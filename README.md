@@ -6,16 +6,19 @@ Built end-to-end on Cloudflare: Workers (compute), Workers AI (the brain), Vecto
 
 > **New here? Open [BOOK.md](BOOK.md).** It walks complete beginners through what Cloudflare is, what each piece (Workers / Workers AI / D1 / R2 / Vectorize) does, what an agent loop actually is, how RAG works, and how WatchOMacho is glued together. ~10 short chapters; no prior knowledge assumed.
 
-## What it does (v2)
+## What it does (v3)
 
+- **Digest mode (new)**: in `digest` strategy, the agent doesn't wander randomly — it watches live feeds (USGS earthquakes, surging Wikipedia articles) every cron tick and only writes a short note when an event matches one of your **interest subscriptions** by semantic similarity. Quiet days cost nothing.
+- **Interest subscriptions**: freeform topics like *"Pacific volcanism"* or *"central Asian languages"*. Each is embedded once; incoming events are matched by cosine similarity above a tunable threshold. Set, mute, and delete from the admin panel.
+- **Per-topic public digest**: the public dashboard shows recent matches grouped under each topic, so "today's signal from the world" is the front door instead of a random map dot.
 - **Autonomous runs**: every N hours (configurable live, no redeploy) it picks a topic and writes a ~300-word field note.
-- **Smarter topic choice**: rotates between *random country*, *random Wikipedia*, *bridge mode* (LLM picks a topic that connects two past notes), and a *gap* bias toward unvisited countries.
+- **Smarter topic choice**: rotates between *random country*, *random Wikipedia*, *bridge mode* (LLM picks a topic that connects two past notes), a *gap* bias toward unvisited countries, or *digest* (live-feed interest-monitor).
 - **Persistent memory**: every note is embedded with `bge-base-en-v1.5` and stored in Vectorize. The agent retrieves the 3–4 most similar past notes before writing, so the new note can explicitly connect to what it already knows.
 - **Real knowledge graph**: every retrieval edge is persisted in a `connections` table, so the map can draw the actual links the agent has made — not just where it's been.
 - **Missions** (multi-step research): admin sends a brief like *"Explore high-altitude human settlements and what makes life there possible"*. The LLM plans 3–5 sub-topics, the agent writes a note on each, then writes a closing **synthesis** note that ties them together. Missions resume across cron ticks and admin pageloads.
 - **Ask**: RAG over every field note the agent has written.
-- **Public dashboard**: stats, a sepia journey map with a chronological travel path *and* connection arcs between linked notes, recent field notes.
-- **Admin panel**: trigger runs, dispatch missions, ask, set cadence + topic strategy + daily budgets, see active missions and recent runs.
+- **Public dashboard**: stats, a sepia journey map with a chronological travel path *and* connection arcs between linked notes, the digest, recent field notes.
+- **Admin panel**: trigger runs, dispatch missions, ask, manage subscriptions, set cadence + topic strategy + daily budgets, see active missions and recent runs.
 
 ## Safety, abuse, and cost gates
 
@@ -98,6 +101,7 @@ If you're upgrading an existing v1 install, run the migrations in order:
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v2.sql
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v3.sql
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v4.sql
+npx wrangler d1 execute watchomacho-db --remote --file=migration-v5.sql
 ```
 
 ### 3. Set the admin secret
@@ -153,6 +157,7 @@ Set from the admin panel (`/admin` → Cadence & strategy):
 - **random**: 50/50 wiki / country, no smart selection
 - **bridge**: always picks a topic that connects two past notes via an LLM call
 - **gap**: favours unvisited countries
+- **digest**: skip the random walk entirely. Each cron tick fetches USGS earthquakes (mag 4.5+) and yesterday's surging Wikipedia articles, embeds each new event, and writes a short field note only when an event matches one of your subscriptions above `digest_match_threshold` (default 0.45). Add topics in the admin panel under *Interest subscriptions*. The daily-notes budget still gates writes, so a viral wiki day can't drain the budget.
 
 ### Daily budgets
 
@@ -224,6 +229,11 @@ Admin (cookie auth):
 | `GET` | `/admin/settings` | Current settings (JSON) |
 | `POST` | `/admin/settings` | Update settings (form fields: `frequency_hours`, `topic_strategy`, `daily_note_limit`, `daily_ask_limit`, `daily_mission_limit`) |
 | `GET` | `/admin/usage` | Today's usage (JSON) |
+| `GET` | `/admin/subscriptions` | List interest subscriptions (JSON) |
+| `POST` | `/admin/subscriptions` | Add a new subscription (form: `topic`) |
+| `POST` | `/admin/subscriptions/:id/toggle` | Mute / unmute (form: `active` = `0` or `1`) |
+| `POST` | `/admin/subscriptions/:id/delete` | Delete a subscription |
+| `POST` | `/admin/digest/scan` | Run one digest scan immediately (returns counts) |
 
 All admin POST endpoints accept form-urlencoded, multipart, or JSON request bodies.
 

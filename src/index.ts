@@ -9,6 +9,11 @@ import {
   getSetting,
   setSetting,
   getDailyUsage,
+  scanLiveFeeds,
+  addSubscription,
+  listSubscriptions,
+  deleteSubscription,
+  setSubscriptionActive,
   BudgetExceeded,
   type Env,
 } from "./agent";
@@ -326,11 +331,19 @@ export default {
         }
         if (form.topic_strategy) {
           const s = form.topic_strategy;
-          if (!["mixed", "random", "bridge", "gap"].includes(s)) {
+          if (!["mixed", "random", "bridge", "gap", "digest"].includes(s)) {
             return json({ error: "invalid strategy" }, { status: 400 });
           }
           await setSetting(env, "topic_strategy", s);
           updated.topic_strategy = s;
+        }
+        if (form.digest_match_threshold !== undefined && form.digest_match_threshold !== "") {
+          const n = parseFloat(form.digest_match_threshold);
+          if (!Number.isFinite(n) || n < 0 || n > 1) {
+            return json({ error: "digest_match_threshold must be 0–1" }, { status: 400 });
+          }
+          await setSetting(env, "digest_match_threshold", String(n));
+          updated.digest_match_threshold = String(n);
         }
         // Budget limits. 0 disables the gate for that kind; we clamp at 10000
         // to avoid a runaway typo (e.g. 999999) draining neurons.
@@ -354,13 +367,14 @@ export default {
 
       if (path === "/admin/settings" && req.method === "GET") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const [freq, strat, last, noteLim, askLim, missLim] = await Promise.all([
+        const [freq, strat, last, noteLim, askLim, missLim, threshold] = await Promise.all([
           getSetting(env, "frequency_hours", "6"),
           getSetting(env, "topic_strategy", "mixed"),
           getSetting(env, "last_cron_run", "0"),
           getSetting(env, "daily_note_limit", "30"),
           getSetting(env, "daily_ask_limit", "100"),
           getSetting(env, "daily_mission_limit", "5"),
+          getSetting(env, "digest_match_threshold", "0.45"),
         ]);
         return json({
           frequency_hours: freq,
@@ -370,7 +384,57 @@ export default {
           daily_note_limit: Number(noteLim),
           daily_ask_limit: Number(askLim),
           daily_mission_limit: Number(missLim),
+          digest_match_threshold: Number(threshold),
         });
+      }
+
+      // Subscriptions (interest topics) for digest mode.
+      if (path === "/admin/subscriptions" && req.method === "GET") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const subs = await listSubscriptions(env);
+        return json({ subscriptions: subs });
+      }
+
+      if (path === "/admin/subscriptions" && req.method === "POST") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const form = await readForm(req);
+        const topic = (form.topic ?? "").trim();
+        if (!topic) return json({ error: "topic required" }, { status: 400 });
+        if (topic.length > 200) return json({ error: "topic must be <= 200 chars" }, { status: 400 });
+        try {
+          const sub = await addSubscription(env, topic);
+          return json({ ok: true, subscription: sub });
+        } catch (e: any) {
+          return json({ error: String(e?.message ?? e) }, { status: 400 });
+        }
+      }
+
+      if (path.startsWith("/admin/subscriptions/") && req.method === "POST") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const rest = path.slice("/admin/subscriptions/".length);
+        const [id, action] = rest.split("/");
+        if (!id || !/^[A-Za-z0-9_-]+$/.test(id)) {
+          return json({ error: "invalid id" }, { status: 400 });
+        }
+        if (action === "delete") {
+          await deleteSubscription(env, id);
+          return json({ ok: true });
+        }
+        if (action === "toggle") {
+          const form = await readForm(req);
+          const active = form.active === "1" || form.active === "true";
+          await setSubscriptionActive(env, id, active);
+          return json({ ok: true, active });
+        }
+        return json({ error: "unknown action" }, { status: 400 });
+      }
+
+      // Trigger one digest scan on-demand (useful for testing without waiting
+      // for the next cron tick). Budget gates still apply per-write.
+      if (path === "/admin/digest/scan" && req.method === "POST") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const res = await scanLiveFeeds(env);
+        return json({ ok: true, ...res });
       }
 
       if (path === "/admin/usage" && req.method === "GET") {
@@ -428,12 +492,24 @@ export default {
           }
 
           // 2. Decide whether to run learnOnce based on the configured frequency.
+          const strategy = await getSetting(env, "topic_strategy", "mixed");
           const freqHours = parseInt(await getSetting(env, "frequency_hours", "6"), 10) || 6;
           const last = parseInt(await getSetting(env, "last_cron_run", "0"), 10) || 0;
           const now = Date.now();
           if (now - last < freqHours * 3600 * 1000) return;
 
-          await learnOnce(env, "cron");
+          if (strategy === "digest") {
+            // Interest-monitor mode: scan live feeds, write only when something
+            // matches an active subscription. Daily-notes budget still applies
+            // inside runStep, so a quiet day costs nothing.
+            const res = await scanLiveFeeds(env).catch((e) => {
+              console.error("digest scan failed", e);
+              return { scanned: 0, matched: 0, written: 0, skipped_seen: 0 };
+            });
+            console.log("digest tick", res);
+          } else {
+            await learnOnce(env, "cron");
+          }
           await setSetting(env, "last_cron_run", String(now));
         } catch (e) {
           console.error("scheduled run failed:", e);
