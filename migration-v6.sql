@@ -14,7 +14,7 @@ DROP TABLE IF EXISTS settings;
 DROP TABLE IF EXISTS runs;
 DROP TABLE IF EXISTS notes;
 
--- Targets: things the agent is researching. One row per HA0 4GP, Bhutan, etc.
+-- Targets: things the agent is researching. One row per SW1A 1AA, Bhutan, etc.
 CREATE TABLE targets (
   id TEXT PRIMARY KEY,
   slug TEXT UNIQUE NOT NULL,

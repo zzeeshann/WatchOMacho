@@ -520,7 +520,7 @@ export async function renderHome(env: Env): Promise<string> {
       <section style="padding:56px 0">
         <p class="label">Empty — for now</p>
         <h1 class="headline" style="margin-top:8px">No targets yet.</h1>
-        <p class="subhead">Give the agent something to research. <a href="/admin/login" style="color:var(--zee-primary);border-bottom:1px solid currentColor">Open the admin</a>, add a target like <em>HA0 4GP</em> or <em>Bhutan</em>, attach a skill, and the agent will keep that target's page fresh.</p>
+        <p class="subhead">Give the agent something to research. <a href="/admin/login" style="color:var(--zee-primary);border-bottom:1px solid currentColor">Open the admin</a>, add a target like <em>Bhutan</em> or <em>OpenAI</em>, attach a skill, and the agent will keep that target's page fresh.</p>
       </section>
     `;
   } else {
@@ -831,7 +831,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       <form method="post" action="/admin/targets">
         <div class="field">
           <label>Name</label>
-          <input name="name" placeholder="HA0 4GP, Bhutan, OpenAI, etc." required maxlength="200">
+          <input name="name" placeholder="SW1A 1AA, Bhutan, OpenAI, etc." required maxlength="200">
         </div>
         <div class="field">
           <label>Kind <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
@@ -871,7 +871,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       <form id="mission-form">
         <div class="field">
           <label>Brief</label>
-          <textarea name="brief" placeholder="e.g. 'Research HA0 4GP, London — present a housing report.' or 'Apply transport-analysis to NW6'" required></textarea>
+          <textarea name="brief" placeholder="e.g. 'Research SW1A 1AA, London — present a housing report.' or 'Apply transport-analysis to NW6'" required></textarea>
         </div>
         <div class="row" style="gap:16px">
           <div class="field" style="flex:1;margin-bottom:0">
