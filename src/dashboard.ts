@@ -2,11 +2,12 @@
 //
 // Pages:
 //   renderDashboard()     — public landing with stats, world map, recent notes
-//   renderNotePage()      — single note in long-form magazine layout
+//   renderNotePage()      — single note with linked-notes panel
 //   renderAdminLogin()    — secret-gated login
-//   renderAdminPanel()    — trigger runs, ask the agent, see run log
+//   renderAdminPanel()    — runs, ask, missions, cadence
 
 import type { Env } from "./agent";
+import { getSetting, getDailyUsage } from "./agent";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared design tokens
@@ -76,6 +77,19 @@ function escapeHtml(s: any): string {
   );
 }
 
+/** Safely embed JSON inside an inline <script>. The default JSON.stringify can
+ *  emit `</script>` or `<!--` inside a string and break out of the script tag.
+ *  This neutralises those sequences and any line/paragraph separators. */
+function jsonForScript(value: unknown): string {
+  const LSEP = String.fromCharCode(0x2028);
+  const PSEP = String.fromCharCode(0x2029);
+  return JSON.stringify(value)
+    .replace(/<\//g, "<\\/")
+    .replace(/<!--/g, "<\\!--")
+    .split(LSEP).join("\\u2028")
+    .split(PSEP).join("\\u2029");
+}
+
 function formatDate(ts: number): string {
   return new Date(ts)
     .toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
@@ -94,6 +108,16 @@ function timeAgo(ts: number): string {
   return formatDate(ts);
 }
 
+function timeUntil(ts: number): string {
+  const diff = ts - Date.now();
+  if (diff <= 0) return "due now";
+  const mins = Math.ceil(diff / 60000);
+  if (mins < 60) return `in ${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem ? `in ${hours}h ${rem}m` : `in ${hours}h`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public dashboard
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,7 +128,11 @@ export async function renderDashboard(env: Env): Promise<string> {
   ).first<any>()) ?? { notes: 0, countries: 0, last_visit: null, words: 0 };
 
   const notes = await env.DB.prepare(
-    "SELECT id, title, place, country, lat, lon, snippet, created_at FROM notes ORDER BY created_at DESC LIMIT 20",
+    "SELECT id, title, place, country, lat, lon, snippet, source, created_at FROM notes ORDER BY created_at DESC LIMIT 40",
+  ).all<any>();
+
+  const connectionRows = await env.DB.prepare(
+    "SELECT from_note_id, to_note_id, kind FROM connections ORDER BY created_at DESC LIMIT 300",
   ).all<any>();
 
   const rows = notes.results ?? [];
@@ -117,13 +145,30 @@ export async function renderDashboard(env: Env): Promise<string> {
       lon: n.lon,
       place: n.place ?? "",
       country: n.country ?? "",
+      source: n.source ?? "",
+      created_at: n.created_at,
     }));
+
+  const coords: Record<string, { lat: number; lon: number }> = {};
+  for (const p of mapPoints) coords[p.id] = { lat: p.lat, lon: p.lon };
+  const edges = (connectionRows.results ?? [])
+    .filter((e: any) => coords[e.from_note_id] && coords[e.to_note_id])
+    .map((e: any) => ({
+      from: coords[e.from_note_id],
+      to: coords[e.to_note_id],
+      kind: e.kind,
+    }));
+
+  const journey = [...mapPoints]
+    .sort((a, b) => a.created_at - b.created_at)
+    .map((p) => [p.lat, p.lon]);
 
   const lastVisit = stats.last_visit ? timeAgo(stats.last_visit) : "—";
 
-  const entries = rows.length === 0
+  const visibleRows = rows.slice(0, 20);
+  const entries = visibleRows.length === 0
     ? `<div class="empty">The agent hasn't started exploring yet. Trigger a run from the admin panel, or wait for the next cron.</div>`
-    : rows
+    : visibleRows
         .map(
           (n: any, i: number) => `
     <a class="entry reveal" style="animation-delay: ${(0.05 * i + 0.4).toFixed(2)}s" href="/note/${escapeHtml(n.id)}">
@@ -131,6 +176,8 @@ export async function renderDashboard(env: Env): Promise<string> {
         <span class="date">${formatDate(n.created_at)}</span>
         ${n.country ? `<span>${escapeHtml(n.country)}</span>` : ""}
         ${n.place && n.place !== n.country ? `<span>${escapeHtml(n.place)}</span>` : ""}
+        ${n.source === "synthesis" ? `<span class="badge-synth">synthesis</span>` : ""}
+        ${n.source === "exploration" ? `<span class="badge-explore">mission step</span>` : ""}
       </div>
       <div class="entry-body">
         <div class="entry-title">${escapeHtml(n.title)}</div>
@@ -235,8 +282,23 @@ h2 em { font-style: italic; color: var(--oxblood); }
   color: var(--sepia);
   text-transform: uppercase;
 }
+.map-legend {
+  display: flex;
+  gap: 18px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--sepia);
+  text-transform: uppercase;
+  margin-top: -12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.map-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.map-legend i { width: 18px; height: 2px; display: inline-block; }
+.map-legend i.dot { width: 10px; height: 10px; border-radius: 50%; }
 #map {
-  height: 460px;
+  height: 480px;
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 2px;
@@ -267,6 +329,17 @@ h2 em { font-style: italic; color: var(--oxblood); }
   gap: 6px;
 }
 .entry-meta .date { color: var(--ink-soft); }
+.badge-synth, .badge-explore {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 2px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  width: max-content;
+}
+.badge-synth { background: rgba(122, 46, 42, 0.12); color: var(--oxblood); }
+.badge-explore { background: rgba(58, 107, 126, 0.15); color: var(--teal); }
 .entry-title {
   font-family: var(--font-display);
   font-weight: 500;
@@ -336,9 +409,9 @@ footer a:hover { color: var(--oxblood); border-color: var(--oxblood); }
   <header class="reveal">
     <div class="brand">
       <h1 class="logo">Watch<em>O</em>Macho</h1>
-      <span class="tag">v1 · world explorer</span>
+      <span class="tag">v2 · world explorer</span>
     </div>
-    <p class="manifesto">An autonomous agent that wanders public archives — Wikipedia, OpenStreetMap, country databases, weather feeds — and writes <strong>short field notes</strong> about what it finds. It runs on its own, every few hours.</p>
+    <p class="manifesto">An autonomous agent that wanders public archives — Wikipedia, OpenStreetMap, country databases, weather feeds — and writes <strong>short field notes</strong> about what it finds. It also takes <strong>research missions</strong> on demand and stitches its memory into a growing graph of places.</p>
   </header>
 
   <section class="stats reveal" style="animation-delay: 0.1s">
@@ -350,7 +423,14 @@ footer a:hover { color: var(--oxblood); border-color: var(--oxblood); }
 
   <div class="section-head reveal" style="animation-delay: 0.2s">
     <h2>The <em>journey</em></h2>
-    <span class="section-meta">${mapPoints.length} pinned locations</span>
+    <span class="section-meta">${mapPoints.length} pinned · ${edges.length} links · ${journey.length} stops</span>
+  </div>
+  <div class="map-legend reveal">
+    <span><i class="dot" style="background:#7A2E2A"></i> Field note</span>
+    <span><i class="dot" style="background:#3A6B7E"></i> Mission step</span>
+    <span><i style="background:#8C7858"></i> Travel path</span>
+    <span><i style="background:rgba(122,46,42,0.55)"></i> Memory link</span>
+    <span><i style="background:rgba(58,107,126,0.55)"></i> Mission link</span>
   </div>
   <div id="map" class="reveal" style="animation-delay: 0.3s"></div>
 
@@ -368,14 +448,45 @@ footer a:hover { color: var(--oxblood); border-color: var(--oxblood); }
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-  const points = ${JSON.stringify(mapPoints)};
+  const points = ${jsonForScript(mapPoints)};
+  const journey = ${jsonForScript(journey)};
+  const edges = ${jsonForScript(edges)};
+
   const map = L.map('map', { zoomControl: true, attributionControl: false, scrollWheelZoom: false }).setView([20, 10], 2);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 6, minZoom: 1 }).addTo(map);
-  const style = { radius: 6, fillColor: '#7A2E2A', color: '#1F1A14', weight: 1.5, opacity: 1, fillOpacity: 0.85 };
+
+  if (journey.length >= 2) {
+    L.polyline(journey, { color: '#8C7858', weight: 1.2, opacity: 0.55, dashArray: '4 6' }).addTo(map);
+  }
+
+  edges.forEach(e => {
+    const color = e.kind === 'exploration' ? '#3A6B7E' : '#7A2E2A';
+    L.polyline([[e.from.lat, e.from.lon], [e.to.lat, e.to.lon]], {
+      color, weight: 0.9, opacity: 0.45
+    }).addTo(map);
+  });
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+      {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+    ));
+  }
+  function safeId(id) {
+    // Only allow our id alphabet: lowercase a-z, 0-9, hyphen.
+    return /^[a-z0-9-]{1,40}$/.test(String(id)) ? id : '';
+  }
   points.forEach(p => {
-    const html = '<div style="font-family:Fraunces,Georgia,serif;font-size:16px;font-weight:500;color:#1F1A14;letter-spacing:-0.01em">' + p.title + '</div>'
-      + '<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:#8C7858;letter-spacing:0.08em;text-transform:uppercase;margin-top:4px">' + (p.place || p.country || '') + '</div>'
-      + '<a href="/note/' + p.id + '" style="display:inline-block;margin-top:8px;color:#7A2E2A;font-family:JetBrains Mono,monospace;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;text-decoration:none;border-bottom:1px solid #7A2E2A">Read note →</a>';
+    const isSynth = p.source === 'synthesis';
+    const isExp = p.source === 'exploration';
+    const style = {
+      radius: isSynth ? 7 : 5.5,
+      fillColor: (isExp || isSynth) ? '#3A6B7E' : '#7A2E2A',
+      color: '#1F1A14', weight: 1.2, opacity: 1, fillOpacity: 0.9
+    };
+    const id = safeId(p.id);
+    const html = '<div style="font-family:Fraunces,Georgia,serif;font-size:16px;font-weight:500;color:#1F1A14;letter-spacing:-0.01em">' + esc(p.title) + '</div>'
+      + '<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:#8C7858;letter-spacing:0.08em;text-transform:uppercase;margin-top:4px">' + esc(p.place || p.country || p.source) + '</div>'
+      + (id ? '<a href="/note/' + id + '" style="display:inline-block;margin-top:8px;color:#7A2E2A;font-family:JetBrains Mono,monospace;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;text-decoration:none;border-bottom:1px solid #7A2E2A">Read note →</a>' : '');
     L.circleMarker([p.lat, p.lon], style).bindPopup(html).addTo(map);
   });
 </script>
@@ -396,9 +507,19 @@ export async function renderNotePage(env: Env, id: string): Promise<string> {
   const obj = await env.NOTES.get(row.r2_key);
   const md = obj ? await obj.text() : `# ${row.title}\n\n${row.snippet}`;
 
-  // Tiny purposeful markdown renderer — we control the input format
+  const linkedRows = await env.DB.prepare(
+    `SELECT n.id, n.title, n.country, c.kind
+       FROM connections c
+       JOIN notes n ON n.id = c.to_note_id
+       WHERE c.from_note_id = ?
+       ORDER BY c.created_at DESC LIMIT 6`,
+  )
+    .bind(id)
+    .all<any>();
+  const linked = linkedRows.results ?? [];
+
   const bodyHtml = md
-    .replace(/^# .+$/m, "") // strip the title (rendered separately)
+    .replace(/^# .+$/m, "")
     .split(/\n\n+/)
     .map((p) => p.trim())
     .filter(Boolean)
@@ -413,6 +534,22 @@ export async function renderNotePage(env: Env, id: string): Promise<string> {
       return `<p>${safe}</p>`;
     })
     .join("\n");
+
+  const linkedHtml = linked.length
+    ? `<div class="linked">
+         <div class="linked-head">Connections drawn</div>
+         <ul>${linked
+           .map(
+             (l: any) => `
+           <li><a href="/note/${escapeHtml(l.id)}">
+             <span class="lk-title">${escapeHtml(l.title)}</span>
+             ${l.country ? `<span class="lk-country">${escapeHtml(l.country)}</span>` : ""}
+             <span class="lk-kind">${escapeHtml(l.kind)}</span>
+           </a></li>`,
+           )
+           .join("")}</ul>
+       </div>`
+    : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -490,6 +627,33 @@ ${BASE_CSS}
 }
 .note-source a { color: var(--ink-soft); text-decoration: none; border-bottom: 1px solid var(--sepia); }
 .note-source a:hover { color: var(--oxblood); border-color: var(--oxblood); }
+.linked {
+  margin-top: 56px;
+  padding-top: 32px;
+  border-top: 1px solid var(--line);
+}
+.linked-head {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--sepia);
+  margin-bottom: 16px;
+}
+.linked ul { list-style: none; }
+.linked li { padding: 8px 0; border-bottom: 1px dotted var(--line); }
+.linked li a {
+  display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  text-decoration: none; color: var(--ink);
+}
+.lk-title { font-family: var(--font-display); font-weight: 500; font-size: 18px; }
+.linked li a:hover .lk-title { color: var(--oxblood); }
+.lk-country { font-style: italic; color: var(--teal); font-size: 14px; }
+.lk-kind {
+  margin-left: auto;
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--sepia);
+}
 </style>
 </head>
 <body>
@@ -497,8 +661,9 @@ ${BASE_CSS}
   <a class="note-back" href="/">← Back to journey</a>
   <h1 class="note-title">${escapeHtml(row.title)}</h1>
   ${row.place || row.country ? `<p class="note-loc">${escapeHtml([row.place, row.country].filter(Boolean).join(", "))}</p>` : ""}
-  <p class="note-date">Logged ${formatDate(row.created_at)} · ${row.word_count ?? 0} words · via ${escapeHtml(row.source)}</p>
+  <p class="note-date">Logged ${formatDate(row.created_at)} · ${row.word_count ?? 0} words · via ${escapeHtml(row.source)}${row.exploration_id ? ` · mission step` : ""}</p>
   <div class="note-body">${bodyHtml}</div>
+  ${linkedHtml}
   ${row.source_url ? `<p class="note-source">Source: <a href="${escapeHtml(row.source_url)}" target="_blank" rel="noopener">${escapeHtml(row.source_url)}</a></p>` : ""}
 </div>
 </body>
@@ -613,6 +778,27 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     "SELECT id, title, created_at FROM notes ORDER BY created_at DESC LIMIT 1",
   ).first<any>();
 
+  const explorations = await env.DB.prepare(
+    "SELECT id, brief, status, current_step, total_steps, synthesis_note_id, error, created_at, updated_at FROM explorations ORDER BY created_at DESC LIMIT 10",
+  ).all<any>();
+
+  const [frequency, strategy, lastCronStr, noteLimStr, askLimStr, missLimStr, usage] = await Promise.all([
+    getSetting(env, "frequency_hours", "6"),
+    getSetting(env, "topic_strategy", "mixed"),
+    getSetting(env, "last_cron_run", "0"),
+    getSetting(env, "daily_note_limit", "30"),
+    getSetting(env, "daily_ask_limit", "100"),
+    getSetting(env, "daily_mission_limit", "5"),
+    getDailyUsage(env),
+  ]);
+  const noteLim = Number(noteLimStr) || 0;
+  const askLim = Number(askLimStr) || 0;
+  const missLim = Number(missLimStr) || 0;
+  const lastCron = Number(lastCronStr) || 0;
+  const freqNum = Number(frequency) || 6;
+  const nextCron = lastCron + freqNum * 3600 * 1000;
+  const nextCronLabel = lastCron === 0 ? "next hourly tick" : timeUntil(nextCron);
+
   const runsHtml = (runs.results ?? [])
     .map(
       (r: any) => `
@@ -625,6 +811,52 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     </tr>`,
     )
     .join("");
+
+  const explorationsHtml = (explorations.results ?? [])
+    .map((e: any) => {
+      const pct = e.total_steps > 0
+        ? Math.min(100, Math.round((e.current_step / e.total_steps) * 100))
+        : 0;
+      const synthLink = e.synthesis_note_id
+        ? `<a class="syn-link" href="/note/${escapeHtml(e.synthesis_note_id)}">read synthesis →</a>`
+        : "";
+      const errPart = e.status === "error" && e.error
+        ? `<div class="exp-err">${escapeHtml(e.error)}</div>`
+        : "";
+      return `
+        <div class="exp-card">
+          <div class="exp-head">
+            <span class="exp-status exp-${escapeHtml(e.status)}">${escapeHtml(e.status)}</span>
+            <span class="exp-time">${escapeHtml(timeAgo(e.updated_at ?? e.created_at))}</span>
+          </div>
+          <div class="exp-brief">${escapeHtml(e.brief)}</div>
+          <div class="exp-progress"><div class="exp-bar" style="width:${pct}%"></div></div>
+          <div class="exp-meta">
+            <span>${e.current_step}/${e.total_steps} steps</span>
+            ${synthLink}
+          </div>
+          ${errPart}
+        </div>`;
+    })
+    .join("");
+
+  const freqOption = (n: number, label: string) =>
+    `<option value="${n}"${freqNum === n ? " selected" : ""}>${label}</option>`;
+  const stratOption = (v: string, label: string, desc: string) =>
+    `<option value="${v}"${strategy === v ? " selected" : ""}>${label} — ${desc}</option>`;
+
+  const budgetRow = (label: string, used: number, limit: number) => {
+    const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+    const remaining = limit > 0 ? Math.max(0, limit - used) : Infinity;
+    const tone = limit === 0 ? "ok" : remaining === 0 ? "danger" : pct > 80 ? "warn" : "ok";
+    const limitText = limit === 0 ? "∞" : String(limit);
+    return `
+      <div class="bg-row">
+        <div class="bg-label">${escapeHtml(label)}</div>
+        <div class="bg-bar bg-${tone}"><div style="width:${limit === 0 ? 0 : pct}%"></div></div>
+        <div class="bg-fig">${escapeHtml(used)} <span>/ ${escapeHtml(limitText)}</span></div>
+      </div>`;
+  };
 
   return `<!doctype html>
 <html lang="en">
@@ -691,9 +923,10 @@ ${BASE_CSS}
   font-weight: 500;
   letter-spacing: -0.01em;
 }
+.panel h3 em { color: var(--oxblood); font-style: italic; }
 .panel .desc { color: var(--ink-soft); font-size: 14px; margin-top: 6px; font-style: italic; }
 .panel form { margin-top: 20px; display: flex; flex-direction: column; gap: 12px; }
-.panel input, .panel textarea {
+.panel input, .panel textarea, .panel select {
   background: var(--paper);
   border: 1px solid var(--line);
   padding: 12px;
@@ -703,7 +936,7 @@ ${BASE_CSS}
   color: var(--ink);
 }
 .panel textarea { min-height: 80px; resize: vertical; }
-.panel input:focus, .panel textarea:focus { outline: none; border-color: var(--oxblood); }
+.panel input:focus, .panel textarea:focus, .panel select:focus { outline: none; border-color: var(--oxblood); }
 .panel button {
   background: var(--ink);
   color: var(--paper);
@@ -717,7 +950,28 @@ ${BASE_CSS}
   border-radius: 2px;
 }
 .panel button:hover { background: var(--oxblood); }
-#ask-result {
+.panel-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.panel-row label {
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--sepia); margin-bottom: 6px; display: block;
+}
+.steps-row { display: flex; align-items: center; gap: 12px; }
+.steps-row input[type=range] { flex: 1; }
+.steps-row output {
+  font-family: var(--font-mono); font-size: 14px;
+  color: var(--oxblood); min-width: 28px; text-align: right;
+}
+.next-run {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--sepia);
+  text-transform: uppercase;
+}
+.next-run strong { color: var(--ink); font-weight: 500; }
+#ask-result, #explore-result {
   margin-top: 20px;
   padding: 16px 20px;
   background: var(--paper);
@@ -726,8 +980,8 @@ ${BASE_CSS}
   line-height: 1.65;
   display: none;
 }
-#ask-result.show { display: block; }
-#ask-result .sources {
+#ask-result.show, #explore-result.show { display: block; }
+#ask-result .sources, #explore-result .meta {
   margin-top: 16px;
   font-family: var(--font-mono);
   font-size: 11px;
@@ -735,14 +989,44 @@ ${BASE_CSS}
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
-h2.runs-title {
+.section-title {
   font-family: var(--font-display);
   font-size: 28px;
   font-weight: 400;
   letter-spacing: -0.02em;
   margin-top: 80px;
 }
-h2.runs-title em { font-style: italic; color: var(--oxblood); }
+.section-title em { font-style: italic; color: var(--oxblood); }
+.missions { margin-top: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.exp-card {
+  background: rgba(221, 208, 179, 0.35);
+  border: 1px solid var(--line);
+  padding: 20px;
+  border-radius: 2px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.exp-head { display: flex; justify-content: space-between; align-items: center; }
+.exp-status {
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 2px;
+}
+.exp-in_progress, .exp-planning { background: rgba(58, 107, 126, 0.18); color: var(--teal); }
+.exp-synthesizing { background: rgba(140, 120, 88, 0.22); color: var(--ink-soft); }
+.exp-complete { background: rgba(74, 110, 60, 0.18); color: #3F5E2C; }
+.exp-error { background: rgba(122, 46, 42, 0.18); color: var(--oxblood); }
+.exp-time { font-family: var(--font-mono); font-size: 10px; color: var(--sepia); letter-spacing: 0.1em; text-transform: uppercase; }
+.exp-brief { font-style: italic; color: var(--ink); font-size: 16px; line-height: 1.45; }
+.exp-progress { width: 100%; height: 4px; background: rgba(31, 26, 20, 0.1); border-radius: 2px; overflow: hidden; }
+.exp-bar { height: 100%; background: var(--oxblood); transition: width 0.4s; }
+.exp-meta {
+  display: flex; justify-content: space-between; align-items: center;
+  font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: 0.1em; color: var(--sepia); text-transform: uppercase;
+}
+.syn-link { color: var(--oxblood); text-decoration: none; border-bottom: 1px solid var(--oxblood); }
+.exp-err { font-family: var(--font-mono); font-size: 11px; color: var(--oxblood); }
+.no-missions { padding: 24px; text-align: center; color: var(--sepia); font-style: italic; grid-column: 1 / -1; }
 table.runs { width: 100%; margin-top: 24px; border-collapse: collapse; }
 table.runs th {
   font-family: var(--font-mono);
@@ -768,8 +1052,18 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
 .badge-success { background: rgba(58, 107, 126, 0.15); color: var(--teal); }
 .badge-error { background: rgba(122, 46, 42, 0.12); color: var(--oxblood); }
 .empty-runs { text-align: center; padding: 48px; color: var(--sepia); font-style: italic; }
+.budget-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+.bg-row { display: grid; grid-template-columns: 110px 1fr 80px; gap: 12px; align-items: center; }
+.bg-label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--sepia); }
+.bg-bar { height: 6px; background: rgba(31, 26, 20, 0.1); border-radius: 2px; overflow: hidden; }
+.bg-bar > div { height: 100%; transition: width 0.4s; }
+.bg-ok > div { background: var(--teal); }
+.bg-warn > div { background: var(--sepia); }
+.bg-danger > div { background: var(--oxblood); }
+.bg-fig { font-family: var(--font-mono); font-size: 13px; color: var(--ink); text-align: right; }
+.bg-fig span { color: var(--sepia); }
 @media (max-width: 720px) {
-  .admin-grid { grid-template-columns: 1fr; gap: 20px; }
+  .admin-grid, .missions, .panel-row { grid-template-columns: 1fr; gap: 20px; }
   .panel { padding: 24px; }
   table.runs th, table.runs td { padding: 10px 8px; font-size: 13px; }
 }
@@ -786,8 +1080,8 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
 
   <div class="admin-grid">
     <div class="panel">
-      <h3>Trigger a run</h3>
-      <p class="desc">Run the agent now. Leave the prompt empty for autonomous exploration, or steer it.</p>
+      <h3>Trigger a <em>single run</em></h3>
+      <p class="desc">Leave the prompt empty for autonomous exploration, or steer with a topic.</p>
       <form method="post" action="/admin/run">
         <textarea name="prompt" placeholder="Optional: 'Tell me about Bhutan' or 'Find me an unusual island'"></textarea>
         <button type="submit">Run agent now</button>
@@ -795,17 +1089,98 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
     </div>
 
     <div class="panel">
-      <h3>Ask the agent</h3>
-      <p class="desc">Query its memory. It pulls from every field note it has written.</p>
+      <h3>Ask the <em>agent</em></h3>
+      <p class="desc">Query its memory. RAG over every field note it has written.</p>
       <form id="ask-form">
         <textarea name="question" placeholder="What have you learned about island nations?" required></textarea>
         <button type="submit">Ask</button>
       </form>
       <div id="ask-result"></div>
     </div>
+
+    <div class="panel">
+      <h3>Send the agent <em>on a mission</em></h3>
+      <p class="desc">Multi-step research. The agent plans sub-topics, writes a note on each, then a closing synthesis.</p>
+      <form id="explore-form">
+        <textarea name="brief" placeholder="e.g. 'Explore how island colonial histories shaped their post-independence economies'" required></textarea>
+        <div class="steps-row">
+          <label style="font-family:var(--font-mono);font-size:10px;letter-spacing:0.14em;text-transform:uppercase;color:var(--sepia)">Steps</label>
+          <input type="range" name="steps" min="2" max="7" value="4" oninput="document.getElementById('step-out').value=this.value">
+          <output id="step-out">4</output>
+        </div>
+        <button type="submit">Dispatch mission</button>
+      </form>
+      <div id="explore-result"></div>
+    </div>
+
+    <div class="panel">
+      <h3>Cadence &amp; <em>strategy</em></h3>
+      <p class="desc">How often the cron writes a note, and how it chooses topics.</p>
+      <form id="settings-form">
+        <div class="panel-row">
+          <div>
+            <label>Run every</label>
+            <select name="frequency_hours">
+              ${freqOption(1, "1 hour")}
+              ${freqOption(2, "2 hours")}
+              ${freqOption(3, "3 hours")}
+              ${freqOption(6, "6 hours")}
+              ${freqOption(12, "12 hours")}
+              ${freqOption(24, "24 hours")}
+            </select>
+          </div>
+          <div>
+            <label>Topic strategy</label>
+            <select name="topic_strategy">
+              ${stratOption("mixed", "mixed", "country / wiki / bridge")}
+              ${stratOption("random", "random", "pure serendipity")}
+              ${stratOption("bridge", "bridge", "always link two past notes")}
+              ${stratOption("gap", "gap", "favour unvisited countries")}
+            </select>
+          </div>
+        </div>
+        <button type="submit">Save</button>
+      </form>
+      <div class="next-run">Last cron run: <strong>${lastCron > 0 ? escapeHtml(timeAgo(lastCron)) : "never"}</strong> · Next: <strong>${escapeHtml(nextCronLabel)}</strong></div>
+    </div>
+
+    <div class="panel">
+      <h3>Budget &amp; <em>safety</em></h3>
+      <p class="desc">Daily caps on neuron-spending actions. 0 = unlimited. Counters reset at 00:00 UTC.</p>
+      <div class="budget-grid">
+        ${budgetRow("Notes today", usage.notes, noteLim)}
+        ${budgetRow("Asks today", usage.asks, askLim)}
+        ${budgetRow("Missions today", usage.missions, missLim)}
+      </div>
+      <form id="budget-form" style="margin-top: 12px">
+        <div class="panel-row">
+          <div>
+            <label>Notes / day</label>
+            <input type="number" name="daily_note_limit" min="0" max="10000" value="${escapeHtml(noteLim)}">
+          </div>
+          <div>
+            <label>Asks / day</label>
+            <input type="number" name="daily_ask_limit" min="0" max="10000" value="${escapeHtml(askLim)}">
+          </div>
+        </div>
+        <div class="panel-row">
+          <div>
+            <label>Missions / day</label>
+            <input type="number" name="daily_mission_limit" min="0" max="10000" value="${escapeHtml(missLim)}">
+          </div>
+          <div></div>
+        </div>
+        <button type="submit">Save budgets</button>
+      </form>
+    </div>
   </div>
 
-  <h2 class="runs-title">Recent <em>runs</em></h2>
+  <h2 class="section-title">Active <em>missions</em></h2>
+  <div class="missions">
+    ${explorationsHtml || `<div class="no-missions">No missions dispatched yet.</div>`}
+  </div>
+
+  <h2 class="section-title">Recent <em>runs</em></h2>
   <table class="runs">
     <thead><tr><th>When</th><th>Trigger</th><th>Topic / error</th><th>Duration</th><th>Status</th></tr></thead>
     <tbody>${runsHtml || `<tr><td colspan="5" class="empty-runs">No runs yet.</td></tr>`}</tbody>
@@ -813,6 +1188,8 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
 </div>
 
 <script>
+  function escape(s) { return String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+
   document.getElementById('ask-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const form = e.target;
@@ -824,18 +1201,75 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
     try {
       const fd = new FormData(form);
       const res = await fetch('/admin/ask', { method: 'POST', body: fd });
+      if (res.status === 429) {
+        const d = await res.json();
+        result.textContent = d.message || 'Daily budget exhausted.';
+        return;
+      }
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-      const escaped = data.answer.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
       const sources = (data.sources && data.sources.length)
-        ? '<div class="sources">Sources · ' + data.sources.map(s => s.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))).join(' · ') + '</div>'
+        ? '<div class="sources">Sources · ' + data.sources.map(escape).join(' · ') + '</div>'
         : '';
-      result.innerHTML = escaped.replace(/\\n/g, '<br>') + sources;
+      result.innerHTML = escape(data.answer).replace(/\\n/g, '<br>') + sources;
     } catch (err) {
       result.textContent = 'Error: ' + err.message;
     } finally {
       btn.disabled = false;
     }
+  });
+
+  document.getElementById('explore-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const btn = form.querySelector('button');
+    const result = document.getElementById('explore-result');
+    result.classList.add('show');
+    result.innerHTML = 'Planning the mission…';
+    btn.disabled = true;
+    try {
+      const fd = new FormData(form);
+      const res = await fetch('/admin/explore', { method: 'POST', body: fd });
+      if (res.status === 429) {
+        const d = await res.json();
+        result.textContent = d.message || 'Daily mission budget exhausted.';
+        return;
+      }
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || ('HTTP ' + res.status));
+      }
+      const data = await res.json();
+      const planList = (data.plan || []).map((s, i) => '<li>' + (i+1) + '. ' + escape(s) + '</li>').join('');
+      result.innerHTML = '<strong>Mission dispatched.</strong> The agent will work through these steps in the background and synthesise at the end. Reloading…<ol style="margin-top:12px;padding-left:20px">' + planList + '</ol><div class="meta">Mission ID · ' + escape(data.id) + '</div>';
+      setTimeout(() => { window.location.reload(); }, 1500);
+    } catch (err) {
+      result.textContent = 'Error: ' + err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  async function saveSettings(form, btn, label) {
+    btn.disabled = true;
+    try {
+      const fd = new FormData(form);
+      const res = await fetch('/admin/settings', { method: 'POST', body: fd });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      btn.textContent = 'Saved ✓';
+      setTimeout(() => { btn.textContent = label; btn.disabled = false; window.location.reload(); }, 900);
+    } catch (err) {
+      btn.textContent = 'Failed';
+      btn.disabled = false;
+    }
+  }
+  document.getElementById('settings-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    saveSettings(e.target, e.target.querySelector('button'), 'Save');
+  });
+  document.getElementById('budget-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    saveSettings(e.target, e.target.querySelector('button'), 'Save budgets');
   });
 </script>
 </body>

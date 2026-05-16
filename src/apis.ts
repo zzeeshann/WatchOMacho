@@ -110,6 +110,39 @@ export async function reverseGeocode(lat: number, lon: number): Promise<GeoPlace
   };
 }
 
+export interface GeoHit {
+  display: string;
+  lat: number;
+  lon: number;
+  country?: string;
+  city?: string;
+}
+
+/** Forward-geocode a free-text query (a place name, an article title) into
+ *  lat/lon via OpenStreetMap Nominatim. Returns null on no match.
+ *  Useful for Wikipedia articles that lack coordinates of their own. */
+export async function geocodeQuery(q: string): Promise<GeoHit | null> {
+  if (!q) return null;
+  const r = await fetch(
+    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${encodeURIComponent(q)}`,
+    { headers: { "User-Agent": UA, "Accept": "application/json" } },
+  );
+  if (!r.ok) return null;
+  const data: any = await r.json();
+  if (!Array.isArray(data) || data.length === 0) return null;
+  const hit = data[0];
+  const lat = parseFloat(hit.lat);
+  const lon = parseFloat(hit.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return {
+    display: hit.display_name,
+    lat,
+    lon,
+    country: hit.address?.country,
+    city: hit.address?.city ?? hit.address?.town ?? hit.address?.village,
+  };
+}
+
 /** Current weather at a coordinate. Open-Meteo, no key required. */
 export async function currentWeather(lat: number, lon: number): Promise<any | null> {
   const r = await fetch(

@@ -11,10 +11,11 @@ routes = [
   { pattern = "watchomacho.daylila.com", custom_domain = true }
 ]
 
-# Runs the agent every 6 hours (UTC). Change to taste.
-# Examples: "0 */2 * * *" every 2h, "0 9 * * *" daily at 09:00 UTC
+# Cron fires every hour. The worker reads the live `frequency_hours` setting
+# (editable from the admin panel) and decides whether to actually run learnOnce
+# on each tick, AND pumps any in-progress explorations forward by one step.
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["0 * * * *"]
 
 # Workers AI — for chat + embeddings
 [ai]
