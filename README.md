@@ -4,6 +4,10 @@ A research agent you give jobs to. You hand it a **target** (a postcode, a perso
 
 Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. Web search via Brave Search.
 
+> **New to the project?** Read [BOOK.md](BOOK.md) — a guided tour from "what is Cloudflare?" to "how the agent's research loop works", in 14 short chapters. No prior experience assumed.
+>
+> **Want a quick reference?** [ARCHITECTURE.md](ARCHITECTURE.md) has the schema, data flow, API surface, and bindings in scannable tables.
+
 ## The three concepts
 
 ```
