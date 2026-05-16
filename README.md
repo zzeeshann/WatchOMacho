@@ -61,10 +61,12 @@ npm run bucket:create   # creates the R2 bucket
 npm run vector:create   # creates the Vectorize index (768 dims, cosine)
 ```
 
-If you're upgrading from any earlier version, run the v6 migration instead of `db:init` — it drops the old data model and creates the new one:
+If you're upgrading from any earlier version, run the v6 migration instead of `db:init` — it drops the old data model and creates the new one — then chain through any later migrations:
 
 ```bash
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v6.sql
+npx wrangler d1 execute watchomacho-db --remote --file=migration-v7.sql
+npx wrangler d1 execute watchomacho-db --remote --file=migration-v8.sql
 ```
 
 ### 3. Set the secrets

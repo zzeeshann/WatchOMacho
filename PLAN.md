@@ -1,5 +1,7 @@
 # WatchOMacho refactor plan — Tavily + Tailwind
 
+> **✅ Shipped 2026-05-17.** Phases 0–11 are complete. Tavily refactor deployed as Worker version `dbfa2283-5593-4e5f-a84f-5b15c33f3090`; Tailwind migration on top as `7a022dd5-0613-4e6e-9aa1-82d409e7a1e3`. Both live at watchomacho.daylila.com. Merged via [PR #7](https://github.com/zzeeshann/WatchOMacho/pull/7). The only outstanding work is **Phase 12** (cancel Brave subscription + optional production-grade Tailwind CSS bundle) — see Phase 12 below. This file is kept in the repo as history so future sessions can see how the change was scoped and executed.
+
 Two refactors bundled into one plan, executed in sequence:
 
 1. **Tavily-only toolbox** — swap from `Brave + Wikipedia + Nominatim` to Tavily as the single research tool.
@@ -7,7 +9,7 @@ Two refactors bundled into one plan, executed in sequence:
 
 No new features. Behaviour after = behaviour before, but with richer content (Tavily extracts full pages, not snippets) and cleaner styling source (Tailwind utility classes, not inline strings).
 
-> **For a fresh session executing this:** read this whole doc top-to-bottom before touching code. Then check the memory file at `~/.claude/projects/-Users-zi-pro-WatchOMacho/memory/MEMORY.md` for any drift in state. Then start at Phase 0.
+> ~~**For a fresh session executing this:** read this whole doc top-to-bottom before touching code. Then check the memory file at `~/.claude/projects/-Users-zi-pro-WatchOMacho/memory/MEMORY.md` for any drift in state. Then start at Phase 0.~~ — Plan shipped; see banner above.
 
 ---
 
