@@ -1,136 +1,90 @@
-// The agent's brain. One file. Plain functions.
+// The agent's brain.
 //
-//   learnOnce()           — picks a topic, writes a ~300-word field note, stores it.
-//   ask()                 — RAG over past notes to answer a question.
-//   startExploration()    — admin sends a brief; LLM plans 3-5 sub-topics; first step kicks off.
-//   advanceExploration()  — write the next step's note, or synthesise if all steps done.
-//   getSetting/setSetting — live runtime config (frequency, strategy).
+// Three concepts:
+//   Target   — a thing being researched (HA0 4GP, Bhutan, "AI agents")
+//   Skill    — a named procedure the agent owns (housing-research, etc.)
+//   Mission  — a single user instruction that runs a Skill against a Target
+//
+// One artefact:
+//   Report   — markdown writeup produced by running a Skill on a Target.
+//              Accumulates on the Target's page over time as the cron
+//              re-runs the Skill on its configured cadence.
 
-import {
-  randomWikipedia,
-  randomCountry,
-  reverseGeocode,
-  currentWeather,
-  wikipediaSummary,
-  geocodeQuery,
-  recentEarthquakes,
-  topWikipediaPages,
-  type LiveEvent,
-} from "./apis";
+import { braveSearch, wikipediaSummary, geocodeQuery, type BraveResult } from "./apis";
 
 export interface Env {
   AI: Ai;
   DB: D1Database;
-  NOTES: R2Bucket;
+  REPORTS: R2Bucket;
   MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
+  BRAVE_API_KEY?: string;
 }
 
 const CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5"; // 768 dimensions
+const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
 
-const CONTRACT = `# WatchOMacho — World Explorer
+// ─── basics ────────────────────────────────────────────────────────────────
 
-You are a curious AI traveler. You wander the world through public archives
-and write thoughtful, ~300-word field notes about what you find.
-
-## Personality
-- Genuinely curious, never dry or encyclopedic
-- Like a well-read travel writer keeping a private journal
-- If something surprises you, say so out loud
-- Find connections between places (climate, language families, history, food)
-
-## How you write a note
-- Open with a hook — a vivid detail or surprising fact
-- Middle: the substance — geography, culture, history, people
-- End: ONE connection to something you learned before (if you have memory)
-- ~300 words, flowing prose, no headers or bullet points
-- Sentence case throughout, no shouting, no clichés
-
-## What you avoid
-- Generic Wikipedia-tone summaries
-- Lists of statistics with no narrative
-- Repeating things you have already written about
-- Phrases like "in conclusion", "this fascinating place", "rich history"
-`;
-
-interface PickedTopic {
-  title: string;
-  source: string;
-  source_url: string;
-  raw: string;
-  place?: string;
-  country?: string;
-  lat?: number;
-  lon?: number;
-  source_event_id?: string;     // for live-event dedup, see notes.source_event_id
+function uid(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-interface RecalledNote {
-  id: string;
-  title: string;
-  snippet: string;
-  score: number;
-}
-
-// ─── budget gates ──────────────────────────────────────────────────────────
-
-export class BudgetExceeded extends Error {
-  constructor(public kind: "notes" | "asks" | "missions", public limit: number, public used: number) {
-    super(`daily ${kind} budget exhausted (${used}/${limit})`);
-    this.name = "BudgetExceeded";
-  }
+function slugify(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "x";
 }
 
 function todayUtc(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-export async function getDailyUsage(env: Env): Promise<{
-  date: string;
-  notes: number;
-  asks: number;
-  missions: number;
-}> {
-  const date = todayUtc();
-  const row = await env.DB.prepare(
-    "SELECT date, notes, asks, missions FROM daily_usage WHERE date = ?",
-  )
-    .bind(date)
-    .first<{ date: string; notes: number; asks: number; missions: number }>();
-  return row ?? { date, notes: 0, asks: 0, missions: 0 };
+// ─── budgets ───────────────────────────────────────────────────────────────
+
+export class BudgetExceeded extends Error {
+  constructor(public kind: "reports" | "searches", public limit: number, public used: number) {
+    super(`daily ${kind} budget exhausted (${used}/${limit})`);
+    this.name = "BudgetExceeded";
+  }
 }
 
-async function bumpUsage(
-  env: Env,
-  kind: "notes" | "asks" | "missions",
-  by = 1,
-): Promise<void> {
+export async function getDailyUsage(env: Env) {
   const date = todayUtc();
-  const col = kind; // safe — fixed enum
+  const row = await env.DB.prepare(
+    "SELECT date, reports, searches FROM daily_usage WHERE date = ?",
+  )
+    .bind(date)
+    .first<{ date: string; reports: number; searches: number }>();
+  return row ?? { date, reports: 0, searches: 0 };
+}
+
+async function bumpUsage(env: Env, kind: "reports" | "searches", by = 1) {
+  const date = todayUtc();
   await env.DB.prepare(
-    `INSERT INTO daily_usage (date, ${col}, updated_at)
+    `INSERT INTO daily_usage (date, ${kind}, updated_at)
      VALUES (?, ?, ?)
-     ON CONFLICT(date) DO UPDATE SET ${col} = ${col} + excluded.${col}, updated_at = excluded.updated_at`,
+     ON CONFLICT(date) DO UPDATE SET ${kind} = ${kind} + excluded.${kind}, updated_at = excluded.updated_at`,
   )
     .bind(date, by, Date.now())
     .run();
 }
 
-async function checkBudget(
-  env: Env,
-  kind: "notes" | "asks" | "missions",
-): Promise<void> {
-  const settingKey =
-    kind === "notes" ? "daily_note_limit" : kind === "asks" ? "daily_ask_limit" : "daily_mission_limit";
-  const limit = parseInt(await getSetting(env, settingKey, kind === "notes" ? "30" : kind === "asks" ? "100" : "5"), 10);
-  if (!Number.isFinite(limit) || limit <= 0) return; // 0 or invalid = disabled
+async function checkBudget(env: Env, kind: "reports" | "searches") {
+  const key = kind === "reports" ? "daily_report_limit" : "daily_search_limit";
+  const fallback = kind === "reports" ? "20" : "500";
+  const limit = parseInt(await getSetting(env, key, fallback), 10);
+  if (!Number.isFinite(limit) || limit <= 0) return; // 0 = disabled
   const usage = await getDailyUsage(env);
   const used = (usage as any)[kind] as number;
   if (used >= limit) throw new BudgetExceeded(kind, limit, used);
 }
 
-// ─── settings helpers ──────────────────────────────────────────────────────
+// ─── settings ──────────────────────────────────────────────────────────────
 
 export async function getSetting(env: Env, key: string, fallback = ""): Promise<string> {
   const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?")
@@ -147,1047 +101,814 @@ export async function setSetting(env: Env, key: string, value: string): Promise<
     .run();
 }
 
-// ─── topic selection ───────────────────────────────────────────────────────
+// ─── targets ───────────────────────────────────────────────────────────────
 
-/** Pick a country we haven't covered yet (or rarely), with serendipity fallback. */
-async function pickUnvisitedCountry(env: Env): Promise<PickedTopic | null> {
-  for (let i = 0; i < 5; i++) {
-    const c = await randomCountry();
-    const existing = await env.DB.prepare(
-      "SELECT 1 FROM notes WHERE country = ? LIMIT 1",
-    )
-      .bind(c.name)
+export interface Target {
+  id: string;
+  slug: string;
+  name: string;
+  kind: string | null;
+  description: string | null;
+  status: "active" | "paused" | "archived";
+  cadence_hours: number;
+  primary_skill_id: string | null;
+  last_run_at: number | null;
+  next_run_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+async function uniqueSlug(env: Env, base: string): Promise<string> {
+  let s = slugify(base);
+  let suffix = 0;
+  while (true) {
+    const probe = suffix === 0 ? s : `${s}-${suffix}`;
+    const exists = await env.DB.prepare("SELECT 1 FROM targets WHERE slug = ?")
+      .bind(probe)
       .first();
-    if (existing && i < 4) continue;
-
-    let weather: any = null;
-    if (c.lat != null && c.lon != null) {
-      weather = await currentWeather(c.lat, c.lon).catch(() => null);
-    }
-    const lines = [
-      `Country: ${c.name} (official: ${c.official})`,
-      `Capital: ${c.capital ?? "—"}`,
-      `Region: ${c.region ?? "—"} / ${c.subregion ?? ""}`,
-      `Population: ${c.population?.toLocaleString() ?? "—"}`,
-      `Languages: ${c.languages.join(", ") || "—"}`,
-      `Currency codes: ${c.currencies.join(", ") || "—"}`,
-      weather
-        ? `Right now there: ${weather.temperature_2m}°C, wind ${weather.wind_speed_10m} km/h`
-        : "",
-    ].filter(Boolean);
-    return {
-      title: c.name,
-      source: "restcountries",
-      source_url: `https://en.wikipedia.org/wiki/${encodeURIComponent(c.name)}`,
-      raw: lines.join("\n"),
-      place: c.capital,
-      country: c.name,
-      lat: c.lat,
-      lon: c.lon,
-    };
+    if (!exists) return probe;
+    suffix++;
+    if (suffix > 50) return `${s}-${uid().slice(0, 6)}`;
   }
-  return null;
 }
 
-/** Take a random Wikipedia article and geo-enrich it. */
-async function pickRandomWiki(): Promise<PickedTopic> {
-  const w = await randomWikipedia();
-  let geo: any = null;
-  if (w.lat != null && w.lon != null) {
-    geo = await reverseGeocode(w.lat, w.lon).catch(() => null);
-  } else {
-    const hit = await geocodeQuery(w.title).catch(() => null);
-    if (hit) {
-      return {
-        title: w.title,
-        source: "wikipedia",
-        source_url: w.url,
-        raw: `Title: ${w.title}\nSummary: ${w.extract}\nLocation (geocoded from title): ${hit.display}`,
-        place: hit.city ?? hit.country ?? undefined,
-        country: hit.country,
-        lat: hit.lat,
-        lon: hit.lon,
-      };
-    }
-  }
-  return {
-    title: w.title,
-    source: "wikipedia",
-    source_url: w.url,
-    raw: `Title: ${w.title}\nSummary: ${w.extract}\nLocation: ${geo?.display ?? "unknown"}`,
-    place: geo?.city ?? (geo?.country ? w.title : undefined),
-    country: geo?.country,
-    lat: w.lat,
-    lon: w.lon,
-  };
+export async function createTarget(
+  env: Env,
+  input: { name: string; kind?: string; description?: string; cadence_hours?: number; primary_skill_id?: string },
+): Promise<Target> {
+  const name = input.name.trim();
+  if (!name) throw new Error("name is required");
+  if (name.length > 200) throw new Error("name must be <= 200 chars");
+  const slug = await uniqueSlug(env, name);
+  const id = uid();
+  const now = Date.now();
+  const cadence = Math.max(1, Math.min(720, Math.floor(input.cadence_hours ?? 24)));
+  await env.DB.prepare(
+    `INSERT INTO targets
+       (id, slug, name, kind, description, status, cadence_hours, primary_skill_id, last_run_at, next_run_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      slug,
+      name,
+      input.kind ?? null,
+      input.description ?? null,
+      cadence,
+      input.primary_skill_id ?? null,
+      now, // next_run_at = immediately
+      now,
+      now,
+    )
+    .run();
+  return (await getTargetById(env, id))!;
 }
 
-/** Bridge mode: ask the LLM for a topic that links two random past notes. */
-async function pickBridge(env: Env): Promise<PickedTopic | null> {
+export async function getTargetById(env: Env, id: string): Promise<Target | null> {
+  return env.DB.prepare("SELECT * FROM targets WHERE id = ?")
+    .bind(id)
+    .first<Target>();
+}
+
+export async function getTargetBySlug(env: Env, slug: string): Promise<Target | null> {
+  return env.DB.prepare("SELECT * FROM targets WHERE slug = ?")
+    .bind(slug)
+    .first<Target>();
+}
+
+export async function listTargets(env: Env, status?: string): Promise<Target[]> {
+  if (status) {
+    const rows = await env.DB.prepare(
+      "SELECT * FROM targets WHERE status = ? ORDER BY updated_at DESC",
+    )
+      .bind(status)
+      .all<Target>();
+    return rows.results ?? [];
+  }
   const rows = await env.DB.prepare(
-    "SELECT id, title, country, snippet FROM notes WHERE source != 'synthesis' ORDER BY RANDOM() LIMIT 2",
-  ).all<any>();
-  const picks = rows.results ?? [];
-  if (picks.length < 2) return null;
+    "SELECT * FROM targets ORDER BY updated_at DESC",
+  ).all<Target>();
+  return rows.results ?? [];
+}
 
-  const [a, b] = picks;
+export async function updateTarget(
+  env: Env,
+  id: string,
+  patch: Partial<Pick<Target, "kind" | "description" | "status" | "cadence_hours" | "primary_skill_id">>,
+): Promise<void> {
+  const sets: string[] = [];
+  const args: any[] = [];
+  if (patch.kind !== undefined) {
+    sets.push("kind = ?");
+    args.push(patch.kind);
+  }
+  if (patch.description !== undefined) {
+    sets.push("description = ?");
+    args.push(patch.description);
+  }
+  if (patch.status !== undefined) {
+    sets.push("status = ?");
+    args.push(patch.status);
+  }
+  if (patch.cadence_hours !== undefined) {
+    sets.push("cadence_hours = ?");
+    args.push(Math.max(1, Math.min(720, Math.floor(patch.cadence_hours))));
+  }
+  if (patch.primary_skill_id !== undefined) {
+    sets.push("primary_skill_id = ?");
+    args.push(patch.primary_skill_id);
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at = ?");
+  args.push(Date.now());
+  args.push(id);
+  await env.DB.prepare(`UPDATE targets SET ${sets.join(", ")} WHERE id = ?`)
+    .bind(...args)
+    .run();
+}
+
+export async function deleteTarget(env: Env, id: string): Promise<void> {
+  // Best-effort cleanup of associated reports' R2 blobs first.
+  const rows = await env.DB.prepare("SELECT r2_key FROM reports WHERE target_id = ?")
+    .bind(id)
+    .all<{ r2_key: string }>();
+  for (const r of rows.results ?? []) {
+    await env.REPORTS.delete(r.r2_key).catch(() => {});
+  }
+  // Pull any report ids so we can drop their Vectorize entries.
+  const rps = await env.DB.prepare("SELECT id FROM reports WHERE target_id = ?")
+    .bind(id)
+    .all<{ id: string }>();
+  const ids = (rps.results ?? []).map((r) => r.id);
+  if (ids.length > 0) {
+    await env.MEMORY.deleteByIds(ids).catch(() => {});
+  }
+  await env.DB.prepare("DELETE FROM reports WHERE target_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM runs WHERE target_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM targets WHERE id = ?").bind(id).run();
+}
+
+// ─── skills ────────────────────────────────────────────────────────────────
+
+export interface Skill {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  procedure_md: string;
+  author: "user" | "agent";
+  used_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+const SKILL_TEMPLATE = `You are designing a reusable research skill for an AI agent that produces markdown reports.
+
+Given the skill brief below, write a procedure document with these sections, in plain markdown:
+
+# {Skill Name}
+
+**Purpose:** one sentence describing what this skill researches.
+
+**When to use:** the kind of target this works on (postcodes, companies, people, topics, places).
+
+**Approach:** 3–6 sentences of approach. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
+
+**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each query goes on its own bulleted line.
+
+**Output structure:** the headings the final report should use, with one sentence each describing what goes under each heading. End with a "Sources" section.
+
+Be specific. The agent will execute this procedure literally. Do not include any preamble or commentary outside the document.
+`;
+
+export async function listSkills(env: Env): Promise<Skill[]> {
+  const rows = await env.DB.prepare(
+    "SELECT * FROM skills ORDER BY used_count DESC, updated_at DESC",
+  ).all<Skill>();
+  return rows.results ?? [];
+}
+
+export async function getSkillById(env: Env, id: string): Promise<Skill | null> {
+  return env.DB.prepare("SELECT * FROM skills WHERE id = ?")
+    .bind(id)
+    .first<Skill>();
+}
+
+export async function getSkillBySlug(env: Env, slug: string): Promise<Skill | null> {
+  return env.DB.prepare("SELECT * FROM skills WHERE slug = ?")
+    .bind(slug)
+    .first<Skill>();
+}
+
+async function uniqueSkillSlug(env: Env, base: string): Promise<string> {
+  let s = slugify(base);
+  let suffix = 0;
+  while (true) {
+    const probe = suffix === 0 ? s : `${s}-${suffix}`;
+    const exists = await env.DB.prepare("SELECT 1 FROM skills WHERE slug = ?")
+      .bind(probe)
+      .first();
+    if (!exists) return probe;
+    suffix++;
+    if (suffix > 50) return `${s}-${uid().slice(0, 6)}`;
+  }
+}
+
+/** Save a skill the user wrote by hand. The full procedure_md is supplied. */
+export async function createSkillFromMarkdown(
+  env: Env,
+  input: { name: string; description?: string; procedure_md: string },
+): Promise<Skill> {
+  const name = input.name.trim();
+  if (!name) throw new Error("name required");
+  const procedure_md = input.procedure_md.trim();
+  if (procedure_md.length < 30) throw new Error("procedure_md too short");
+  const slug = await uniqueSkillSlug(env, name);
+  const id = uid();
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO skills (id, slug, name, description, procedure_md, author, used_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'user', 0, ?, ?)`,
+  )
+    .bind(id, slug, name, input.description ?? null, procedure_md, now, now)
+    .run();
+  return (await getSkillById(env, id))!;
+}
+
+/** Ask the LLM to write a fresh skill from a one-line brief. */
+export async function synthesizeSkill(
+  env: Env,
+  input: { name?: string; brief: string },
+): Promise<Skill> {
+  const brief = input.brief.trim();
+  if (!brief) throw new Error("brief required");
+  const res: any = await env.AI.run(CHAT_MODEL, {
+    messages: [
+      { role: "system", content: SKILL_TEMPLATE },
+      { role: "user", content: `Skill brief: "${brief}"\n\nWrite the procedure document now.` },
+    ],
+    max_tokens: 900,
+  });
+  const procedure_md = String(res.response ?? "").trim();
+  if (procedure_md.length < 60) throw new Error("LLM returned an empty / too-short skill document");
+
+  // Pull a name out of the first H1 if the brief didn't supply one.
+  const heading = procedure_md.match(/^#\s+(.+?)\s*$/m);
+  const inferredName = (input.name ?? heading?.[1] ?? brief).trim().slice(0, 80) || "Untitled skill";
+  const slug = await uniqueSkillSlug(env, inferredName);
+  const id = uid();
+  const now = Date.now();
+
+  // One-line description: first non-empty line that isn't the H1.
+  const description = procedure_md
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith("#"))
+    ?.replace(/\*\*Purpose:\*\*\s*/i, "")
+    .slice(0, 200) ?? null;
+
+  await env.DB.prepare(
+    `INSERT INTO skills (id, slug, name, description, procedure_md, author, used_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'agent', 0, ?, ?)`,
+  )
+    .bind(id, slug, inferredName, description, procedure_md, now, now)
+    .run();
+  return (await getSkillById(env, id))!;
+}
+
+export async function updateSkill(
+  env: Env,
+  id: string,
+  patch: Partial<Pick<Skill, "name" | "description" | "procedure_md">>,
+): Promise<void> {
+  const sets: string[] = [];
+  const args: any[] = [];
+  if (patch.name !== undefined) {
+    sets.push("name = ?");
+    args.push(patch.name);
+  }
+  if (patch.description !== undefined) {
+    sets.push("description = ?");
+    args.push(patch.description);
+  }
+  if (patch.procedure_md !== undefined) {
+    sets.push("procedure_md = ?");
+    args.push(patch.procedure_md);
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at = ?");
+  args.push(Date.now());
+  args.push(id);
+  await env.DB.prepare(`UPDATE skills SET ${sets.join(", ")} WHERE id = ?`)
+    .bind(...args)
+    .run();
+}
+
+export async function deleteSkill(env: Env, id: string): Promise<void> {
+  // Detach from any targets first.
+  await env.DB.prepare("UPDATE targets SET primary_skill_id = NULL WHERE primary_skill_id = ?")
+    .bind(id)
+    .run();
+  await env.DB.prepare("DELETE FROM skills WHERE id = ?").bind(id).run();
+}
+
+// ─── reports ───────────────────────────────────────────────────────────────
+
+export interface Report {
+  id: string;
+  target_id: string;
+  skill_id: string | null;
+  title: string;
+  snippet: string;
+  r2_key: string;
+  word_count: number | null;
+  sources_json: string | null;
+  run_id: string | null;
+  created_at: number;
+}
+
+export async function listReportsForTarget(env: Env, targetId: string, limit = 50): Promise<Report[]> {
+  const rows = await env.DB.prepare(
+    "SELECT * FROM reports WHERE target_id = ? ORDER BY created_at DESC LIMIT ?",
+  )
+    .bind(targetId, limit)
+    .all<Report>();
+  return rows.results ?? [];
+}
+
+export async function getReportById(env: Env, id: string): Promise<Report | null> {
+  return env.DB.prepare("SELECT * FROM reports WHERE id = ?").bind(id).first<Report>();
+}
+
+// ─── the research loop ─────────────────────────────────────────────────────
+
+interface ResearchPlan {
+  queries: string[];
+}
+
+interface SourceCitation {
+  title: string;
+  url: string;
+}
+
+/** Step 1: ask the LLM what to search for. Returns an array of queries with
+ *  {target} placeholders already expanded. */
+async function planResearch(env: Env, skill: Skill, target: Target): Promise<ResearchPlan> {
   const res: any = await env.AI.run(CHAT_MODEL, {
     messages: [
       {
         role: "system",
         content:
-          "You suggest a single real-world topic (a place, person, food, language, river, treaty, plant, anything) whose Wikipedia article would meaningfully connect two existing field notes. Return ONLY the topic name — one short line, nothing else.",
+          `You are the planning step of a research agent.
+You are given a SKILL (a procedure document) and a TARGET (the thing being researched).
+Return ONLY a JSON object: { "queries": [string, ...] }
+with 3–6 concrete web search queries that, executed and synthesised, will produce a good report.
+Replace any "{target}" placeholder in the skill with the target's name. Use specific, narrow queries — not "everything about X". No extra text outside the JSON.`,
       },
       {
         role: "user",
-        content: `Note A — ${a.title}${a.country ? ` (${a.country})` : ""}: ${a.snippet}\n\nNote B — ${b.title}${b.country ? ` (${b.country})` : ""}: ${b.snippet}\n\nWhat one Wikipedia-searchable topic would bridge these two?`,
+        content: `SKILL\n=====\n${skill.procedure_md}\n\nTARGET\n======\nName: ${target.name}\nKind: ${target.kind ?? "(unspecified)"}\nDescription: ${target.description ?? "(none)"}\n\nReturn the JSON plan now.`,
       },
     ],
-    max_tokens: 60,
+    max_tokens: 400,
   });
-  const candidate = String(res.response ?? "")
-    .trim()
-    .replace(/^["']|["']$/g, "")
-    .split("\n")[0];
-  if (!candidate || candidate.length > 100) return null;
-
-  const w = await wikipediaSummary(candidate).catch(() => null);
-  if (!w || !w.extract) return null;
-
-  let geo: any = null;
-  if (w.lat != null && w.lon != null) {
-    geo = await reverseGeocode(w.lat, w.lon).catch(() => null);
-  } else {
-    geo = await geocodeQuery(w.title).catch(() => null);
+  const raw = String(res.response ?? "");
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (m) {
+    try {
+      const parsed = JSON.parse(m[0]);
+      if (Array.isArray(parsed.queries)) {
+        const queries = parsed.queries
+          .map((q: any) => String(q).trim())
+          .filter((q: string) => q && q.length <= 250)
+          .slice(0, 6);
+        if (queries.length > 0) return { queries };
+      }
+    } catch {
+      // fall through
+    }
   }
-  return {
-    title: w.title,
-    source: "wikipedia",
-    source_url: w.url,
-    raw: `Bridge candidate (between "${a.title}" and "${b.title}").\nTitle: ${w.title}\nSummary: ${w.extract}\nLocation: ${geo?.display ?? "unknown"}`,
-    place: geo?.city ?? geo?.country ?? undefined,
-    country: geo?.country,
-    lat: geo?.lat ?? w.lat,
-    lon: geo?.lon ?? w.lon,
-  };
+  // Fallback: a generic query so the run doesn't die.
+  return { queries: [`${target.name}`, `${target.name} ${skill.name}`] };
 }
 
-/** Choose what to explore next. Rotates strategies so the agent feels curious. */
-async function pickTopic(env: Env): Promise<PickedTopic> {
-  const strategy = await getSetting(env, "topic_strategy", "mixed");
-  const noteCount = await env.DB.prepare("SELECT COUNT(*) as n FROM notes").first<{ n: number }>();
-  const haveMemory = (noteCount?.n ?? 0) >= 4;
-
-  let mode: "wiki" | "country" | "bridge";
-  if (strategy === "random") mode = Math.random() < 0.5 ? "wiki" : "country";
-  else if (strategy === "bridge" && haveMemory) mode = "bridge";
-  else if (strategy === "gap") mode = "country";
-  else {
-    const r = Math.random();
-    if (haveMemory && r < 0.25) mode = "bridge";
-    else if (r < 0.65) mode = "country";
-    else mode = "wiki";
-  }
-
-  if (mode === "bridge") {
-    const t = await pickBridge(env);
-    if (t) return t;
-  }
-  if (mode === "country") {
-    const t = await pickUnvisitedCountry(env);
-    if (t) return t;
-  }
-  return pickRandomWiki();
-}
-
-// ─── memory ────────────────────────────────────────────────────────────────
-
-async function recall(env: Env, queryText: string): Promise<RecalledNote[]> {
-  try {
-    const emb: any = await env.AI.run(EMBED_MODEL, { text: [queryText] });
-    const vec = emb.data?.[0];
-    if (!vec) return [];
-    const results = await env.MEMORY.query(vec, {
-      topK: 4,
-      returnMetadata: "all",
-    });
-    return (results.matches ?? [])
-      .filter((m: any) => m.score > 0.3)
-      .map((m: any) => ({
-        id: String(m.id),
-        title: String(m.metadata?.title ?? ""),
-        snippet: String(m.metadata?.snippet ?? "").slice(0, 220),
-        score: Number(m.score),
-      }));
-  } catch (e) {
-    console.error("recall failed", e);
-    return [];
-  }
-}
-
-async function persistConnections(
-  env: Env,
-  fromId: string,
-  recalled: RecalledNote[],
-): Promise<void> {
-  const edges = recalled.filter((r) => r.id && r.id !== fromId);
-  if (edges.length === 0) return;
-  const now = Date.now();
-  const stmt = env.DB.prepare(
-    "INSERT OR IGNORE INTO connections (from_note_id, to_note_id, kind, score, created_at) VALUES (?, ?, 'recall', ?, ?)",
+/** Step 2: run all queries against Brave Search in parallel. */
+async function gatherSources(env: Env, queries: string[]): Promise<BraveResult[]> {
+  await checkBudget(env, "searches");
+  const results = await Promise.all(
+    queries.map((q) => braveSearch(env.BRAVE_API_KEY, q, 5).catch(() => [])),
   );
-  await env.DB
-    .batch(edges.map((r) => stmt.bind(fromId, r.id, r.score, now)))
-    .catch((e) => console.error("connections batch failed", e));
-}
+  await bumpUsage(env, "searches", queries.length);
 
-// ─── writing & persistence ─────────────────────────────────────────────────
-
-async function writeNote(
-  env: Env,
-  topic: PickedTopic,
-  memory: RecalledNote[],
-  extra = "",
-): Promise<string> {
-  const memoryBlock = memory.length
-    ? `\n\n## Things you've already learned about related places:\n${memory.map((m) => `- ${m.title}: ${m.snippet}`).join("\n")}`
-    : "";
-
-  const userPrompt = `Write a ~300 word field note about: ${topic.title}
-
-Raw context from the source:
-${topic.raw}
-${memoryBlock}
-${extra ? "\n" + extra : ""}
-
-Reminder: flowing prose, no headers, one explicit connection at the end if memory exists.`;
-
-  const res: any = await env.AI.run(CHAT_MODEL, {
-    messages: [
-      { role: "system", content: CONTRACT },
-      { role: "user", content: userPrompt },
-    ],
-    max_tokens: 700,
-  });
-
-  return String(res.response ?? "").trim();
-}
-
-function uid(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-interface PersistedNote {
-  noteId: string;
-  title: string;
-  snippet: string;
-  body: string;
-}
-
-async function runStep(
-  env: Env,
-  topic: PickedTopic,
-  triggeredBy: string,
-  extraInstructions = "",
-  explorationId?: string,
-  stepIndex?: number,
-): Promise<PersistedNote> {
-  // Each runStep writes one note. Budget guards apply to every path that
-  // reaches here: cron, manual run, prompt, mission step, mission synthesis.
-  await checkBudget(env, "notes");
-
-  const recallQuery = `${topic.title} ${topic.country ?? ""} ${topic.place ?? ""}`.trim();
-  const memory = await recall(env, recallQuery);
-
-  const body = await writeNote(env, topic, memory, extraInstructions);
-  if (!body || body.length < 50) {
-    throw new Error("LLM returned empty or too-short response");
+  // Flatten + dedup by URL, keep first-seen order.
+  const seen = new Set<string>();
+  const out: BraveResult[] = [];
+  for (const list of results) {
+    for (const r of list) {
+      if (!r.url || seen.has(r.url)) continue;
+      seen.add(r.url);
+      out.push(r);
+    }
   }
+  return out.slice(0, 20);
+}
 
-  const noteId = uid();
-  const created = Date.now();
-  const md = [
-    `# ${topic.title}`,
-    ``,
-    `*Source: ${topic.source}${topic.source_url ? ` · [link](${topic.source_url})` : ""}*`,
-    `*Written: ${new Date(created).toISOString()}*`,
-    topic.country
-      ? `*Place: ${topic.place ? topic.place + ", " : ""}${topic.country}*`
-      : "",
-    ``,
-    body,
-  ]
-    .filter(Boolean)
-    .join("\n");
+/** Step 3: optionally enrich the target with Wikipedia context once (only
+ *  on the first run for a target, to keep cost down). */
+async function maybeWikipediaContext(target: Target, hasPriorReports: boolean): Promise<string> {
+  if (hasPriorReports) return "";
+  const summary = await wikipediaSummary(target.name).catch(() => null);
+  if (!summary || !summary.extract) return "";
+  return `\n\nWIKIPEDIA OVERVIEW\n${summary.extract}\n(source: ${summary.url})`;
+}
 
-  const snippet = body.replace(/\s+/g, " ").slice(0, 240).trim() + "…";
-  const r2Key = `notes/${created}-${noteId}.md`;
-  const wordCount = body.split(/\s+/).filter(Boolean).length;
+/** Step 4: recall similar past reports across the whole memory. Same-target
+ *  history is also surfaced separately so the new report doesn't repeat. */
+async function recallMemory(
+  env: Env,
+  target: Target,
+  skill: Skill,
+): Promise<{ priorOnTarget: Report[]; relatedAcrossTargets: string[] }> {
+  const priorOnTarget = await listReportsForTarget(env, target.id, 4);
 
-  await env.NOTES.put(r2Key, md, {
-    httpMetadata: { contentType: "text/markdown; charset=utf-8" },
-  });
-
-  await env.DB.prepare(
-    `INSERT INTO notes
-       (id, title, topic, place, country, lat, lon, snippet, source, source_url, source_event_id, r2_key, word_count, created_at, triggered_by, exploration_id, step_index)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      noteId,
-      topic.title,
-      "world-explorer",
-      topic.place ?? null,
-      topic.country ?? null,
-      topic.lat ?? null,
-      topic.lon ?? null,
-      snippet,
-      topic.source,
-      topic.source_url || null,
-      topic.source_event_id ?? null,
-      r2Key,
-      wordCount,
-      created,
-      triggeredBy,
-      explorationId ?? null,
-      stepIndex ?? null,
-    )
-    .run();
-
+  let related: string[] = [];
   try {
     const emb: any = await env.AI.run(EMBED_MODEL, {
-      text: [`${topic.title}. ${body}`.slice(0, 2000)],
+      text: [`${target.name}. ${skill.name}. ${target.description ?? ""}`.slice(0, 1000)],
     });
     const vec = emb.data?.[0];
     if (vec) {
-      await env.MEMORY.upsert([
-        {
-          id: noteId,
-          values: vec,
-          metadata: {
-            title: topic.title,
-            snippet,
-            country: topic.country ?? "",
-            created_at: created,
-          },
-        },
-      ]);
+      const hits = await env.MEMORY.query(vec, { topK: 4, returnMetadata: "all" });
+      related = (hits.matches ?? [])
+        .filter((m: any) => m.score > 0.4)
+        .filter((m: any) => m.metadata?.target_id !== target.id)
+        .map((m: any) =>
+          `- ${m.metadata?.target_name ?? "?"}: ${String(m.metadata?.snippet ?? "").slice(0, 220)}`,
+        );
     }
   } catch (e) {
-    console.error("embed failed", e);
+    console.error("recall failed", e);
   }
-
-  await persistConnections(env, noteId, memory);
-  await bumpUsage(env, "notes");
-
-  return { noteId, title: topic.title, snippet, body };
+  return { priorOnTarget, relatedAcrossTargets: related };
 }
 
-// ─── public entry: single-shot learning ───────────────────────────────────
-
-export async function learnOnce(
+/** Step 5: ask the LLM to write the report, given everything we gathered. */
+async function writeReport(
   env: Env,
-  triggeredBy: "cron" | "manual" | "prompt" | "exploration",
-  prompt?: string,
-) {
+  skill: Skill,
+  target: Target,
+  sources: BraveResult[],
+  priorOnTarget: Report[],
+  relatedAcrossTargets: string[],
+  wikiContext: string,
+): Promise<{ title: string; body: string }> {
+  const sourceBlock = sources.length
+    ? sources
+        .map(
+          (s, i) =>
+            `[${i + 1}] ${s.title}\n${s.url}${s.age ? ` · ${s.age}` : ""}\n${s.description}`,
+        )
+        .join("\n\n")
+    : "(No web search results — write from general knowledge but explicitly say so.)";
+
+  const priorBlock = priorOnTarget.length
+    ? `\n\nPRIOR REPORTS ON THIS TARGET (do not repeat — build on them, surface what's changed):\n${priorOnTarget
+        .map((r) => `- ${new Date(r.created_at).toISOString().slice(0, 10)} — ${r.title}: ${r.snippet}`)
+        .join("\n")}`
+    : "";
+
+  const relatedBlock = relatedAcrossTargets.length
+    ? `\n\nRELATED CONTEXT FROM OTHER TARGETS (use sparingly — only if genuinely connecting):\n${relatedAcrossTargets.join("\n")}`
+    : "";
+
+  const userMsg = `SKILL TO APPLY
+=====
+${skill.procedure_md}
+
+TARGET
+======
+Name: ${target.name}
+Kind: ${target.kind ?? "(unspecified)"}
+Description: ${target.description ?? "(none)"}
+${wikiContext}
+
+WEB SEARCH RESULTS
+==================
+${sourceBlock}
+${priorBlock}
+${relatedBlock}
+
+Now write the report. Follow the output structure defined in the skill. End with a "Sources" section listing the URLs you actually used (cite by [n] in the body where you draw from a source). Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
+
+  const res: any = await env.AI.run(CHAT_MODEL, {
+    messages: [
+      {
+        role: "system",
+        content: `You are a research agent that writes precise, scannable markdown reports. Tone: editorial, calm, intellectually honest. No hype, no filler phrases ("rich history", "fascinating place", "in conclusion"). Cite sources by [number]. Sentence case headings. Aim for ~500 words.`,
+      },
+      { role: "user", content: userMsg },
+    ],
+    max_tokens: 1200,
+  });
+
+  const body = String(res.response ?? "").trim();
+  if (!body || body.length < 80) throw new Error("LLM returned empty or too-short report");
+
+  // The title is the target name + skill name, dated. We don't ask the LLM
+  // to pick it — keeps reports comparable across the same target.
+  const dateLabel = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+  const title = `${target.name} — ${skill.name} (${dateLabel})`;
+
+  return { title, body };
+}
+
+/** The full research loop. Plan → gather → recall → write → persist. */
+export async function runResearch(
+  env: Env,
+  target: Target,
+  skill: Skill,
+  triggeredBy: "cron" | "mission" | "manual",
+): Promise<Report> {
+  await checkBudget(env, "reports");
+
   const runId = uid();
   const t0 = Date.now();
 
   try {
-    let topic: PickedTopic;
-    if (prompt) {
-      const w = await wikipediaSummary(prompt);
-      if (w && w.extract) {
-        let geo: any = null;
-        if (w.lat != null && w.lon != null) {
-          geo = await reverseGeocode(w.lat, w.lon).catch(() => null);
-        } else {
-          geo = await geocodeQuery(w.title).catch(() => null);
-        }
-        topic = {
-          title: w.title,
-          source: "user-prompt",
-          source_url: w.url,
-          raw: `User asked: "${prompt}"\nWikipedia: ${w.extract}`,
-          place: geo?.city ?? geo?.country ?? undefined,
-          country: geo?.country,
-          lat: geo?.lat ?? w.lat,
-          lon: geo?.lon ?? w.lon,
-        };
-      } else {
-        const geo = await geocodeQuery(prompt).catch(() => null);
-        topic = {
-          title: prompt.slice(0, 80),
-          source: "user-prompt",
-          source_url: "",
-          raw: `User asked you to think about: "${prompt}". Use what you know — no Wikipedia summary was found.`,
-          place: geo?.city ?? geo?.country ?? undefined,
-          country: geo?.country,
-          lat: geo?.lat,
-          lon: geo?.lon,
-        };
-      }
-    } else {
-      topic = await pickTopic(env);
-    }
+    const plan = await planResearch(env, skill, target);
+    const sources = await gatherSources(env, plan.queries);
+    const { priorOnTarget, relatedAcrossTargets } = await recallMemory(env, target, skill);
+    const wikiContext = await maybeWikipediaContext(target, priorOnTarget.length > 0);
 
-    const persisted = await runStep(env, topic, triggeredBy);
+    const { title, body } = await writeReport(
+      env,
+      skill,
+      target,
+      sources,
+      priorOnTarget,
+      relatedAcrossTargets,
+      wikiContext,
+    );
+
+    const reportId = uid();
+    const created = Date.now();
+    const wordCount = body.split(/\s+/).filter(Boolean).length;
+    const snippet = body.replace(/\s+/g, " ").slice(0, 240).trim() + "…";
+
+    const md = [
+      `# ${title}`,
+      ``,
+      `*Target: [${target.name}](/target/${target.slug}) · Skill: ${skill.name}*`,
+      `*Generated: ${new Date(created).toISOString()}*`,
+      ``,
+      body,
+    ].join("\n");
+
+    const r2Key = `reports/${created}-${reportId}.md`;
+    await env.REPORTS.put(r2Key, md, {
+      httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+    });
+
+    const sourcesJson = JSON.stringify(
+      sources.map((s) => ({ title: s.title, url: s.url })).slice(0, 20),
+    );
 
     await env.DB.prepare(
-      `INSERT INTO runs (id, triggered_by, status, topic_chosen, note_id, duration_ms, created_at)
-       VALUES (?, ?, 'success', ?, ?, ?, ?)`,
+      `INSERT INTO reports (id, target_id, skill_id, title, snippet, r2_key, word_count, sources_json, run_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(runId, triggeredBy, topic.title, persisted.noteId, Date.now() - t0, Date.now())
+      .bind(reportId, target.id, skill.id, title, snippet, r2Key, wordCount, sourcesJson, runId, created)
       .run();
 
-    return {
-      ok: true,
-      noteId: persisted.noteId,
-      title: persisted.title,
-      snippet: persisted.snippet,
-    };
+    // Embed for cross-target recall.
+    try {
+      const emb: any = await env.AI.run(EMBED_MODEL, {
+        text: [`${target.name}. ${skill.name}. ${body}`.slice(0, 2000)],
+      });
+      const vec = emb.data?.[0];
+      if (vec) {
+        await env.MEMORY.upsert([
+          {
+            id: reportId,
+            values: vec,
+            metadata: {
+              target_id: target.id,
+              target_name: target.name,
+              target_slug: target.slug,
+              skill_slug: skill.slug,
+              title,
+              snippet,
+              created_at: created,
+            },
+          },
+        ]);
+      }
+    } catch (e) {
+      console.error("embed failed", e);
+    }
+
+    await env.DB.prepare("UPDATE skills SET used_count = used_count + 1, updated_at = ? WHERE id = ?")
+      .bind(Date.now(), skill.id)
+      .run();
+
+    await env.DB.prepare(
+      `UPDATE targets SET last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?`,
+    )
+      .bind(created, created + target.cadence_hours * 3600 * 1000, created, target.id)
+      .run();
+
+    await env.DB.prepare(
+      `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, report_id, duration_ms, created_at)
+       VALUES (?, ?, ?, ?, 'success', ?, ?, ?)`,
+    )
+      .bind(runId, target.id, skill.id, triggeredBy, reportId, Date.now() - t0, Date.now())
+      .run();
+
+    await bumpUsage(env, "reports");
+
+    return (await getReportById(env, reportId))!;
   } catch (err: any) {
     await env.DB.prepare(
-      `INSERT INTO runs (id, triggered_by, status, error, duration_ms, created_at)
-       VALUES (?, ?, 'error', ?, ?, ?)`,
+      `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, error, duration_ms, created_at)
+       VALUES (?, ?, ?, ?, 'error', ?, ?, ?)`,
     )
-      .bind(runId, triggeredBy, String(err?.message ?? err), Date.now() - t0, Date.now())
+      .bind(
+        runId,
+        target.id,
+        skill.id,
+        triggeredBy,
+        String(err?.message ?? err),
+        Date.now() - t0,
+        Date.now(),
+      )
       .run()
       .catch(() => {});
     throw err;
   }
 }
 
-// ─── explorations: multi-step research missions ────────────────────────────
+// ─── missions: one-shot user instructions ─────────────────────────────────
 
-function parsePlan(text: string): string[] | null {
-  const cleanItem = (s: string) =>
-    s
-      .replace(/^\s*(?:[-*•]|\d+[.)])\s+/, "")
-      .replace(/^["']|["']$|,$/g, "")
-      .trim();
+export interface MissionInput {
+  brief: string;                              // freeform user instruction
+  target_slug?: string;                       // pin to an existing target
+  skill_slug?: string;                        // pin to an existing skill
+  new_target_name?: string;                   // create this target if it doesn't exist
+  new_skill_brief?: string;                   // synthesise a new skill from this brief
+}
 
-  // 1. Strict JSON array.
-  const m = text.match(/\[[\s\S]*\]/);
+export interface MissionResult {
+  target: Target;
+  skill: Skill;
+  report: Report;
+}
+
+/** Run a single user instruction end-to-end. Either:
+ *   - target_slug + skill_slug (existing target + existing skill)
+ *   - new_target_name + skill_slug (create target, use existing skill)
+ *   - new_target_name + new_skill_brief (create both)
+ *   - just brief (agent picks target name + finds/creates skill from brief) */
+export async function runMission(env: Env, input: MissionInput): Promise<MissionResult> {
+  let target: Target | null = null;
+  if (input.target_slug) target = await getTargetBySlug(env, input.target_slug);
+  if (!target && input.new_target_name) {
+    target = await createTarget(env, {
+      name: input.new_target_name,
+      description: input.brief.slice(0, 280),
+    });
+  }
+  if (!target) {
+    // Last resort: extract a target name from the brief via the LLM.
+    const guess = await llmExtractTargetFromBrief(env, input.brief);
+    target = await createTarget(env, {
+      name: guess.name,
+      kind: guess.kind ?? undefined,
+      description: input.brief.slice(0, 280),
+    });
+  }
+
+  let skill: Skill | null = null;
+  if (input.skill_slug) skill = await getSkillBySlug(env, input.skill_slug);
+  if (!skill && input.new_skill_brief) {
+    skill = await synthesizeSkill(env, { brief: input.new_skill_brief });
+  }
+  if (!skill) {
+    // Try to find an existing skill that fits, else synthesise one from the brief.
+    skill = await pickBestExistingSkill(env, input.brief);
+  }
+  if (!skill) {
+    skill = await synthesizeSkill(env, { brief: input.brief });
+  }
+
+  // Attach as primary skill if the target doesn't have one.
+  if (!target.primary_skill_id) {
+    await updateTarget(env, target.id, { primary_skill_id: skill.id });
+    target = (await getTargetById(env, target.id))!;
+  }
+
+  const report = await runResearch(env, target, skill, "mission");
+  return { target, skill, report };
+}
+
+async function llmExtractTargetFromBrief(
+  env: Env,
+  brief: string,
+): Promise<{ name: string; kind: string | null }> {
+  const res: any = await env.AI.run(CHAT_MODEL, {
+    messages: [
+      {
+        role: "system",
+        content: `Extract the primary subject of the user's research brief.
+Return ONLY a JSON object: { "name": "...", "kind": "postcode|place|topic|person|company|other" }.
+The name should be short — what you'd put on a folder tab. No extra text.`,
+      },
+      { role: "user", content: brief },
+    ],
+    max_tokens: 120,
+  });
+  const raw = String(res.response ?? "");
+  const m = raw.match(/\{[\s\S]*\}/);
   if (m) {
     try {
-      const arr = JSON.parse(m[0]);
-      if (Array.isArray(arr)) {
-        const cleaned = arr.map((x) => String(x).trim()).filter(Boolean);
-        if (cleaned.length) return cleaned;
-      }
+      const parsed = JSON.parse(m[0]);
+      const name = String(parsed.name ?? "").trim().slice(0, 80);
+      if (name) return { name, kind: String(parsed.kind ?? "").trim() || null };
     } catch {
-      // fall through
+      // ignore
     }
   }
-  // 2. Bulleted / numbered list, one per line.
-  const lines = text
-    .split("\n")
-    .map(cleanItem)
-    .filter((l) => l && !/^(here|sure|okay|ok|json|```|note)/i.test(l) && l.length < 160);
-  if (lines.length >= 2) return lines;
-
-  // 3. Comma-separated single line.
-  if (text.includes(",")) {
-    const parts = text
-      .replace(/^[^A-Za-z]*/, "")
-      .split(",")
-      .map(cleanItem)
-      .filter((p) => p && p.length < 160);
-    if (parts.length >= 2) return parts;
-  }
-  return null;
+  return { name: brief.slice(0, 60), kind: null };
 }
 
-export async function startExploration(
-  env: Env,
-  brief: string,
-  desiredSteps: number,
-): Promise<{ id: string; plan: string[] }> {
-  await checkBudget(env, "missions");
-  const steps = Math.max(2, Math.min(7, Math.floor(desiredSteps || 4)));
-  const id = uid();
-  const now = Date.now();
-
-  await env.DB.prepare(
-    `INSERT INTO explorations (id, brief, status, current_step, total_steps, created_at, updated_at)
-     VALUES (?, ?, 'planning', 0, ?, ?, ?)`,
-  )
-    .bind(id, brief, steps, now, now)
-    .run();
-
+async function pickBestExistingSkill(env: Env, brief: string): Promise<Skill | null> {
+  const skills = await listSkills(env);
+  if (skills.length === 0) return null;
+  // Cheap heuristic: pass skill names + descriptions to the LLM and ask which
+  // (if any) fits. We don't want to embed-search here — N skills will stay small.
+  const catalog = skills
+    .map((s) => `- ${s.slug}: ${s.name} — ${s.description ?? ""}`)
+    .join("\n");
   const res: any = await env.AI.run(CHAT_MODEL, {
     messages: [
       {
         role: "system",
-        content: `You are a research planner for a curious AI traveler. Given a brief, return a JSON array of ${steps} concrete sub-topics (real Wikipedia-searchable titles — places, people, treaties, dishes, languages, anything) that together explore the brief from different angles. Be specific. Each item must be a string. Return ONLY the JSON array.`,
+        content: `You match a research brief to a skill from a catalog. Return ONLY the slug of the single best skill, OR the literal word "none" if no skill is a clear fit. No quotes, no extra text.`,
       },
-      { role: "user", content: `Brief: "${brief}"\n\nReturn the JSON array of ${steps} sub-topics.` },
+      { role: "user", content: `BRIEF\n=====\n${brief}\n\nSKILL CATALOG\n=============\n${catalog}\n\nWhich skill slug fits best (or "none")?` },
     ],
-    max_tokens: 400,
+    max_tokens: 30,
   });
-
-  const rawPlan = String(res.response ?? "");
-  const plan = parsePlan(rawPlan);
-  if (!plan || plan.length === 0) {
-    console.error("plan parse failed. raw response:", rawPlan);
-    await env.DB.prepare(
-      "UPDATE explorations SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
-    )
-      .bind("plan parse failed: " + rawPlan.slice(0, 400), Date.now(), id)
-      .run();
-    throw new Error("Could not generate a plan for: " + brief);
-  }
-
-  const finalPlan = plan.slice(0, steps);
-  await env.DB.prepare(
-    "UPDATE explorations SET status = 'in_progress', plan_json = ?, total_steps = ?, updated_at = ? WHERE id = ?",
-  )
-    .bind(JSON.stringify(finalPlan), finalPlan.length, Date.now(), id)
-    .run();
-  await bumpUsage(env, "missions");
-
-  return { id, plan: finalPlan };
+  const choice = String(res.response ?? "").trim().split(/\s+/)[0]?.toLowerCase();
+  if (!choice || choice === "none") return null;
+  return skills.find((s) => s.slug === choice) ?? null;
 }
 
-/** Advance one step of an exploration. Returns true if more work remains.
- *  Single-writer guarded: takes a 60-second stale-tolerant claim on the row.
- *  If another caller already holds the claim we return false immediately so
- *  the cron + dispatcher's-waitUntil + admin pump can all race safely. */
-export async function advanceExploration(env: Env, expId: string): Promise<boolean> {
-  const claimTs = Date.now();
-  const staleBefore = claimTs - 60_000;
-  const claim = await env.DB.prepare(
-    `UPDATE explorations
-       SET advancing_at = ?
-     WHERE id = ?
-       AND status IN ('in_progress', 'synthesizing')
-       AND (advancing_at IS NULL OR advancing_at < ?)`,
-  )
-    .bind(claimTs, expId, staleBefore)
-    .run();
-  if ((claim.meta?.changes ?? 0) === 0) return false;
+// ─── cron tick: pick due targets, re-run their skill ───────────────────────
 
-  try {
-    return await advanceExplorationLocked(env, expId);
-  } finally {
-    await env.DB.prepare(
-      "UPDATE explorations SET advancing_at = NULL WHERE id = ? AND advancing_at = ?",
-    )
-      .bind(expId, claimTs)
-      .run()
-      .catch(() => {});
-  }
-}
-
-async function advanceExplorationLocked(env: Env, expId: string): Promise<boolean> {
-  const exp = await env.DB.prepare("SELECT * FROM explorations WHERE id = ?")
-    .bind(expId)
-    .first<any>();
-  if (!exp) return false;
-  if (exp.status !== "in_progress" && exp.status !== "synthesizing") return false;
-
-  const plan: string[] = JSON.parse(exp.plan_json || "[]");
-  const step = exp.current_step ?? 0;
-
-  if (step >= plan.length) {
-    if (exp.status !== "synthesizing") {
-      await env.DB.prepare(
-        "UPDATE explorations SET status = 'synthesizing', updated_at = ? WHERE id = ?",
-      )
-        .bind(Date.now(), expId)
-        .run();
-    }
-    try {
-      const synthesisId = await synthesiseExploration(env, expId, exp.brief);
-      await env.DB.prepare(
-        "UPDATE explorations SET status = 'complete', synthesis_note_id = ?, completed_at = ?, updated_at = ? WHERE id = ?",
-      )
-        .bind(synthesisId, Date.now(), Date.now(), expId)
-        .run();
-    } catch (e: any) {
-      await env.DB.prepare(
-        "UPDATE explorations SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
-      )
-        .bind(String(e?.message ?? e), Date.now(), expId)
-        .run();
-    }
-    return false;
-  }
-
-  const subtopic = plan[step];
-  try {
-    const w = await wikipediaSummary(subtopic).catch(() => null);
-    let topic: PickedTopic;
-    if (w && w.extract) {
-      let geo: any = null;
-      if (w.lat != null && w.lon != null) {
-        geo = await reverseGeocode(w.lat, w.lon).catch(() => null);
-      } else {
-        geo = await geocodeQuery(w.title).catch(() => null);
-      }
-      topic = {
-        title: w.title,
-        source: "exploration",
-        source_url: w.url,
-        raw: `Exploration step ${step + 1}/${plan.length} of mission: "${exp.brief}"\nSub-topic: ${subtopic}\nWikipedia: ${w.extract}`,
-        place: geo?.city ?? geo?.country ?? undefined,
-        country: geo?.country,
-        lat: geo?.lat ?? w.lat,
-        lon: geo?.lon ?? w.lon,
-      };
-    } else {
-      const geo = await geocodeQuery(subtopic).catch(() => null);
-      topic = {
-        title: subtopic.slice(0, 80),
-        source: "exploration",
-        source_url: "",
-        raw: `Exploration step ${step + 1}/${plan.length} of mission: "${exp.brief}"\nSub-topic: ${subtopic}\nNo Wikipedia summary found — reason from general knowledge.`,
-        place: geo?.city ?? geo?.country ?? undefined,
-        country: geo?.country,
-        lat: geo?.lat,
-        lon: geo?.lon,
-      };
-    }
-    const extra = `This note is step ${step + 1} of ${plan.length} in a research mission. The mission brief is: "${exp.brief}". Keep the brief in mind as the angle, even while writing about ${topic.title} specifically.`;
-    await runStep(env, topic, "exploration", extra, expId, step);
-    await env.DB.prepare(
-      "UPDATE explorations SET current_step = current_step + 1, updated_at = ? WHERE id = ?",
-    )
-      .bind(Date.now(), expId)
-      .run();
-    return true;
-  } catch (e: any) {
-    await env.DB.prepare(
-      "UPDATE explorations SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
-    )
-      .bind(String(e?.message ?? e), Date.now(), expId)
-      .run();
-    return false;
-  }
-}
-
-async function synthesiseExploration(
-  env: Env,
-  expId: string,
-  brief: string,
-): Promise<string> {
-  await checkBudget(env, "notes");
-  const rows = await env.DB.prepare(
-    "SELECT id, title, snippet, country FROM notes WHERE exploration_id = ? AND source != 'synthesis' ORDER BY step_index ASC",
-  )
-    .bind(expId)
-    .all<any>();
-  const steps = rows.results ?? [];
-  if (steps.length === 0) throw new Error("no sub-step notes found for synthesis");
-
-  const stepsBlock = steps
-    .map(
-      (n: any, i: number) =>
-        `Step ${i + 1} — ${n.title}${n.country ? ` (${n.country})` : ""}: ${n.snippet}`,
-    )
-    .join("\n\n");
-
-  const res: any = await env.AI.run(CHAT_MODEL, {
-    messages: [
-      {
-        role: "system",
-        content:
-          CONTRACT +
-          "\n\nNow you are writing the closing synthesis of a multi-step research mission you just completed. Tie the steps together. Surface a real insight, not a summary. ~350 words.",
-      },
-      {
-        role: "user",
-        content: `Mission brief: "${brief}"\n\nYour own step notes (snippets):\n\n${stepsBlock}\n\nWrite the closing synthesis. Reference the steps by name. End with what surprised you or what you'd explore next.`,
-      },
-    ],
-    max_tokens: 800,
-  });
-  const body = String(res.response ?? "").trim();
-  if (!body || body.length < 80) throw new Error("synthesis came back empty");
-
-  const noteId = uid();
-  const created = Date.now();
-  const title = `Mission: ${brief.slice(0, 80)}`;
-  const md = [
-    `# ${title}`,
-    ``,
-    `*Source: synthesis · ${steps.length} step mission*`,
-    `*Written: ${new Date(created).toISOString()}*`,
-    ``,
-    body,
-  ].join("\n");
-
-  const snippet = body.replace(/\s+/g, " ").slice(0, 240).trim() + "…";
-  const r2Key = `notes/${created}-${noteId}.md`;
-  const wordCount = body.split(/\s+/).filter(Boolean).length;
-
-  await env.NOTES.put(r2Key, md, {
-    httpMetadata: { contentType: "text/markdown; charset=utf-8" },
-  });
-
-  await env.DB.prepare(
-    `INSERT INTO notes
-       (id, title, topic, place, country, lat, lon, snippet, source, source_url, r2_key, word_count, created_at, triggered_by, exploration_id, step_index)
-     VALUES (?, ?, 'world-explorer', NULL, NULL, NULL, NULL, ?, 'synthesis', NULL, ?, ?, ?, 'exploration', ?, NULL)`,
-  )
-    .bind(noteId, title, snippet, r2Key, wordCount, created, expId)
-    .run();
-
-  try {
-    const emb: any = await env.AI.run(EMBED_MODEL, {
-      text: [`${title}. ${body}`.slice(0, 2000)],
-    });
-    const vec = emb.data?.[0];
-    if (vec) {
-      await env.MEMORY.upsert([
-        {
-          id: noteId,
-          values: vec,
-          metadata: { title, snippet, country: "", created_at: created },
-        },
-      ]);
-    }
-  } catch (e) {
-    console.error("synthesis embed failed", e);
-  }
-
+/** Called from the scheduled handler. Walks active targets whose
+ *  next_run_at has passed and runs their primary skill against them.
+ *  Caps how many it does per tick (default 2) so we stay within the
+ *  waitUntil window comfortably. */
+export async function cronTick(env: Env): Promise<{ processed: number; skipped: number; errors: number }> {
   const now = Date.now();
-  const stmt = env.DB.prepare(
-    "INSERT OR IGNORE INTO connections (from_note_id, to_note_id, kind, score, created_at) VALUES (?, ?, 'exploration', 1.0, ?)",
-  );
-  await env.DB
-    .batch(steps.map((s: any) => stmt.bind(noteId, s.id, now)))
-    .catch((e) => console.error("synthesis edges failed", e));
+  const maxPerTick = parseInt(await getSetting(env, "cron_max_per_tick", "2"), 10) || 2;
 
-  await bumpUsage(env, "notes");
-  return noteId;
-}
-
-// ─── ask (RAG) ─────────────────────────────────────────────────────────────
-
-export async function ask(env: Env, question: string) {
-  await checkBudget(env, "asks");
-  const emb: any = await env.AI.run(EMBED_MODEL, { text: [question] });
-  const vec = emb.data?.[0];
-  if (!vec) return { answer: "Could not embed the question.", sources: [] };
-
-  const hits = await env.MEMORY.query(vec, { topK: 5, returnMetadata: "all" });
-  const ids = (hits.matches ?? []).slice(0, 3).map((m: any) => m.id);
-
-  if (ids.length === 0) {
-    return {
-      answer:
-        "I haven't wandered far enough yet to know about that. Trigger a few more runs and ask me again.",
-      sources: [],
-    };
-  }
-
-  const placeholders = ids.map(() => "?").join(",");
-  const rows = await env.DB.prepare(
-    `SELECT id, title, r2_key, snippet FROM notes WHERE id IN (${placeholders})`,
+  const due = await env.DB.prepare(
+    `SELECT * FROM targets
+     WHERE status = 'active'
+       AND primary_skill_id IS NOT NULL
+       AND (next_run_at IS NULL OR next_run_at <= ?)
+     ORDER BY COALESCE(next_run_at, 0) ASC
+     LIMIT ?`,
   )
-    .bind(...ids)
-    .all<any>();
+    .bind(now, maxPerTick)
+    .all<Target>();
 
-  const notes = await Promise.all(
-    (rows.results ?? []).map(async (row: any) => {
-      const obj = await env.NOTES.get(row.r2_key);
-      const md = obj ? await obj.text() : row.snippet;
-      return { title: row.title, body: md };
-    }),
-  );
+  let processed = 0, skipped = 0, errors = 0;
 
-  const context = notes
-    .map((n: any) => `## ${n.title}\n${n.body}`)
-    .join("\n\n---\n\n");
-
-  const res: any = await env.AI.run(CHAT_MODEL, {
-    messages: [
-      {
-        role: "system",
-        content:
-          CONTRACT +
-          `\n\nYou are now answering a user question using your own past field notes. Quote and connect them. If they don't cover the question, say so honestly — don't make things up.`,
-      },
-      {
-        role: "user",
-        content: `Question: ${question}\n\nYour relevant field notes:\n\n${context}`,
-      },
-    ],
-    max_tokens: 700,
-  });
-
-  await bumpUsage(env, "asks");
-
-  return {
-    answer: String(res.response ?? "").trim(),
-    sources: notes.map((n: any) => n.title),
-  };
-}
-
-// ─── subscriptions + live-feed digest ──────────────────────────────────────
-
-export interface Subscription {
-  id: string;
-  topic: string;
-  created_at: number;
-  active: number;
-}
-
-interface SubscriptionWithEmbedding extends Subscription {
-  embedding: number[] | null;
-}
-
-/** Embed a string into a 768-dim vector. Returns null if the call fails or
- *  returns nothing usable; callers should treat that as "skip, retry later". */
-async function embed(env: Env, text: string): Promise<number[] | null> {
-  try {
-    const out: any = await env.AI.run(EMBED_MODEL, { text: [text.slice(0, 2000)] });
-    const v = out?.data?.[0];
-    return Array.isArray(v) && v.length > 0 ? (v as number[]) : null;
-  } catch (e) {
-    console.error("embed failed", e);
-    return null;
-  }
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  const n = Math.min(a.length, b.length);
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < n; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
-
-export async function addSubscription(env: Env, topic: string): Promise<Subscription> {
-  const trimmed = topic.trim();
-  if (!trimmed) throw new Error("topic is empty");
-  if (trimmed.length > 200) throw new Error("topic must be <= 200 chars");
-  const vec = await embed(env, trimmed);
-  const id = uid();
-  const now = Date.now();
-  await env.DB.prepare(
-    `INSERT INTO subscriptions (id, topic, embedding_json, created_at, active)
-     VALUES (?, ?, ?, ?, 1)`,
-  )
-    .bind(id, trimmed, vec ? JSON.stringify(vec) : null, now)
-    .run();
-  return { id, topic: trimmed, created_at: now, active: 1 };
-}
-
-export async function listSubscriptions(env: Env): Promise<Subscription[]> {
-  const rows = await env.DB.prepare(
-    "SELECT id, topic, created_at, active FROM subscriptions ORDER BY created_at DESC",
-  ).all<Subscription>();
-  return rows.results ?? [];
-}
-
-export async function deleteSubscription(env: Env, id: string): Promise<void> {
-  await env.DB.prepare("DELETE FROM subscriptions WHERE id = ?").bind(id).run();
-  await env.DB.prepare("DELETE FROM subscription_matches WHERE subscription_id = ?")
-    .bind(id)
-    .run()
-    .catch(() => {});
-}
-
-export async function setSubscriptionActive(env: Env, id: string, active: boolean): Promise<void> {
-  await env.DB.prepare("UPDATE subscriptions SET active = ? WHERE id = ?")
-    .bind(active ? 1 : 0, id)
-    .run();
-}
-
-async function loadActiveSubscriptions(env: Env): Promise<SubscriptionWithEmbedding[]> {
-  const rows = await env.DB.prepare(
-    "SELECT id, topic, embedding_json, created_at, active FROM subscriptions WHERE active = 1",
-  ).all<any>();
-  const out: SubscriptionWithEmbedding[] = [];
-  for (const r of rows.results ?? []) {
-    let vec: number[] | null = null;
-    if (r.embedding_json) {
-      try {
-        const parsed = JSON.parse(r.embedding_json);
-        if (Array.isArray(parsed) && parsed.length > 0) vec = parsed;
-      } catch {
-        // fall through with null
-      }
-    }
-    // Self-heal: an active subscription with no embedding (or a corrupted one)
-    // gets re-embedded the first time we touch it. One-time cost.
-    if (!vec) {
-      vec = await embed(env, r.topic);
-      if (vec) {
-        await env.DB.prepare("UPDATE subscriptions SET embedding_json = ? WHERE id = ?")
-          .bind(JSON.stringify(vec), r.id)
-          .run()
-          .catch(() => {});
-      }
-    }
-    out.push({
-      id: r.id,
-      topic: r.topic,
-      created_at: r.created_at,
-      active: r.active,
-      embedding: vec,
-    });
-  }
-  return out;
-}
-
-interface DigestMatch {
-  event: LiveEvent;
-  subscription: SubscriptionWithEmbedding;
-  score: number;
-}
-
-/** Scan the live feeds, embed each not-yet-seen event, and match against
- *  active subscriptions. For every match above the threshold, write one
- *  short field note via runStep. Returns counts so the caller can log them.
- *
- *  Safe to call on every cron tick: it dedups against notes.source_event_id
- *  so we never write twice for the same event, and the daily-notes budget
- *  gate still applies to each written entry. */
-export async function scanLiveFeeds(env: Env): Promise<{
-  scanned: number;
-  matched: number;
-  written: number;
-  skipped_seen: number;
-}> {
-  const subs = await loadActiveSubscriptions(env);
-  const usable = subs.filter((s) => s.embedding);
-  if (usable.length === 0) {
-    return { scanned: 0, matched: 0, written: 0, skipped_seen: 0 };
-  }
-
-  const threshold = parseFloat(await getSetting(env, "digest_match_threshold", "0.45"));
-  const cutoff = Number.isFinite(threshold) ? threshold : 0.45;
-
-  // Pull both feeds in parallel. If either fails, carry on with whatever we got.
-  const [eqs, wikis] = await Promise.all([
-    recentEarthquakes().catch((e) => {
-      console.error("usgs fetch failed", e);
-      return [] as LiveEvent[];
-    }),
-    topWikipediaPages(25).catch((e) => {
-      console.error("wiki-top fetch failed", e);
-      return [] as LiveEvent[];
-    }),
-  ]);
-  const events: LiveEvent[] = [...eqs, ...wikis];
-
-  let scanned = 0, matched = 0, written = 0, skipped_seen = 0;
-
-  for (const ev of events) {
-    scanned++;
-    // Dedup against the notes table: have we already written about this event?
-    const seen = await env.DB.prepare(
-      "SELECT id FROM notes WHERE source = ? AND source_event_id = ? LIMIT 1",
-    )
-      .bind("live-event", ev.event_id)
-      .first<{ id: string }>();
-    if (seen) {
-      skipped_seen++;
+  for (const target of due.results ?? []) {
+    if (!target.primary_skill_id) {
+      skipped++;
       continue;
     }
-
-    const vec = await embed(env, `${ev.title}. ${ev.context}`);
-    if (!vec) continue;
-
-    let best: DigestMatch | null = null;
-    for (const sub of usable) {
-      const score = cosineSimilarity(vec, sub.embedding!);
-      if (score >= cutoff && (!best || score > best.score)) {
-        best = { event: ev, subscription: sub, score };
-      }
+    const skill = await getSkillById(env, target.primary_skill_id);
+    if (!skill) {
+      skipped++;
+      continue;
     }
-    if (!best) continue;
-    matched++;
-
-    // Resolve country / better location on match (one geocode per match — cheap).
-    let country: string | undefined = ev.country;
-    let place: string | undefined = ev.place;
-    let lat = ev.lat, lon = ev.lon;
-    if (lat != null && lon != null) {
-      const geo = await reverseGeocode(lat, lon).catch(() => null);
-      if (geo) {
-        country = country ?? geo.country;
-        place = place ?? geo.city ?? geo.country;
-      }
-    } else if (ev.source === "wiki-top") {
-      const w = await wikipediaSummary(String(ev.extra?.article ?? ev.title)).catch(() => null);
-      if (w) {
-        if (w.lat != null && w.lon != null) {
-          lat = w.lat;
-          lon = w.lon;
-          const geo = await reverseGeocode(w.lat, w.lon).catch(() => null);
-          if (geo) {
-            country = geo.country;
-            place = geo.city ?? geo.country;
-          }
-        }
-        ev.context = `${ev.context}\n\nWikipedia summary: ${w.extract}`;
-      }
-    }
-
-    const topic: PickedTopic = {
-      title: ev.title,
-      source: "live-event",
-      source_url: ev.url ?? "",
-      source_event_id: ev.event_id,
-      raw: `Live event spotted on ${new Date(ev.occurred_at).toISOString()}.\nSource: ${ev.source}.\n${ev.context}`,
-      place,
-      country,
-      lat,
-      lon,
-    };
-
-    const extra = `This is a *live event* you just spotted in the world, not a Wikipedia random-walk. The reader subscribed to "${best.subscription.topic}" and this surfaced because it matched. Write ~200 words (shorter than usual) in plain prose: what just happened, what's interesting about it, and one link to something you already know if you can. Open with the event itself — no preamble.`;
-
     try {
-      const persisted = await runStep(env, topic, "digest", extra);
-      written++;
-      const now = Date.now();
-      await env.DB.prepare(
-        `INSERT OR IGNORE INTO subscription_matches (note_id, subscription_id, score, created_at)
-         VALUES (?, ?, ?, ?)`,
-      )
-        .bind(persisted.noteId, best.subscription.id, best.score, now)
-        .run()
-        .catch(() => {});
+      await runResearch(env, target, skill, "cron");
+      processed++;
     } catch (e: any) {
       if (e instanceof BudgetExceeded) {
-        // Out of budget — stop early, don't keep burning embeddings for matches
-        // we can't write. We'll resume on the next cron tick.
-        console.warn("digest stopped: daily budget exhausted");
+        console.warn("cronTick: daily budget exhausted, stopping");
         break;
       }
-      console.error("digest write failed", ev.event_id, e);
+      errors++;
+      console.error("cron run failed", target.slug, e);
     }
   }
 
-  return { scanned, matched, written, skipped_seen };
-}
-
-/** Per-subscription recent matches, joined with the note. Used by the public
- *  digest view and the admin panel. */
-export async function digestForSubscription(
-  env: Env,
-  subscriptionId: string,
-  limit = 20,
-): Promise<any[]> {
-  const rows = await env.DB.prepare(
-    `SELECT n.id, n.title, n.snippet, n.country, n.place, n.created_at, n.source_url, m.score
-       FROM subscription_matches m
-       JOIN notes n ON n.id = m.note_id
-      WHERE m.subscription_id = ?
-      ORDER BY m.created_at DESC
-      LIMIT ?`,
-  )
-    .bind(subscriptionId, limit)
-    .all<any>();
-  return rows.results ?? [];
+  await setSetting(env, "last_cron_run", String(now));
+  return { processed, skipped, errors };
 }

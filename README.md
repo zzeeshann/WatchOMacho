@@ -1,79 +1,41 @@
 # WatchOMacho
 
-An autonomous AI agent that wanders the world through public archives — Wikipedia, OpenStreetMap, REST Countries, Open-Meteo — and writes short field notes about what it finds. It runs on its own schedule, remembers what it has already learned, links new notes back into a growing memory graph, and serves a vintage explorer-journal dashboard.
+A research agent you give jobs to. You hand it a **target** (a postcode, a person, a company, a topic) and a **skill** (a reusable research procedure) — the agent applies the skill, writes a report, and keeps the target's page fresh on a cadence you set.
 
-Built end-to-end on Cloudflare: Workers (compute), Workers AI (the brain), Vectorize (memory), R2 (note storage), D1 (structured store + audit log), Cron Triggers (autonomy).
+Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. Web search via Brave Search.
 
-> **New here? Open [BOOK.md](BOOK.md).** It walks complete beginners through what Cloudflare is, what each piece (Workers / Workers AI / D1 / R2 / Vectorize) does, what an agent loop actually is, how RAG works, and how WatchOMacho is glued together. ~10 short chapters; no prior knowledge assumed.
-
-## What it does (v3)
-
-- **Digest mode (new)**: in `digest` strategy, the agent doesn't wander randomly — it watches live feeds (USGS earthquakes, surging Wikipedia articles) every cron tick and only writes a short note when an event matches one of your **interest subscriptions** by semantic similarity. Quiet days cost nothing.
-- **Interest subscriptions**: freeform topics like *"Pacific volcanism"* or *"central Asian languages"*. Each is embedded once; incoming events are matched by cosine similarity above a tunable threshold. Set, mute, and delete from the admin panel.
-- **Per-topic public digest**: the public dashboard shows recent matches grouped under each topic, so "today's signal from the world" is the front door instead of a random map dot.
-- **Autonomous runs**: every N hours (configurable live, no redeploy) it picks a topic and writes a ~300-word field note.
-- **Smarter topic choice**: rotates between *random country*, *random Wikipedia*, *bridge mode* (LLM picks a topic that connects two past notes), a *gap* bias toward unvisited countries, or *digest* (live-feed interest-monitor).
-- **Persistent memory**: every note is embedded with `bge-base-en-v1.5` and stored in Vectorize. The agent retrieves the 3–4 most similar past notes before writing, so the new note can explicitly connect to what it already knows.
-- **Real knowledge graph**: every retrieval edge is persisted in a `connections` table, so the map can draw the actual links the agent has made — not just where it's been.
-- **Missions** (multi-step research): admin sends a brief like *"Explore high-altitude human settlements and what makes life there possible"*. The LLM plans 3–5 sub-topics, the agent writes a note on each, then writes a closing **synthesis** note that ties them together. Missions resume across cron ticks and admin pageloads.
-- **Ask**: RAG over every field note the agent has written.
-- **Public dashboard**: stats, a sepia journey map with a chronological travel path *and* connection arcs between linked notes, the digest, recent field notes.
-- **Admin panel**: trigger runs, dispatch missions, ask, manage subscriptions, set cadence + topic strategy + daily budgets, see active missions and recent runs.
-
-## Safety, abuse, and cost gates
-
-- **Daily budgets**: separate caps for *notes / day*, *asks / day*, *missions / day*, set live from the admin panel. Caps are checked before any Workers-AI call — when exhausted, endpoints return `429` with a friendly JSON message and the daily counter resets at 00:00 UTC.
-- **Login throttle**: 10 failed `/admin/login` attempts per IP in any rolling 10-minute window locks that IP out (HTTP 429) without even reaching the secret-compare.
-- **Single-writer mission lock**: each exploration has a stale-tolerant `advancing_at` claim, so concurrent pumpers (cron + dispatcher's `waitUntil` + admin pageload) can't write duplicate step notes.
-- **Constant-time secret compare**: admin secret check uses XOR-fold equality regardless of input length.
-- **Cookies**: `HttpOnly`, `Secure`, `SameSite=Strict` — CSRF-safe by construction.
-- **Security headers on every response**: strict CSP (allowing only the actual externals — OpenStreetMap tiles, unpkg for Leaflet, Google Fonts), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy` disabling camera/mic/geolocation.
-- **Safe JSON-in-script**: the map's inline `<script>` payload escapes `</`, `<!--`, and U+2028/U+2029 so a note title can't break out of the script tag.
-- **Client-side popup escaping**: marker popups are built with an explicit HTML-escape on the title/place fields, and the note id is whitelist-validated before being put into a URL.
-- **SQL injection-proof**: every D1 query uses `prepare().bind()`. No string concatenation into SQL.
-
-## Architecture
+## The three concepts
 
 ```
-       cron (hourly) / GET / / POST /admin/run / POST /admin/explore / POST /admin/ask
-                                          │
-                                          ▼
-                              Cloudflare Worker (src/index.ts)
-                                          │
-                ┌─────────────────────────┼────────────────────────┐
-                ▼                         ▼                        ▼
-          Public APIs               Workers AI                 Memory
-       (Wikipedia REST,        (Llama 3.3 70B chat,       (Vectorize 768-d
-        REST Countries,         bge-base-en-v1.5         + R2 markdown blobs
-        Nominatim,              embedding)                + D1 metadata, edges,
-        Open-Meteo)                                        runs, missions,
-                                                           usage, settings)
+   ┌────────────┐    ┌──────────┐    ┌──────────┐
+   │  MISSION   │ →  │  SKILL   │ →  │  TARGET  │
+   │ user-given │    │ markdown │    │ /target/ │
+   │            │    │ procedure│    │   :slug  │
+   └────────────┘    └──────────┘    └──────────┘
 ```
 
-Source layout:
+- **Target** — a thing the agent watches. Each target has its own page that accumulates reports over time. Statuses: `active`, `paused`, `archived`.
+- **Skill** — a named markdown procedure the agent reads at run-time. Skills are reusable across targets (apply *housing research* to HA0 4GP, SE1, E14, …). You can write skills by hand or describe a brief and let the agent synthesise the procedure.
+- **Mission** — one user instruction. *"Research HA0 4GP, present a housing report."* The agent picks/creates a target, picks/creates a skill, runs it, and links you to the report.
 
-```
-WatchOMacho/
-├── wrangler.toml          # Cloudflare bindings + cron
-├── schema.sql             # full v2 D1 schema (fresh installs)
-├── migration-v2.sql       # v1 → v2 (explorations, connections, settings)
-├── migration-v3.sql       # v2 → v3 (budgets, login_attempts)
-├── migration-v4.sql       # v3 → v4 (exploration single-writer claim)
-├── package.json
-├── tsconfig.json
-├── .dev.vars.example
-├── README.md              # you are here
-├── BOOK.md                # absolute-beginner companion book
-└── src/
-    ├── index.ts           # router + cron + scheduled handler
-    ├── agent.ts           # learnOnce, ask, missions, memory, budgets
-    ├── apis.ts            # Wikipedia / REST Countries / Nominatim / Open-Meteo
-    └── dashboard.ts       # all server-rendered HTML
-```
+The cron walks active targets and re-runs the attached skill on each one's cadence. Quiet targets stay quiet, busy ones keep producing updates.
+
+## What a run does, end-to-end
+
+For each `(target, skill)` execution:
+
+1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries.
+2. **Gather** — Brave Search runs every query in parallel; results are merged and deduped.
+3. **Recall** — Vectorize returns the most relevant past reports (so the new one *builds on* prior ones rather than repeating).
+4. **Wikipedia** — on the first report for a target, a one-shot Wikipedia summary is pulled for grounding.
+5. **Write** — the LLM writes a ~500-word markdown report following the skill's output structure, citing sources by number.
+6. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs`.
+
+Two LLM calls + N Brave Searches per run. Predictable cost, predictable structure.
 
 ## Setup — about 10 minutes
 
-You need a Cloudflare account (free tier works), `npm`, and Node 18+.
+You need a Cloudflare account (free tier works), `npm`, Node 18+, and a free [Brave Search API key](https://api.search.brave.com/app/keys) (2000 queries/month on the Free AI plan).
 
 ### 1. Install
 
@@ -90,31 +52,31 @@ npx wrangler login
 npm run db:create
 # → copy the returned database_id into wrangler.toml under [[d1_databases]]
 
-npm run db:init        # creates notes + runs + settings + explorations + connections + daily_usage + login_attempts
-npm run bucket:create  # creates the R2 bucket
-npm run vector:create  # creates the Vectorize index (768 dims, cosine)
+npm run db:init         # creates targets, skills, reports, runs, settings, etc.
+npm run bucket:create   # creates the R2 bucket
+npm run vector:create   # creates the Vectorize index (768 dims, cosine)
 ```
 
-If you're upgrading an existing v1 install, run the migrations in order:
+If you're upgrading from any earlier version, run the v6 migration instead of `db:init` — it drops the old data model and creates the new one:
 
 ```bash
-npx wrangler d1 execute watchomacho-db --remote --file=migration-v2.sql
-npx wrangler d1 execute watchomacho-db --remote --file=migration-v3.sql
-npx wrangler d1 execute watchomacho-db --remote --file=migration-v4.sql
-npx wrangler d1 execute watchomacho-db --remote --file=migration-v5.sql
+npx wrangler d1 execute watchomacho-db --remote --file=migration-v6.sql
 ```
 
-### 3. Set the admin secret
-
-This is the password that unlocks `/admin/login`. Use a long random string — it's the only thing standing between strangers and your Workers-AI budget.
+### 3. Set the secrets
 
 ```bash
-# Generate + upload in one step (zsh / bash)
+# admin panel password
 SECRET=$(openssl rand -hex 32)
-echo "ADMIN_SECRET=$SECRET" >> .dev.vars     # for local dev (gitignored)
 echo "$SECRET" | npx wrangler secret put ADMIN_SECRET
-echo "$SECRET"                                # save this somewhere safe
+echo "$SECRET"  # save it
+
+# Brave Search API key (free at api.search.brave.com)
+npx wrangler secret put BRAVE_API_KEY
+# paste your key when prompted
 ```
+
+Without `BRAVE_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes).
 
 ### 4. Deploy
 
@@ -122,85 +84,53 @@ echo "$SECRET"                                # save this somewhere safe
 npm run deploy
 ```
 
-If you set the custom-domain route in `wrangler.toml`, wrangler creates the DNS record and the SSL cert automatically (your domain has to be a Zone on the same Cloudflare account). Otherwise wrangler gives you a `*.workers.dev` URL.
+If you set a custom-domain route in `wrangler.toml`, wrangler handles DNS + SSL automatically. Otherwise you'll get a `*.workers.dev` URL.
 
 ### 5. First run
 
-The public dashboard is empty until the agent learns something. Three options:
+1. Open `/admin/login` and unlock with your secret.
+2. Open **Skills** → write or synthesise one (e.g. *"Housing research for UK postcodes"*).
+3. Open **Admin** → add a target (e.g. `HA0 4GP`), attach the skill, tick *Run once immediately*.
+4. ~30 seconds later, the target's public page (`/target/ha0-4gp`) shows the first report.
+5. Every cron tick after that, the agent re-runs the skill and appends an update.
 
-- Go to `/admin/login`, enter your secret, then **Trigger a single run** in the panel.
-- **Send the agent on a mission** with a brief and a step count.
-- Wait for the next cron tick (default frequency: 6 hours).
+## Customising
 
-A single run takes ~10–15 seconds (one chat call + two embedding calls + a few public API hits). A 3-step mission takes 30–60 seconds, which exceeds one Worker invocation's `waitUntil` budget — the dispatcher kicks off as many steps as it can, then the hourly cron + every admin pageload pump it forward.
+### The agent's voice
 
-## Customizing
+The system prompt for the report writer is in `writeReport()` inside [src/agent.ts](src/agent.ts). Defaults to a restrained editorial tone. Change it freely.
 
-### The agent's personality
+### Cadence
 
-The agent reads a `CONTRACT` string in [src/agent.ts](src/agent.ts). Edit it freely — change the tone, the rules, the topics it focuses on. The next run picks up the changes.
-
-### How often it runs
-
-Two settings interact:
-
-1. The cron schedule in `wrangler.toml` (default `0 * * * *` — fires every hour). This is the *maximum* resolution.
-2. `frequency_hours` in the `settings` table (default 6), editable live from the admin panel. The scheduled handler only actually writes a note if `now - last_cron_run ≥ frequency_hours`.
-
-So the cron always wakes up to *pump explorations forward*, but only writes a fresh autonomous note when the frequency setting says it's time.
-
-### Topic strategy
-
-Set from the admin panel (`/admin` → Cadence & strategy):
-
-- **mixed** (default): 40% country, 35% wiki, 25% bridge (once memory exists)
-- **random**: 50/50 wiki / country, no smart selection
-- **bridge**: always picks a topic that connects two past notes via an LLM call
-- **gap**: favours unvisited countries
-- **digest**: skip the random walk entirely. Each cron tick fetches USGS earthquakes (mag 4.5+) and yesterday's surging Wikipedia articles, embeds each new event, and writes a short field note only when an event matches one of your subscriptions above `digest_match_threshold` (default 0.45). Add topics in the admin panel under *Interest subscriptions*. The daily-notes budget still gates writes, so a viral wiki day can't drain the budget.
+Per target, set from the admin: 1h / 6h / 12h / 24h / 3d / weekly. The hourly cron walks `targets` looking for `next_run_at <= now` and runs at most `cron_max_per_tick` (default 2) per tick.
 
 ### Daily budgets
 
-Set from the admin panel (`/admin` → Budget & safety). Defaults are conservative:
+Set from `/admin`:
 
-- `daily_note_limit`: 30
-- `daily_ask_limit`: 100
-- `daily_mission_limit`: 5
+- `daily_report_limit` — caps how many reports the agent will write in a UTC day (default 20)
+- `daily_search_limit` — caps Brave Search calls (default 500)
+- `cron_max_per_tick` — how many targets the cron advances per hour (default 2)
 
-Set any to `0` to disable the cap for that kind. Counters reset at 00:00 UTC.
+Counters reset at 00:00 UTC.
 
-### The model
+### Models
 
-[src/agent.ts](src/agent.ts) uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` by default. If your account doesn't have access, swap to `@cf/meta/llama-3.1-8b-instruct-fast` — same API, smaller and faster, still produces good notes.
-
-The embedding model `@cf/baai/bge-base-en-v1.5` outputs 768-dim vectors. **If you change the embedding model you must recreate the Vectorize index with matching dimensions.**
-
-### Adding sources
-
-[src/apis.ts](src/apis.ts) has one function per API. To add a new one (e.g. Hacker News, USGS earthquakes), write a fetcher there and branch into it from `pickTopic()` in [src/agent.ts](src/agent.ts).
+[src/agent.ts](src/agent.ts) uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` for chat and `@cf/baai/bge-base-en-v1.5` for embeddings. If your account doesn't have access to Llama 3.3 70B, swap to `@cf/meta/llama-3.1-8b-instruct-fast` — same API, smaller, still fine.
 
 ## Cost
 
-Realistic monthly cost at 4 cron runs/day + a few admin missions, on Cloudflare's free tier: **£0**.
+On the free tier, with 20 reports/day and ~5 searches per report:
 
 - Workers requests: free under 100k/day
-- Workers AI: 10k neurons/day free; each run uses ~50–200 neurons; missions cost roughly `(steps + 1)` runs each
+- Workers AI: 10k neurons/day free. Two chat calls + one embedding per report ≈ ~250 neurons. 20 reports/day ≈ 5k neurons — under the cap.
+- Brave Search: 2000 queries/month free = ~65/day. At 5 searches per report, that's 13 reports/day before paying. Lower `daily_report_limit` to 13 if you want zero-cost, or upgrade Brave's plan.
 - Vectorize: 30M queried dimensions/month free
-- R2: 10GB free, $0 egress
+- R2: 10GB free, no egress
 - D1: 5GB free
 - Cron Triggers: free
 
-If the agent goes viral or you set frequency to every hour with no budgets, you'd hit the Workers Paid plan ($5/mo) and pay metered usage on top. **That's why the budget gates exist.** Set them low and raise them deliberately.
-
-## Local development
-
-```bash
-cp .dev.vars.example .dev.vars
-# edit ADMIN_SECRET in .dev.vars
-npm run dev
-```
-
-Note: D1, Vectorize, and Workers AI work against your real Cloudflare account even in `wrangler dev` (unless you pass `--local`, in which case some bindings don't work). Easiest path: dev against your real bindings — they're free.
+If you need more, Cloudflare Workers Paid ($5/mo) + a paid Brave plan covers a serious workload.
 
 ## API surface
 
@@ -208,43 +138,40 @@ Public (no auth):
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/` | Dashboard HTML |
-| `GET` | `/note/:id` | Single note HTML with linked-notes panel |
-| `GET` | `/api/journey?limit=N` | Recent notes (JSON) |
-| `GET` | `/api/stats` | Aggregate counters (JSON) |
-| `GET` | `/api/connections?limit=N` | Memory graph edges (JSON) |
+| `GET` | `/` | Home — list of active targets |
+| `GET` | `/target/:slug` | Target page with all reports |
+| `GET` | `/skill/:slug` | Skill detail with procedure |
+| `GET` | `/report/:id` | Single report |
+| `GET` | `/api/targets` | Active targets (JSON) |
+| `GET` | `/api/skills` | Skills (JSON, without `procedure_md`) |
 
 Admin (cookie auth):
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/admin/login` | Login page |
-| `POST` | `/admin/login` | Set admin cookie. Throttled per IP. |
-| `POST` | `/admin/logout` | Clear admin cookie |
-| `GET` | `/admin` | Admin panel HTML. Also pumps in-flight missions. |
-| `POST` | `/admin/run` | Trigger one note (form: optional `prompt`) |
-| `POST` | `/admin/ask` | RAG question (form: `question`) |
-| `POST` | `/admin/explore` | Dispatch mission (form: `brief`, `steps`) |
-| `GET` | `/admin/explorations` | Recent missions (JSON) |
-| `GET` | `/admin/settings` | Current settings (JSON) |
-| `POST` | `/admin/settings` | Update settings (form fields: `frequency_hours`, `topic_strategy`, `daily_note_limit`, `daily_ask_limit`, `daily_mission_limit`) |
-| `GET` | `/admin/usage` | Today's usage (JSON) |
-| `GET` | `/admin/subscriptions` | List interest subscriptions (JSON) |
-| `POST` | `/admin/subscriptions` | Add a new subscription (form: `topic`) |
-| `POST` | `/admin/subscriptions/:id/toggle` | Mute / unmute (form: `active` = `0` or `1`) |
-| `POST` | `/admin/subscriptions/:id/delete` | Delete a subscription |
-| `POST` | `/admin/digest/scan` | Run one digest scan immediately (returns counts) |
+| `POST` | `/admin/login` | Set admin cookie (IP-throttled) |
+| `POST` | `/admin/logout` | Clear cookie |
+| `GET` | `/admin` | Overview |
+| `GET` | `/admin/skills` | Skill library |
+| `POST` | `/admin/skills` | Create (form: `mode=synthesize&brief=…` or `mode=write&name&procedure_md`) |
+| `POST` | `/admin/skills/:slug/update` | Edit |
+| `POST` | `/admin/skills/:slug/delete` | Delete |
+| `POST` | `/admin/targets` | Create target (form: `name`, optional `kind`, `description`, `cadence_hours`, `skill_slug`, `run_now`) |
+| `GET` | `/admin/targets/:slug` | Edit page |
+| `POST` | `/admin/targets/:slug/update` | Patch target |
+| `POST` | `/admin/targets/:slug/run` | Run immediately |
+| `POST` | `/admin/targets/:slug/delete` | Delete target + reports |
+| `POST` | `/admin/mission` | One-shot mission (form: `brief`, optional pins) |
+| `GET` / `POST` | `/admin/settings` | Read / write budgets |
+| `POST` | `/admin/cron/tick` | Manually trigger a cron tick (testing) |
 
-All admin POST endpoints accept form-urlencoded, multipart, or JSON request bodies.
+## Security
 
-## Troubleshooting
-
-**"Could not generate a plan"** when dispatching a mission: rare. The LLM occasionally returns prose instead of a list. The parser handles JSON arrays, bulleted lists, numbered lists, and comma-separated lines — but very long briefs sometimes confuse it. Re-dispatch with a shorter brief.
-
-**"plan parse failed: …"** in mission errors: the raw LLM output is included so you can see exactly what came back. Usually fixable by rephrasing.
-
-**Mission stuck at N/M for an hour**: a step crashed mid-claim. The `advancing_at` claim auto-expires after 60 seconds, so the next cron tick will retry.
-
-**Map is empty**: the agent has only written notes about non-place topics (people, abstract concepts) that didn't resolve to coordinates. Trigger a `country` strategy run or dispatch a mission with geographic sub-topics.
-
-**429 on the API**: daily budget exhausted. Bump it in the admin panel or wait until 00:00 UTC.
+- Admin cookie: `HttpOnly`, `Secure`, `SameSite=Strict`. CSRF-safe by construction.
+- Login throttle: 10 failed attempts per IP per 10-minute window → HTTP 429.
+- Constant-time secret compare (XOR-fold).
+- Strict CSP, no external scripts, no inline event handlers beyond what the dashboard ships.
+- All D1 queries use prepared statements with bound parameters. No string concat into SQL.
+- All HTML rendered server-side with explicit escaping.
+- Markdown renderer is a hand-rolled subset (no `<img>`, no raw HTML) — even agent-written reports can't inject script.
