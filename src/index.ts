@@ -53,7 +53,7 @@ const SECURITY_HEADERS: Record<string, string> = {
     "img-src 'self' data:",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
-    "script-src 'self' 'unsafe-inline'",
+    "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com",
     "connect-src 'self'",
     "frame-ancestors 'none'",
     "base-uri 'self'",

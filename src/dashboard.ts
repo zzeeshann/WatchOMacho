@@ -478,6 +478,30 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // Extend Tailwind with the same design tokens already used by the
+  // hand-rolled CSS in BASE_CSS, so utility classes like text-zee-primary
+  // resolve to identical pixel values. No design change.
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          'zee-bg':      '#FAF8F4',
+          'zee-cream':   '#FAF8F4',
+          'zee-text':    '#1A1A1A',
+          'zee-primary': '#1A6B62',
+          'zee-muted':   '#6B6B6B',
+          'zee-gold':    '#C49A1A',
+          'zee-border':  '#E8E4DE',
+        },
+        fontFamily: {
+          sans: ['"DM Sans"', 'system-ui', 'sans-serif'],
+        },
+      },
+    },
+  };
+</script>
 </head>
 <body>
 <header class="site-header">
@@ -485,11 +509,11 @@ ${FONTS}
     <a href="/" class="brand">WatchOMacho</a>
     <nav class="nav">
       ${navLink("/", "Targets", "home")}
-      ${isAdmin ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/skills", "Skills", "skills")} ${navLink("/admin/tools", "Tools", "tools")} <form method="post" action="/admin/logout" style="display:inline;margin-left:8px"><button class="btn btn-secondary" style="padding:4px 10px;font-size:11px">Logout</button></form>` : navLink("/admin/login", "Admin", "admin")}
+      ${isAdmin ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/skills", "Skills", "skills")} ${navLink("/admin/tools", "Tools", "tools")} <form method="post" action="/admin/logout" class="inline ml-2"><button class="btn btn-secondary px-2.5 py-1 text-[11px]">Logout</button></form>` : navLink("/admin/login", "Admin", "admin")}
     </nav>
   </div>
 </header>
-<main class="wrap" style="flex:1;padding:8px 24px 16px">
+<main class="wrap flex-1 px-6 pt-2 pb-4">
 ${body}
 </main>
 <footer>
@@ -531,30 +555,30 @@ export async function renderHome(env: Env): Promise<string> {
   let hero = "";
   if (enriched.length === 0) {
     hero = `
-      <section style="padding:56px 0">
+      <section class="py-14">
         <p class="label">Empty — for now</p>
-        <h1 class="headline" style="margin-top:8px">No targets yet.</h1>
-        <p class="subhead">Give the agent something to research. <a href="/admin/login" style="color:var(--zee-primary);border-bottom:1px solid currentColor">Open the admin</a>, add a target like <em>Bhutan</em> or <em>OpenAI</em>, attach a skill, and the agent will keep that target's page fresh.</p>
+        <h1 class="headline mt-2">No targets yet.</h1>
+        <p class="subhead">Give the agent something to research. <a href="/admin/login" class="text-zee-primary border-b border-current">Open the admin</a>, add a target like <em>Bhutan</em> or <em>OpenAI</em>, attach a skill, and the agent will keep that target's page fresh.</p>
       </section>
     `;
   } else {
     const top = enriched[0];
     if (top.latest) {
       hero = `
-        <section style="padding:32px 0 56px">
-          <p class="label">Latest <span style="color:rgba(107,107,107,0.6);font-weight:400;text-transform:none;letter-spacing:normal;margin-left:6px">· ${escapeHtml(timeAgo(top.latest.created_at))}</span></p>
-          <a href="/target/${escapeHtml(top.target.slug)}" style="display:block;margin-top:14px">
+        <section class="pt-8 pb-14">
+          <p class="label">Latest <span class="ml-1.5 font-normal normal-case tracking-normal text-[rgba(107,107,107,0.6)]">· ${escapeHtml(timeAgo(top.latest.created_at))}</span></p>
+          <a href="/target/${escapeHtml(top.target.slug)}" class="block mt-3.5">
             <h1 class="headline">${escapeHtml(top.target.name)}</h1>
             <p class="subhead">${escapeHtml(top.latest.snippet)}</p>
-            <p style="margin-top:20px;font-size:14px;font-weight:500;color:var(--zee-primary)">Open the target page <span aria-hidden="true">→</span></p>
+            <p class="mt-5 text-sm font-medium text-zee-primary">Open the target page <span aria-hidden="true">→</span></p>
           </a>
         </section>
       `;
     } else {
       hero = `
-        <section style="padding:32px 0 56px">
+        <section class="pt-8 pb-14">
           <p class="label">Newest target</p>
-          <a href="/target/${escapeHtml(top.target.slug)}" style="display:block;margin-top:14px">
+          <a href="/target/${escapeHtml(top.target.slug)}" class="block mt-3.5">
             <h1 class="headline">${escapeHtml(top.target.name)}</h1>
             <p class="subhead">No reports yet. ${top.target.primary_skill_id ? "First run is queued." : "Attach a skill to start producing reports."}</p>
           </a>
@@ -566,7 +590,7 @@ export async function renderHome(env: Env): Promise<string> {
   const list = enriched.slice(1).map(({ target, latest }) => `
     <a class="piece" href="/target/${escapeHtml(target.slug)}">
       <div class="piece-row">
-        <div style="flex:1;min-width:0">
+        <div class="flex-1 min-w-0">
           <p class="piece-title">${escapeHtml(target.name)} <span class="piece-arrow" aria-hidden="true">→</span></p>
           <p class="piece-meta">${escapeHtml(latest?.title ?? target.description ?? (target.kind ?? "target"))}</p>
         </div>
@@ -578,13 +602,13 @@ export async function renderHome(env: Env): Promise<string> {
   const body = `
     ${hero}
     ${stats}
-    <section style="padding:32px 0 0">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+    <section class="pt-8">
+      <div class="flex justify-between items-baseline mb-2">
         <h2 class="label-muted">All targets</h2>
-        <a href="/admin/login" style="font-size:13px;color:var(--zee-primary)">Add target →</a>
+        <a href="/admin/login" class="text-[13px] text-zee-primary">Add target →</a>
       </div>
       <div class="divider"></div>
-      ${list || `<div class="empty" style="margin-top:16px">No other targets.</div>`}
+      ${list || `<div class="empty mt-4">No other targets.</div>`}
     </section>
   `;
 
@@ -599,10 +623,10 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
   const target = await getTargetBySlug(env, slug);
   if (!target) {
     return shell("Not found", `
-      <section style="padding:80px 0;text-align:center">
+      <section class="py-20 text-center">
         <p class="label">404</p>
-        <h1 class="headline" style="margin-top:12px">No such target.</h1>
-        <p class="subhead" style="margin-left:auto;margin-right:auto">It may have been renamed or archived. <a href="/" style="color:var(--zee-primary);border-bottom:1px solid currentColor">Back to the list</a>.</p>
+        <h1 class="headline mt-3">No such target.</h1>
+        <p class="subhead mx-auto">It may have been renamed or archived. <a href="/" class="text-zee-primary border-b border-current">Back to the list</a>.</p>
       </section>
     `);
   }
@@ -612,19 +636,19 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
     : null;
 
   const meta = `
-    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:12px">
+    <div class="flex flex-wrap items-center gap-3 mt-3">
       <span class="badge badge-${target.status}">${target.status}</span>
       ${target.kind ? `<span class="label-muted">${escapeHtml(target.kind)}</span>` : ""}
-      ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" style="color:var(--zee-primary)">${escapeHtml(skill.name)}</a></span>` : `<span class="label-muted">no skill attached</span>`}
+      ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" class="text-zee-primary">${escapeHtml(skill.name)}</a></span>` : `<span class="label-muted">no skill attached</span>`}
       <span class="label-muted">every ${target.cadence_hours}h</span>
       ${target.next_run_at ? `<span class="label-muted">next ${escapeHtml(timeUntil(target.next_run_at))}</span>` : ""}
     </div>
   `;
 
   let body = `
-    <section style="padding:32px 0 28px">
+    <section class="pt-8 pb-7">
       <p class="label">Target</p>
-      <h1 class="headline" style="margin-top:8px">${escapeHtml(target.name)}</h1>
+      <h1 class="headline mt-2">${escapeHtml(target.name)}</h1>
       ${target.description ? `<p class="subhead">${escapeHtml(target.description)}</p>` : ""}
       ${meta}
     </section>
@@ -633,20 +657,20 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
 
   if (reports.length === 0) {
     body += `
-      <section style="padding:48px 0">
+      <section class="py-12">
         <div class="empty">No reports yet. ${target.primary_skill_id ? "The agent will write the first one on the next cron tick (or hit \"Run now\" in the admin)." : "Attach a skill from the admin to start producing reports."}</div>
       </section>
     `;
   } else {
-    body += `<section style="padding:8px 0">`;
+    body += `<section class="py-2">`;
     for (const r of reports) {
       body += `
         <a class="piece" href="/report/${escapeHtml(r.id)}">
           <div class="piece-row">
-            <div style="flex:1;min-width:0">
+            <div class="flex-1 min-w-0">
               <p class="piece-title">${escapeHtml(r.title)} <span class="piece-arrow" aria-hidden="true">→</span></p>
               <p class="piece-meta">${escapeHtml(r.snippet)}</p>
-              ${r.chat_model ? `<p class="piece-meta" style="margin-top:6px;font-size:11px">model: <span style="color:var(--zee-text)">${escapeHtml(chatModelShortLabel(r.chat_model))}</span></p>` : ""}
+              ${r.chat_model ? `<p class="piece-meta mt-1.5 text-[11px]">model: <span class="text-zee-text">${escapeHtml(chatModelShortLabel(r.chat_model))}</span></p>` : ""}
             </div>
             <span class="piece-date tt">${escapeHtml(formatDate(r.created_at))}</span>
           </div>
@@ -667,9 +691,9 @@ export async function renderSkillPage(env: Env, slug: string): Promise<string> {
   const skill = await getSkillBySlug(env, slug);
   if (!skill) {
     return shell("Not found", `
-      <section style="padding:80px 0;text-align:center">
+      <section class="py-20 text-center">
         <p class="label">404</p>
-        <h1 class="headline" style="margin-top:12px">No such skill.</h1>
+        <h1 class="headline mt-3">No such skill.</h1>
       </section>
     `);
   }
@@ -681,26 +705,26 @@ export async function renderSkillPage(env: Env, slug: string): Promise<string> {
   const usedBy = usedByRows.results ?? [];
 
   const body = `
-    <section style="padding:32px 0 16px">
-      <p class="label">Skill <span style="margin-left:8px"><span class="badge badge-${skill.author}">${skill.author}-written</span></span></p>
-      <h1 class="headline" style="margin-top:8px">${escapeHtml(skill.name)}</h1>
+    <section class="pt-8 pb-4">
+      <p class="label">Skill <span class="ml-2"><span class="badge badge-${skill.author}">${skill.author}-written</span></span></p>
+      <h1 class="headline mt-2">${escapeHtml(skill.name)}</h1>
       ${skill.description ? `<p class="subhead">${escapeHtml(skill.description)}</p>` : ""}
-      <div style="margin-top:14px"><span class="label-muted">used ${skill.used_count} time${skill.used_count === 1 ? "" : "s"}</span></div>
+      <div class="mt-3.5"><span class="label-muted">used ${skill.used_count} time${skill.used_count === 1 ? "" : "s"}</span></div>
     </section>
     <div class="divider"></div>
-    <section class="prose" style="padding:32px 0">
+    <section class="prose py-8">
       ${renderMarkdown(skill.procedure_md)}
     </section>
     <div class="divider"></div>
-    <section style="padding:24px 0">
+    <section class="py-6">
       <h2 class="label-muted">Used by</h2>
       ${usedBy.length === 0
-        ? `<div class="empty" style="margin-top:12px">No targets are using this skill yet.</div>`
-        : `<ul style="list-style:none;margin-top:12px">${usedBy.map((t) => `
-            <li style="padding:8px 0;border-bottom:1px solid rgba(232,228,222,0.6)">
-              <a href="/target/${escapeHtml(t.slug)}" style="color:var(--zee-text)">
-                <strong style="font-weight:500">${escapeHtml(t.name)}</strong>
-                <span class="badge badge-${t.status}" style="margin-left:8px">${t.status}</span>
+        ? `<div class="empty mt-3">No targets are using this skill yet.</div>`
+        : `<ul class="list-none mt-3">${usedBy.map((t) => `
+            <li class="py-2 border-b border-[rgba(232,228,222,0.6)]">
+              <a href="/target/${escapeHtml(t.slug)}" class="text-zee-text">
+                <strong class="font-medium">${escapeHtml(t.name)}</strong>
+                <span class="badge badge-${t.status} ml-2">${t.status}</span>
               </a>
             </li>`).join("")}</ul>`}
     </section>
@@ -716,9 +740,9 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const report = await getReportById(env, id);
   if (!report) {
     return shell("Not found", `
-      <section style="padding:80px 0;text-align:center">
+      <section class="py-20 text-center">
         <p class="label">404</p>
-        <h1 class="headline" style="margin-top:12px">Report missing.</h1>
+        <h1 class="headline mt-3">Report missing.</h1>
       </section>
     `);
   }
@@ -736,18 +760,18 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const html = renderMarkdown(bodyMd);
 
   const body = `
-    <section style="padding:32px 0 16px">
-      <p class="label">${target ? `<a href="/target/${escapeHtml(target.slug)}" style="color:inherit">${escapeHtml(target.name)}</a>` : "Report"}</p>
-      <h1 class="headline" style="margin-top:8px">${escapeHtml(report.title)}</h1>
-      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:14px">
+    <section class="pt-8 pb-4">
+      <p class="label">${target ? `<a href="/target/${escapeHtml(target.slug)}" class="text-inherit">${escapeHtml(target.name)}</a>` : "Report"}</p>
+      <h1 class="headline mt-2">${escapeHtml(report.title)}</h1>
+      <div class="flex flex-wrap gap-3 mt-3.5">
         <span class="label-muted">${escapeHtml(formatDate(report.created_at))}</span>
-        ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" style="color:var(--zee-primary)">${escapeHtml(skill.name)}</a></span>` : ""}
+        ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" class="text-zee-primary">${escapeHtml(skill.name)}</a></span>` : ""}
         <span class="label-muted">${report.word_count ?? 0} words</span>
-        ${report.chat_model ? `<span class="label-muted" title="${escapeHtml(report.chat_model)}">written by <strong style="color:var(--zee-text);font-weight:500">${escapeHtml(chatModelShortLabel(report.chat_model))}</strong></span>` : ""}
+        ${report.chat_model ? `<span class="label-muted" title="${escapeHtml(report.chat_model)}">written by <strong class="text-zee-text font-medium">${escapeHtml(chatModelShortLabel(report.chat_model))}</strong></span>` : ""}
       </div>
     </section>
     <div class="divider"></div>
-    <article class="prose" style="padding:32px 0">${html}</article>
+    <article class="prose py-8">${html}</article>
   `;
   return shell(`${report.title} — WatchOMacho`, body);
 }
@@ -758,18 +782,18 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
 
 export function renderAdminLogin(error?: string): string {
   const body = `
-    <section style="max-width:380px;margin:48px auto;padding:32px 0">
+    <section class="max-w-[380px] mx-auto my-12 py-8">
       <p class="label">Admin</p>
-      <h1 class="headline" style="margin-top:8px;font-size:32px">Unlock the agent.</h1>
-      <form method="post" action="/admin/login" style="margin-top:28px">
+      <h1 class="headline mt-2 text-[32px]">Unlock the agent.</h1>
+      <form method="post" action="/admin/login" class="mt-7">
         <div class="field">
           <label for="secret">Secret</label>
           <input id="secret" type="password" name="secret" autofocus autocomplete="off" required>
         </div>
-        <button class="btn" type="submit" style="width:100%">Unlock</button>
-        ${error ? `<p style="margin-top:12px;color:rgb(180,60,60);font-size:13px">${escapeHtml(error)}</p>` : ""}
+        <button class="btn w-full" type="submit">Unlock</button>
+        ${error ? `<p class="mt-3 text-[13px] text-[rgb(180,60,60)]">${escapeHtml(error)}</p>` : ""}
       </form>
-      <p style="margin-top:24px;text-align:center"><a href="/" style="font-size:12px;color:var(--zee-muted)">← back</a></p>
+      <p class="mt-6 text-center"><a href="/" class="text-xs text-zee-muted">← back</a></p>
     </section>
   `;
   return shell("Admin · WatchOMacho", body);
@@ -809,15 +833,15 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 
   const targetRows = active.length === 0
     ? `<div class="empty">No targets yet. Add one above.</div>`
-    : `<ul style="list-style:none">${active.map((t) => `
-        <li style="padding:10px 0;border-bottom:1px solid rgba(232,228,222,0.6)">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
-            <a href="/admin/targets/${escapeHtml(t.slug)}" style="font-weight:500;color:var(--zee-text)">
+    : `<ul class="list-none">${active.map((t) => `
+        <li class="py-2.5 border-b border-[rgba(232,228,222,0.6)]">
+          <div class="flex flex-wrap justify-between items-baseline gap-3">
+            <a href="/admin/targets/${escapeHtml(t.slug)}" class="font-medium text-zee-text">
               ${escapeHtml(t.name)}
-              ${t.kind ? `<span class="label-muted" style="margin-left:8px">${escapeHtml(t.kind)}</span>` : ""}
+              ${t.kind ? `<span class="label-muted ml-2">${escapeHtml(t.kind)}</span>` : ""}
             </a>
-            <span class="tt" style="font-size:12px;color:var(--zee-muted)">
-              ${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span style="color:var(--zee-primary)">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"}
+            <span class="tt text-xs text-zee-muted">
+              ${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"}
               · every ${t.cadence_hours}h
             </span>
           </div>
@@ -835,29 +859,29 @@ export async function renderAdminPanel(env: Env): Promise<string> {
   `).join("");
 
   const body = `
-    <section style="padding:24px 0 12px">
+    <section class="pt-6 pb-3">
       <p class="label">Admin</p>
-      <h1 class="headline" style="margin-top:8px;font-size:32px">Console.</h1>
-      <p class="subhead"><strong style="color:var(--zee-text)">${active.length}</strong> ${active.length === 1 ? "target" : "targets"}${dueNow.length ? ` · <strong style="color:var(--zee-primary)">${dueNow.length}</strong> due now` : ""} · <strong style="color:var(--zee-text)">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
+      <h1 class="headline mt-2 text-[32px]">Console.</h1>
+      <p class="subhead"><strong class="text-zee-text">${active.length}</strong> ${active.length === 1 ? "target" : "targets"}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <strong class="text-zee-text">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
     </section>
 
     <div class="card">
-      <div class="h3-row"><h3>Add a target</h3><a href="/admin/skills" style="font-size:12px;color:var(--zee-primary)">Manage skills →</a></div>
+      <div class="h3-row"><h3>Add a target</h3><a href="/admin/skills" class="text-xs text-zee-primary">Manage skills →</a></div>
       <form method="post" action="/admin/targets">
         <div class="field">
           <label>Name</label>
           <input name="name" placeholder="SW1A 1AA, Bhutan, OpenAI, etc." required maxlength="200">
         </div>
         <div class="field">
-          <label>Kind <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
+          <label>Kind <span class="font-normal normal-case tracking-normal">(optional)</span></label>
           <input name="kind" placeholder="postcode / place / topic / person / company">
         </div>
         <div class="field">
-          <label>Description <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional — context for the agent)</span></label>
+          <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
           <input name="description" maxlength="400">
         </div>
-        <div class="row" style="gap:16px;margin-bottom:16px">
-          <div class="field" style="flex:1;margin-bottom:0">
+        <div class="row gap-4 mb-4">
+          <div class="field flex-1 mb-0">
             <label>Cadence</label>
             <select name="cadence_hours">
               <option value="1">every hour</option>
@@ -868,12 +892,12 @@ export async function renderAdminPanel(env: Env): Promise<string> {
               <option value="168">every week</option>
             </select>
           </div>
-          <div class="field" style="flex:2;margin-bottom:0">
+          <div class="field flex-[2] mb-0">
             <label>Skill to apply</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
-        <label style="font-size:13px;color:var(--zee-muted);display:flex;align-items:center;gap:8px;margin-bottom:14px">
+        <label class="flex items-center gap-2 mb-3.5 text-[13px] text-zee-muted">
           <input type="checkbox" name="run_now" value="1"> Run once now
         </label>
         <button class="btn" type="submit">Add target</button>
@@ -888,32 +912,32 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     <div class="card">
       <div class="h3-row"><h3>Budgets & settings</h3></div>
       <form id="settings-form">
-        <div class="field" style="margin-bottom:16px">
+        <div class="field mb-4">
           <label>Chat model</label>
           <select name="chat_model">${modelOptions}</select>
           <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
         </div>
-        <div class="row" style="gap:16px">
-          <div class="field" style="flex:1;margin-bottom:0">
+        <div class="row gap-4">
+          <div class="field flex-1 mb-0">
             <label>Reports / day</label>
             <input type="number" name="daily_report_limit" min="0" max="10000" value="${escapeHtml(reportLim)}">
             <div class="field-help">${usage.reports} used today</div>
           </div>
-          <div class="field" style="flex:1;margin-bottom:0">
+          <div class="field flex-1 mb-0">
             <label>Tavily credits / day</label>
             <input type="number" name="daily_search_limit" min="0" max="100000" value="${escapeHtml(searchLim)}">
             <div class="field-help">${usage.searches} used today</div>
           </div>
-          <div class="field" style="flex:1;margin-bottom:0">
+          <div class="field flex-1 mb-0">
             <label>Runs / hour</label>
             <input type="number" name="cron_max_per_tick" min="1" max="20" value="${escapeHtml(perTick)}">
             <div class="field-help">Cap per hourly cron firing</div>
           </div>
         </div>
-        <div class="row" style="margin-top:14px">
+        <div class="row mt-3.5">
           <button class="btn" type="submit">Save</button>
           <button id="cron-now-btn" type="button" class="btn btn-secondary">Run cron now</button>
-          <span id="cron-result" style="font-size:12px;color:var(--zee-muted)"></span>
+          <span id="cron-result" class="text-xs text-zee-muted"></span>
         </div>
       </form>
     </div>
@@ -983,16 +1007,16 @@ export async function renderAdminSkills(env: Env): Promise<string> {
   const list = skills.length === 0
     ? `<div class="empty">No skills yet. Synthesise one below from a brief, or paste your own markdown.</div>`
     : skills.map((s) => `
-        <details class="card" style="padding:16px 20px" ${s.slug ? "" : "open"}>
-          <summary style="cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
+        <details class="card px-5 py-4" ${s.slug ? "" : "open"}>
+          <summary class="cursor-pointer list-none flex flex-wrap justify-between items-baseline gap-3">
             <span>
-              <strong style="font-weight:500">${escapeHtml(s.name)}</strong>
-              <span class="badge badge-${s.author}" style="margin-left:8px">${s.author}</span>
-              <a href="/skill/${escapeHtml(s.slug)}" style="margin-left:8px;font-size:12px;color:var(--zee-primary)">public →</a>
+              <strong class="font-medium">${escapeHtml(s.name)}</strong>
+              <span class="badge badge-${s.author} ml-2">${s.author}</span>
+              <a href="/skill/${escapeHtml(s.slug)}" class="ml-2 text-xs text-zee-primary">public →</a>
             </span>
             <span class="label-muted">used ${s.used_count}× · ${escapeHtml(timeAgo(s.updated_at))}</span>
           </summary>
-          <form method="post" action="/admin/skills/${escapeHtml(s.slug)}/update" style="margin-top:16px">
+          <form method="post" action="/admin/skills/${escapeHtml(s.slug)}/update" class="mt-4">
             <div class="field">
               <label>Name</label>
               <input name="name" value="${escapeHtml(s.name)}" maxlength="120">
@@ -1003,7 +1027,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
             </div>
             <div class="field">
               <label>Procedure (markdown)</label>
-              <textarea name="procedure_md" style="min-height:280px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px">${escapeHtml(s.procedure_md)}</textarea>
+              <textarea name="procedure_md" class="min-h-[280px] font-mono text-[13px]">${escapeHtml(s.procedure_md)}</textarea>
             </div>
             <div class="row">
               <button class="btn" type="submit">Save changes</button>
@@ -1014,19 +1038,19 @@ export async function renderAdminSkills(env: Env): Promise<string> {
       `).join("");
 
   const body = `
-    <section style="padding:24px 0 8px">
+    <section class="pt-6 pb-2">
       <p class="label">Admin</p>
-      <h1 class="headline" style="margin-top:8px;font-size:32px">Skills.</h1>
+      <h1 class="headline mt-2 text-[32px]">Skills.</h1>
       <p class="subhead">The agent's library of reusable research procedures. Each skill is a markdown document — write it yourself or let the agent synthesise one from a brief.</p>
     </section>
 
     <div class="card">
       <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help" style="margin-bottom:12px">Describe what the skill should do in one paragraph. The agent will write the procedure document for you, including optional <a href="/admin/tools" style="color:var(--zee-primary)">Tavily headers</a> (search topic, time range, depth, or extract URLs) when the brief implies them.</p>
+      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the procedure document for you, including optional <a href="/admin/tools" class="text-zee-primary">Tavily headers</a> (search topic, time range, depth, or extract URLs) when the brief implies them.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="synthesize">
         <div class="field">
-          <label>Name <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
+          <label>Name <span class="font-normal normal-case tracking-normal">(optional)</span></label>
           <input name="name" placeholder="e.g. Housing research" maxlength="120">
         </div>
         <div class="field">
@@ -1039,7 +1063,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Write a skill by hand</h3></div>
-      <p class="field-help" style="margin-bottom:12px">Optional Tavily headers you can declare in the markdown (all defaults are sensible): <code>**Tavily op:** search|extract</code>, <code>**Search topic:** general|news|finance</code>, <code>**Time range:** day|week|month|year</code>, <code>**Depth:** basic|advanced</code>. Full catalog: <a href="/admin/tools" style="color:var(--zee-primary)">/admin/tools</a>.</p>
+      <p class="field-help mb-3">Optional Tavily headers you can declare in the markdown (all defaults are sensible): <code>**Tavily op:** search|extract</code>, <code>**Search topic:** general|news|finance</code>, <code>**Time range:** day|week|month|year</code>, <code>**Depth:** basic|advanced</code>. Full catalog: <a href="/admin/tools" class="text-zee-primary">/admin/tools</a>.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="write">
         <div class="field">
@@ -1052,7 +1076,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
         </div>
         <div class="field">
           <label>Procedure (markdown)</label>
-          <textarea name="procedure_md" required style="min-height:240px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px" placeholder="# Skill name
+          <textarea name="procedure_md" required class="min-h-[240px] font-mono text-[13px]" placeholder="# Skill name
 
 **Purpose:** ...
 **Search queries:**
@@ -1077,7 +1101,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 export async function renderAdminTargetEdit(env: Env, slug: string): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
-    return shell("Not found", `<section style="padding:80px 0;text-align:center"><h1 class="headline">No such target.</h1></section>`, { adminFooter: true });
+    return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { adminFooter: true });
   }
   const skills = await listSkills(env);
   const reports = await listReportsForTarget(env, target.id, 10);
@@ -1101,11 +1125,11 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
 
   const reportsList = reports.length === 0
     ? `<div class="empty">No reports yet.</div>`
-    : `<ul style="list-style:none">${reports.map((r) => `
-        <li style="padding:8px 0;border-bottom:1px solid rgba(232,228,222,0.6)">
-          <a href="/report/${escapeHtml(r.id)}" style="font-size:14px">
-            <span style="color:var(--zee-text)">${escapeHtml(r.title)}</span>
-            <span class="label-muted" style="margin-left:8px">${escapeHtml(timeAgo(r.created_at))}</span>
+    : `<ul class="list-none">${reports.map((r) => `
+        <li class="py-2 border-b border-[rgba(232,228,222,0.6)]">
+          <a href="/report/${escapeHtml(r.id)}" class="text-sm">
+            <span class="text-zee-text">${escapeHtml(r.title)}</span>
+            <span class="label-muted ml-2">${escapeHtml(timeAgo(r.created_at))}</span>
           </a>
         </li>
       `).join("")}</ul>`;
@@ -1122,16 +1146,16 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
   `).join("");
 
   const body = `
-    <section style="padding:24px 0 8px">
-      <p class="label"><a href="/admin" style="color:inherit">← Admin</a></p>
-      <h1 class="headline" style="margin-top:8px">${escapeHtml(target.name)}</h1>
-      <p class="subhead">${target.description ? escapeHtml(target.description) : `<em style="color:var(--zee-muted)">No description</em>`}</p>
-      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:14px">
+    <section class="pt-6 pb-2">
+      <p class="label"><a href="/admin" class="text-inherit">← Admin</a></p>
+      <h1 class="headline mt-2">${escapeHtml(target.name)}</h1>
+      <p class="subhead">${target.description ? escapeHtml(target.description) : `<em class="text-zee-muted">No description</em>`}</p>
+      <div class="flex flex-wrap items-center gap-3 mt-3.5">
         <span class="badge badge-${target.status}">${target.status}</span>
         ${target.kind ? `<span class="label-muted">${escapeHtml(target.kind)}</span>` : ""}
         <span class="label-muted">${target.last_run_at ? `last run ${escapeHtml(timeAgo(target.last_run_at))}` : "never run"}</span>
         ${target.next_run_at && target.status === "active" ? `<span class="label-muted">next ${escapeHtml(timeUntil(target.next_run_at))}</span>` : ""}
-        <a href="/target/${escapeHtml(target.slug)}" style="font-size:13px;color:var(--zee-primary);margin-left:auto">View public page →</a>
+        <a href="/target/${escapeHtml(target.slug)}" class="ml-auto text-[13px] text-zee-primary">View public page →</a>
       </div>
     </section>
 
@@ -1146,8 +1170,8 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
           <label>Description</label>
           <input name="description" value="${escapeHtml(target.description ?? "")}" maxlength="400">
         </div>
-        <div class="row" style="gap:16px">
-          <div class="field" style="flex:1;margin-bottom:0">
+        <div class="row gap-4">
+          <div class="field flex-1 mb-0">
             <label>Status</label>
             <select name="status">
               <option value="active"${target.status === "active" ? " selected" : ""}>active</option>
@@ -1155,21 +1179,21 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
               <option value="archived"${target.status === "archived" ? " selected" : ""}>archived</option>
             </select>
           </div>
-          <div class="field" style="flex:1;margin-bottom:0">
+          <div class="field flex-1 mb-0">
             <label>Cadence</label>
             <select name="cadence_hours">${cadenceOptions}</select>
           </div>
-          <div class="field" style="flex:2;margin-bottom:0">
+          <div class="field flex-[2] mb-0">
             <label>Primary skill</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
-        <div class="row" style="margin-top:16px;gap:12px">
+        <div class="row gap-3 mt-4">
           <button class="btn" type="submit">Save</button>
-          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/run" style="display:inline">
+          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/run" class="inline">
             <button class="btn btn-secondary" type="submit"${target.primary_skill_id ? "" : " disabled"}>Run now</button>
           </form>
-          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/delete" style="display:inline;margin-left:auto" onsubmit="return confirm('Delete this target and all its reports?')">
+          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this target and all its reports?')">
             <button class="btn btn-danger" type="submit">Delete target</button>
           </form>
         </div>
@@ -1177,7 +1201,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
     </div>
 
     <div class="card">
-      <div class="h3-row"><h3>Reports</h3><a href="/target/${escapeHtml(target.slug)}" style="font-size:12px;color:var(--zee-primary)">all →</a></div>
+      <div class="h3-row"><h3>Reports</h3><a href="/target/${escapeHtml(target.slug)}" class="text-xs text-zee-primary">all →</a></div>
       ${reportsList}
     </div>
 
@@ -1199,24 +1223,24 @@ export function renderAdminTools(): string {
   const rows = Object.values(TOOLS).map((tool) => {
     const opRows = Object.entries(tool.operations).map(([opName, opDesc]) => `
       <tr>
-        <td style="white-space:nowrap;vertical-align:top;padding:8px 12px 8px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--zee-primary)">${escapeHtml(tool.slug)} (${escapeHtml(opName)})</td>
-        <td style="vertical-align:top;padding:8px 0;font-size:14px;color:var(--zee-text)">${escapeHtml(opDesc)}</td>
+        <td class="whitespace-nowrap align-top pr-3 py-2 font-mono text-[13px] text-zee-primary">${escapeHtml(tool.slug)} (${escapeHtml(opName)})</td>
+        <td class="align-top py-2 text-sm text-zee-text">${escapeHtml(opDesc)}</td>
       </tr>
     `).join("");
     return `
       <div class="card">
         <div class="h3-row"><h3>${escapeHtml(tool.display)}</h3></div>
-        <p class="field-help" style="margin-bottom:12px"><strong>When to use search:</strong> ${escapeHtml(tool.when_to_use_search)}</p>
-        <p class="field-help" style="margin-bottom:16px"><strong>When to use extract:</strong> ${escapeHtml(tool.when_to_use_extract)}</p>
-        <table style="width:100%;border-collapse:collapse"><tbody>${opRows}</tbody></table>
+        <p class="field-help mb-3"><strong>When to use search:</strong> ${escapeHtml(tool.when_to_use_search)}</p>
+        <p class="field-help mb-4"><strong>When to use extract:</strong> ${escapeHtml(tool.when_to_use_extract)}</p>
+        <table class="w-full border-collapse"><tbody>${opRows}</tbody></table>
       </div>
     `;
   }).join("");
 
   const body = `
-    <section style="padding:24px 0 8px">
+    <section class="pt-6 pb-2">
       <p class="label">Admin</p>
-      <h1 class="headline" style="margin-top:8px;font-size:32px">Tools.</h1>
+      <h1 class="headline mt-2 text-[32px]">Tools.</h1>
       <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
     </section>
 
@@ -1224,8 +1248,8 @@ export function renderAdminTools(): string {
 
     <div class="card">
       <div class="h3-row"><h3>Skill markdown headers</h3></div>
-      <p class="field-help" style="margin-bottom:8px">Any skill can declare these optional headers in its procedure markdown. Sensible defaults if omitted (search mode, basic depth, general topic, any time range).</p>
-      <pre style="background:rgba(232,228,222,0.4);padding:12px 14px;border-radius:6px;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.6;color:var(--zee-text)">**Tavily op:** search          (default)
+      <p class="field-help mb-2">Any skill can declare these optional headers in its procedure markdown. Sensible defaults if omitted (search mode, basic depth, general topic, any time range).</p>
+      <pre class="px-3.5 py-3 rounded-md overflow-x-auto font-mono text-[13px] leading-relaxed text-zee-text bg-[rgba(232,228,222,0.4)]">**Tavily op:** search          (default)
                 OR
                extract            (forces URL-based mode)
 
