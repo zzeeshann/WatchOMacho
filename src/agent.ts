@@ -21,7 +21,7 @@ export interface Env {
   BRAVE_API_KEY?: string;
 }
 
-const CHAT_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+const CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
 
 // ─── basics ────────────────────────────────────────────────────────────────
