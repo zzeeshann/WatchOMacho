@@ -14,7 +14,6 @@ Fast reference. For narrative explanation, read [BOOK.md](BOOK.md). For setup, [
                     ┌──────────▼───────────┐
                     │   ADMIN HTTP REQ     │
                     │   /admin/targets/X/run │
-                    │   /admin/mission     │
                     └──────────┬───────────┘
                                │
               ┌────────────────▼───────────────┐
@@ -29,22 +28,22 @@ Fast reference. For narrative explanation, read [BOOK.md](BOOK.md). For setup, [
                    │      skill)            │
                    └───────────┬────────────┘
                                │
-       ┌───────────┬───────────┼───────────┬──────────────┐
-       ▼           ▼           ▼           ▼              ▼
-   ┌───────┐  ┌────────┐  ┌─────────┐  ┌──────┐  ┌──────────────┐
-   │ Brave │  │  Wiki  │  │ Workers │  │ D1   │  │ Vectorize    │
-   │ Search│  │  REST  │  │   AI    │  │      │  │   (memory)   │
-   │       │  │        │  │ Llama+  │  │      │  │              │
-   │       │  │        │  │ bge-base│  │      │  │              │
-   └───────┘  └────────┘  └─────────┘  └──────┘  └──────────────┘
-       │                                  │
-       │                                  ▼
-       │                              ┌──────┐
-       └──────────────────────────────►  R2  │ (full markdown of each report)
-                                      └──────┘
+          ┌───────────────┬───────────┬──────────────┐
+          ▼               ▼           ▼              ▼
+      ┌────────┐     ┌─────────┐  ┌──────┐  ┌──────────────┐
+      │ Tavily │     │ Workers │  │ D1   │  │ Vectorize    │
+      │ search │     │   AI    │  │      │  │   (memory)   │
+      │ + ext  │     │ Llama+  │  │      │  │              │
+      │        │     │ bge-base│  │      │  │              │
+      └────────┘     └─────────┘  └──────┘  └──────────────┘
+          │                          │
+          │                          ▼
+          │                      ┌──────┐
+          └──────────────────────►  R2  │ (full markdown of each report)
+                                 └──────┘
 ```
 
-External: Brave Search, Wikipedia REST, Nominatim (rare).
+External: Tavily (search + extract).
 Internal: Workers AI (chat + embeddings), D1, R2, Vectorize.
 
 ---
@@ -56,14 +55,14 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | # | Step | Calls | Cost |
 | --- | --- | --- | --- |
 | 1 | **Budget check** | D1 read | ~free |
-| 2 | **Plan** — LLM picks 3–6 search queries | 1 chat call | ~150–300 neurons |
-| 3 | **Gather** — N Brave searches in parallel | N HTTP calls | N Brave queries (~$0 free tier) |
-| 4 | **Recall** — Vectorize for related past reports + D1 for same-target history | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
-| 5 | **Wikipedia grounding** (first run for target only) | 1 HTTP call | free |
-| 6 | **Write** — LLM produces the markdown report | 1 chat call | ~200–500 neurons |
+| 2 | **Parse skill** — extract optional `**Tavily op:**` / `**Sources:**` / topic / time range / depth headers | local | free |
+| 3 | **Plan** — LLM picks 3–6 search queries (skipped in extract mode) | 1 chat call | ~150–300 neurons |
+| 4 | **Gather** — Tavily `/search` for each planned query, OR `/extract` for an explicit URL list. Each result includes the page's extracted full content. | N HTTP calls | N Tavily credits (1 per basic search; 1 per 5 URLs extracted) |
+| 5 | **Recall** — Vectorize for related past reports + D1 for same-target history | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
+| 6 | **Write** — LLM produces the markdown report from extracted page content + recalled context | 1 chat call | ~300–700 neurons (richer input than v4's snippet-only) |
 | 7 | **Persist** — R2 put + D1 insert + embed + Vectorize upsert + update target.next_run_at + audit row | 1 R2 put + 4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
 
-**Total per run:** ~2 chat calls + 1 embedding + 5–7 search queries → roughly **500–1000 neurons + 5–7 Brave queries**.
+**Total per run:** ~2 chat calls + 1 embedding + 3–6 Tavily calls → roughly **600–1200 neurons + 3–6 Tavily credits**.
 
 ---
 
@@ -121,7 +120,7 @@ created_at
 id TEXT PRIMARY KEY
 target_id TEXT
 skill_id TEXT
-triggered_by TEXT                  -- 'cron' | 'mission' | 'manual'
+triggered_by TEXT                  -- 'cron' | 'manual'
 status TEXT                        -- 'success' | 'error'
 report_id TEXT                     -- if successful
 duration_ms INTEGER
@@ -136,7 +135,7 @@ Key/value strings.
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `daily_report_limit` | `20` | Cap on reports written per UTC day |
-| `daily_search_limit` | `500` | Cap on Brave queries per UTC day |
+| `daily_search_limit` | `500` | Cap on Tavily credits consumed per UTC day |
 | `cron_max_per_tick` | `2` | Max targets advanced per hourly cron tick |
 | `last_cron_run` | `0` | Last successful cron timestamp |
 
@@ -191,12 +190,12 @@ The full markdown of every report. `text/markdown; charset=utf-8`. Never queried
 
 | File | Lines | What's in it |
 | --- | --- | --- |
-| [src/apis.ts](src/apis.ts) | ~150 | `braveSearch`, `wikipediaSummary`, `geocodeQuery` |
-| [src/agent.ts](src/agent.ts) | ~550 | Targets / skills / reports CRUD, `runResearch` loop, `runMission`, `cronTick`, budget gates |
+| [src/apis.ts](src/apis.ts) | ~130 | `tavilySearch`, `tavilyExtract`, `TOOLS` registry |
+| [src/agent.ts](src/agent.ts) | ~570 | Targets / skills / reports CRUD, `parseSkillTools`, `runResearch` loop, `cronTick`, budget gates |
 | [src/index.ts](src/index.ts) | ~400 | HTTP routing, auth/cookie, `readForm`, `scheduled` handler, security headers |
-| [src/dashboard.ts](src/dashboard.ts) | ~900 | All HTML rendering: public pages + admin pages + safe markdown renderer |
+| [src/dashboard.ts](src/dashboard.ts) | ~1240 | All HTML rendering: public pages + admin pages (incl. `/admin/tools`) + safe markdown renderer |
 
-Total: ~2000 lines of TypeScript.
+Total: ~2300 lines of TypeScript.
 
 ---
 
@@ -222,6 +221,7 @@ Total: ~2000 lines of TypeScript.
 | POST | `/admin/logout` | Clear cookie |
 | GET | `/admin` | Overview |
 | GET | `/admin/skills` | Skill library |
+| GET | `/admin/tools` | Read-only catalog of tools (Tavily search/extract) skills can call |
 | POST | `/admin/skills` | Create skill — `mode=synthesize&brief=…` OR `mode=write&name&procedure_md` |
 | POST | `/admin/skills/:slug/update` | Edit skill |
 | POST | `/admin/skills/:slug/delete` | Delete skill |
@@ -230,7 +230,6 @@ Total: ~2000 lines of TypeScript.
 | POST | `/admin/targets/:slug/update` | Patch target |
 | POST | `/admin/targets/:slug/run` | Run immediately |
 | POST | `/admin/targets/:slug/delete` | Delete target + reports |
-| POST | `/admin/mission` | One-shot mission — `brief`, optional `target_slug`, `skill_slug`, `new_target_name`, `new_skill_brief` |
 | GET | `/admin/settings` | Current settings + usage (JSON) |
 | POST | `/admin/settings` | Update budgets |
 | POST | `/admin/cron/tick` | Run a cron tick now (testing) |
@@ -274,7 +273,7 @@ Daily budget gates stop early on `BudgetExceeded`.
 | Secret | Required? | Purpose |
 | --- | --- | --- |
 | `ADMIN_SECRET` | yes | Admin panel password. Generate with `openssl rand -hex 32`. |
-| `BRAVE_API_KEY` | recommended | Brave Search Free AI plan key. Without it, web search is skipped — reports become LLM-knowledge-only. |
+| `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search is skipped — reports become LLM-knowledge-only. |
 
 Set both via `npx wrangler secret put …`. Never commit.
 

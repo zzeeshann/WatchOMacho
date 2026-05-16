@@ -1,6 +1,6 @@
--- v5 → v6: FULL WIPE. Old data model (random-walker field notes, missions,
--- subscriptions, live-event digest) is gone. New shape: targets the agent
--- researches, skills the agent applies, reports it accumulates per target.
+-- v5 → v6: FULL WIPE. The old random-walker / digest data model is gone.
+-- New shape: targets the agent researches, skills the agent applies, reports
+-- it accumulates per target.
 --
 -- WARNING: this drops every old table. Run only if you want a clean reset.
 
@@ -67,13 +67,13 @@ CREATE TABLE reports (
 CREATE INDEX idx_reports_target ON reports(target_id, created_at DESC);
 CREATE INDEX idx_reports_skill ON reports(skill_id);
 
--- Runs: audit log for every research run (cron / mission / manual).
+-- Runs: audit log for every research run (cron / manual).
 CREATE TABLE runs (
   id TEXT PRIMARY KEY,
   target_id TEXT,
   skill_id TEXT,
-  triggered_by TEXT NOT NULL,               -- 'cron' | 'mission' | 'manual'
-  status TEXT NOT NULL,                     -- 'success' | 'error'
+  triggered_by TEXT NOT NULL CHECK (triggered_by IN ('cron', 'manual')),
+  status TEXT NOT NULL CHECK (status IN ('success', 'error')),
   report_id TEXT,
   duration_ms INTEGER,
   error TEXT,

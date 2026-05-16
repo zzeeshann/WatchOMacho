@@ -2,46 +2,44 @@
 
 A research agent you give jobs to. You hand it a **target** (a postcode, a person, a company, a topic) and a **skill** (a reusable research procedure) — the agent applies the skill, writes a report, and keeps the target's page fresh on a cadence you set.
 
-Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. Web search via Brave Search.
+Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. Web research via [Tavily](https://tavily.com) — one tool, two operations (search + extract).
 
 > **New to the project?** Read [BOOK.md](BOOK.md) — a guided tour from "what is Cloudflare?" to "how the agent's research loop works", in 14 short chapters. No prior experience assumed.
 >
 > **Want a quick reference?** [ARCHITECTURE.md](ARCHITECTURE.md) has the schema, data flow, API surface, and bindings in scannable tables.
 >
-> **Where it's going?** [ROADMAP.md](ROADMAP.md) lays out the four-level improvement ladder (Brave snippets → full page content → typed tools → agentic loop), cost trajectory, and what's deliberately deferred.
+> **Where it's going?** [ROADMAP.md](ROADMAP.md) lays out the improvement ladder, cost trajectory, and what's deliberately deferred.
 
-## The three concepts
+## The two concepts
 
 ```
-   ┌────────────┐    ┌──────────┐    ┌──────────┐
-   │  MISSION   │ →  │  SKILL   │ →  │  TARGET  │
-   │ user-given │    │ markdown │    │ /target/ │
-   │            │    │ procedure│    │   :slug  │
-   └────────────┘    └──────────┘    └──────────┘
+   ┌──────────┐    ┌──────────┐    ┌──────────┐
+   │  SKILL   │ →  │  TARGET  │ →  │  REPORT  │
+   │ markdown │    │ /target/ │    │ markdown │
+   │ procedure│    │   :slug  │    │ output   │
+   └──────────┘    └──────────┘    └──────────┘
 ```
 
 - **Target** — a thing the agent watches. Each target has its own page that accumulates reports over time. Statuses: `active`, `paused`, `archived`.
 - **Skill** — a named markdown procedure the agent reads at run-time. Skills are reusable across targets (apply *housing research* to SW1A 1AA, SE1, E14, …). You can write skills by hand or describe a brief and let the agent synthesise the procedure.
-- **Mission** — one user instruction. *"Research SW1A 1AA, present a housing report."* The agent picks/creates a target, picks/creates a skill, runs it, and links you to the report.
 
-The cron walks active targets and re-runs the attached skill on each one's cadence. Quiet targets stay quiet, busy ones keep producing updates.
+A **report** is what comes out when the agent runs a skill against a target. The cron walks active targets and re-runs the attached skill on each one's cadence. Quiet targets stay quiet, busy ones keep producing updates.
 
 ## What a run does, end-to-end
 
 For each `(target, skill)` execution:
 
-1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries.
-2. **Gather** — Brave Search runs every query in parallel; results are merged and deduped.
+1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries. (Skipped if the skill declares `**Tavily op:** extract` with explicit URLs.)
+2. **Gather** — Tavily runs every query in parallel; each result already includes the page's extracted full content. For extract-mode skills, Tavily reads the listed URLs in full.
 3. **Recall** — Vectorize returns the most relevant past reports (so the new one *builds on* prior ones rather than repeating).
-4. **Wikipedia** — on the first report for a target, a one-shot Wikipedia summary is pulled for grounding.
-5. **Write** — the LLM writes a ~500-word markdown report following the skill's output structure, citing sources by number.
-6. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs`.
+4. **Write** — the LLM writes a ~500-word markdown report following the skill's output structure, citing sources by number.
+5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs`.
 
-Two LLM calls + N Brave Searches per run. Predictable cost, predictable structure.
+Two LLM calls + N Tavily calls per run. Predictable cost, predictable structure.
 
 ## Setup — about 10 minutes
 
-You need a Cloudflare account (free tier works), `npm`, Node 18+, and a free [Brave Search API key](https://api.search.brave.com/app/keys) (2000 queries/month on the Free AI plan).
+You need a Cloudflare account (free tier works), `npm`, Node 18+, and a free [Tavily API key](https://app.tavily.com) (1000 credits/month on the Researcher Free plan).
 
 ### 1. Install
 
@@ -63,10 +61,12 @@ npm run bucket:create   # creates the R2 bucket
 npm run vector:create   # creates the Vectorize index (768 dims, cosine)
 ```
 
-If you're upgrading from any earlier version, run the v6 migration instead of `db:init` — it drops the old data model and creates the new one:
+If you're upgrading from any earlier version, run the v6 migration instead of `db:init` — it drops the old data model and creates the new one — then chain through any later migrations:
 
 ```bash
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v6.sql
+npx wrangler d1 execute watchomacho-db --remote --file=migration-v7.sql
+npx wrangler d1 execute watchomacho-db --remote --file=migration-v8.sql
 ```
 
 ### 3. Set the secrets
@@ -77,12 +77,12 @@ SECRET=$(openssl rand -hex 32)
 echo "$SECRET" | npx wrangler secret put ADMIN_SECRET
 echo "$SECRET"  # save it
 
-# Brave Search API key (free at api.search.brave.com)
-npx wrangler secret put BRAVE_API_KEY
+# Tavily API key (free at app.tavily.com)
+npx wrangler secret put TAVILY_API_KEY
 # paste your key when prompted
 ```
 
-Without `BRAVE_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes).
+Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes).
 
 ### 4. Deploy
 
@@ -115,7 +115,7 @@ Per target, set from the admin: 1h / 6h / 12h / 24h / 3d / weekly. The hourly cr
 Set from `/admin`:
 
 - `daily_report_limit` — caps how many reports the agent will write in a UTC day (default 20)
-- `daily_search_limit` — caps Brave Search calls (default 500)
+- `daily_search_limit` — caps Tavily credits consumed per UTC day (default 500)
 - `cron_max_per_tick` — how many targets the cron advances per hour (default 2)
 
 Counters reset at 00:00 UTC.
@@ -130,13 +130,13 @@ On the free tier, with 20 reports/day and ~5 searches per report:
 
 - Workers requests: free under 100k/day
 - Workers AI: 10k neurons/day free. Two chat calls + one embedding per report ≈ ~250 neurons. 20 reports/day ≈ 5k neurons — under the cap.
-- Brave Search: 2000 queries/month free = ~65/day. At 5 searches per report, that's 13 reports/day before paying. Lower `daily_report_limit` to 13 if you want zero-cost, or upgrade Brave's plan.
+- Tavily: 1000 credits/month free on the Researcher plan = ~33/day. At 1 credit per basic search and 5 searches per report, that's ~6 reports/day before paying. Lower `daily_report_limit` (or `daily_search_limit`) to stay zero-cost, or upgrade Tavily's plan.
 - Vectorize: 30M queried dimensions/month free
 - R2: 10GB free, no egress
 - D1: 5GB free
 - Cron Triggers: free
 
-If you need more, Cloudflare Workers Paid ($5/mo) + a paid Brave plan covers a serious workload.
+If you need more, Cloudflare Workers Paid ($5/mo) + a paid Tavily plan covers a serious workload.
 
 ## API surface
 
@@ -160,6 +160,7 @@ Admin (cookie auth):
 | `POST` | `/admin/logout` | Clear cookie |
 | `GET` | `/admin` | Overview |
 | `GET` | `/admin/skills` | Skill library |
+| `GET` | `/admin/tools` | Read-only catalog of tools skills can call |
 | `POST` | `/admin/skills` | Create (form: `mode=synthesize&brief=…` or `mode=write&name&procedure_md`) |
 | `POST` | `/admin/skills/:slug/update` | Edit |
 | `POST` | `/admin/skills/:slug/delete` | Delete |
@@ -168,7 +169,6 @@ Admin (cookie auth):
 | `POST` | `/admin/targets/:slug/update` | Patch target |
 | `POST` | `/admin/targets/:slug/run` | Run immediately |
 | `POST` | `/admin/targets/:slug/delete` | Delete target + reports |
-| `POST` | `/admin/mission` | One-shot mission (form: `brief`, optional pins) |
 | `GET` / `POST` | `/admin/settings` | Read / write budgets |
 | `POST` | `/admin/cron/tick` | Manually trigger a cron tick (testing) |
 

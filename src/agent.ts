@@ -1,16 +1,20 @@
 // The agent's brain.
 //
-// Three concepts:
+// Two concepts:
 //   Target   — a thing being researched (SW1A 1AA, Bhutan, "AI agents")
 //   Skill    — a named procedure the agent owns (housing-research, etc.)
-//   Mission  — a single user instruction that runs a Skill against a Target
 //
 // One artefact:
 //   Report   — markdown writeup produced by running a Skill on a Target.
 //              Accumulates on the Target's page over time as the cron
 //              re-runs the Skill on its configured cadence.
 
-import { braveSearch, wikipediaSummary, geocodeQuery, type BraveResult } from "./apis";
+import {
+  tavilySearch,
+  tavilyExtract,
+  TOOLS,
+  type TavilySearchOptions,
+} from "./apis";
 
 export interface Env {
   AI: Ai;
@@ -18,7 +22,7 @@ export interface Env {
   REPORTS: R2Bucket;
   MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
-  BRAVE_API_KEY?: string;
+  TAVILY_API_KEY?: string;
 }
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -305,6 +309,21 @@ export interface Skill {
 
 const SKILL_TEMPLATE = `You are designing a reusable research skill for an AI agent that produces markdown reports.
 
+Available tools you can call from a skill:
+
+tavily (search):  Search the web by keyword. Returns top results with
+                  extracted full-page content. Add **Tavily op:** search
+                  to declare. Default if no Tavily op header.
+
+tavily (extract): Read a list of specific URLs in full. Add
+                  **Tavily op:** extract to declare, plus **Sources:**
+                  list with one URL per bullet.
+
+Optional headers for search mode:
+  **Search topic:** general | news | finance
+  **Time range:**   day | week | month | year
+  **Depth:**        basic | advanced
+
 Given the skill brief below, write a procedure document with these sections, in plain markdown:
 
 # {Skill Name}
@@ -313,9 +332,11 @@ Given the skill brief below, write a procedure document with these sections, in 
 
 **When to use:** the kind of target this works on (postcodes, companies, people, topics, places).
 
+(Optional Tavily headers here, only if the brief implies them — e.g. "hourly news on X" → **Tavily op:** search + **Search topic:** news + **Time range:** day. Don't add headers you don't need.)
+
 **Approach:** 3–6 sentences of approach. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
 
-**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each query goes on its own bulleted line.
+**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each query goes on its own bulleted line. (Skip this section if **Tavily op:** is extract — list URLs under **Sources:** instead.)
 
 **Output structure:** the headings the final report should use, with one sentence each describing what goes under each heading. End with a "Sources" section.
 
@@ -535,34 +556,126 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
   return { queries: [`${target.name}`, `${target.name} ${skill.name}`] };
 }
 
-/** Step 2: run all queries against Brave Search in parallel. */
-async function gatherSources(env: Env, queries: string[]): Promise<BraveResult[]> {
-  await checkBudget(env, "searches");
-  const results = await Promise.all(
-    queries.map((q) => braveSearch(env.BRAVE_API_KEY, q, 5).catch(() => [])),
-  );
-  await bumpUsage(env, "searches", queries.length);
-
-  // Flatten + dedup by URL, keep first-seen order.
-  const seen = new Set<string>();
-  const out: BraveResult[] = [];
-  for (const list of results) {
-    for (const r of list) {
-      if (!r.url || seen.has(r.url)) continue;
-      seen.add(r.url);
-      out.push(r);
-    }
-  }
-  return out.slice(0, 20);
+// One row of gathered evidence — same shape regardless of whether it came
+// from a Tavily search or a Tavily extract.
+interface GatheredSource {
+  title: string;
+  url: string;
+  content: string;
 }
 
-/** Step 3: optionally enrich the target with Wikipedia context once (only
- *  on the first run for a target, to keep cost down). */
-async function maybeWikipediaContext(target: Target, hasPriorReports: boolean): Promise<string> {
-  if (hasPriorReports) return "";
-  const summary = await wikipediaSummary(target.name).catch(() => null);
-  if (!summary || !summary.extract) return "";
-  return `\n\nWIKIPEDIA OVERVIEW\n${summary.extract}\n(source: ${summary.url})`;
+// Cap each source's text so the writer prompt stays bounded. With 20 sources
+// at 4000 chars each, worst-case input is ~80kB — comfortably within every
+// chat model in ALLOWED_CHAT_MODELS.
+const MAX_CHARS_PER_SOURCE = 4000;
+
+/** Parse the optional Tavily-related markdown headers a skill may declare.
+ *  Every header is optional — a skill with none gets search mode + sensible
+ *  defaults. Conventions:
+ *
+ *    **Tavily op:** search | extract
+ *    **Sources:**                       (only used with extract op)
+ *      - https://...
+ *      - https://...
+ *    **Search topic:** general | news | finance
+ *    **Time range:** day | week | month | year
+ *    **Depth:** basic | advanced
+ */
+export interface SkillToolConfig {
+  op: "search" | "extract";
+  sources?: string[];
+  topic?: "general" | "news" | "finance";
+  timeRange?: "day" | "week" | "month" | "year";
+  depth?: "basic" | "advanced";
+}
+
+export function parseSkillTools(procedureMd: string): SkillToolConfig {
+  const opMatch = procedureMd.match(/\*\*Tavily op:\*\*\s*(search|extract)/i);
+  const op: "search" | "extract" =
+    opMatch && opMatch[1].toLowerCase() === "extract" ? "extract" : "search";
+
+  const topicMatch = procedureMd.match(/\*\*Search topic:\*\*\s*(general|news|finance)/i);
+  const topic = topicMatch
+    ? (topicMatch[1].toLowerCase() as "general" | "news" | "finance")
+    : undefined;
+
+  const timeMatch = procedureMd.match(/\*\*Time range:\*\*\s*(day|week|month|year)/i);
+  const timeRange = timeMatch
+    ? (timeMatch[1].toLowerCase() as "day" | "week" | "month" | "year")
+    : undefined;
+
+  const depthMatch = procedureMd.match(/\*\*Depth:\*\*\s*(basic|advanced)/i);
+  const depth = depthMatch
+    ? (depthMatch[1].toLowerCase() as "basic" | "advanced")
+    : undefined;
+
+  let sources: string[] | undefined;
+  if (op === "extract") {
+    // Grab the bulleted lines beneath a **Sources:** header until a blank
+    // line, the next bold header, or another markdown heading.
+    const block = procedureMd.match(/\*\*Sources:\*\*\s*\n([\s\S]*?)(?:\n\s*\n|\n\*\*|\n#|$)/i);
+    if (block) {
+      sources = block[1]
+        .split("\n")
+        .map((l) => l.replace(/^\s*[-*]\s+/, "").trim())
+        .filter((l) => /^https?:\/\//i.test(l));
+    }
+  }
+
+  return { op, sources, topic, timeRange, depth };
+}
+
+/** Step 2: gather evidence via Tavily. Either runs the LLM-planned queries
+ *  through /search, or — if the skill declared **Tavily op:** extract with a
+ *  Sources list — pulls those specific URLs through /extract. */
+async function gatherSources(
+  env: Env,
+  queries: string[],
+  toolCfg: SkillToolConfig,
+): Promise<GatheredSource[]> {
+  await checkBudget(env, "searches");
+
+  let gathered: GatheredSource[] = [];
+
+  if (toolCfg.op === "extract" && toolCfg.sources?.length) {
+    // Curated URL list — skip search entirely.
+    const extracted = await tavilyExtract(env.TAVILY_API_KEY, toolCfg.sources).catch(() => []);
+    gathered = extracted.map((r) => ({
+      title: r.url,
+      url: r.url,
+      content: r.raw_content,
+    }));
+    // Roughly one credit per 5 URLs (basic depth). Bill conservatively.
+    await bumpUsage(env, "searches", Math.max(1, Math.ceil(toolCfg.sources.length / 5)));
+  } else {
+    // Default: LLM-planned queries → Tavily /search.
+    const opts: TavilySearchOptions = {
+      topic: toolCfg.topic ?? "general",
+      time_range: toolCfg.timeRange,
+      search_depth: toolCfg.depth ?? "basic",
+    };
+    const results = await Promise.all(
+      queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts).catch(() => [])),
+    );
+    await bumpUsage(env, "searches", queries.length);
+
+    // Flatten + dedup by URL, keep first-seen order.
+    const seen = new Set<string>();
+    for (const list of results) {
+      for (const r of list) {
+        if (!r.url || seen.has(r.url)) continue;
+        seen.add(r.url);
+        gathered.push({ title: r.title, url: r.url, content: r.content });
+      }
+    }
+  }
+
+  // Cap each source's content + cap total source count.
+  gathered = gathered.slice(0, 20).map((s) => ({
+    ...s,
+    content: s.content.slice(0, MAX_CHARS_PER_SOURCE),
+  }));
+  return gathered;
 }
 
 /** Step 4: recall similar past reports across the whole memory. Same-target
@@ -595,22 +708,21 @@ async function recallMemory(
   return { priorOnTarget, relatedAcrossTargets: related };
 }
 
-/** Step 5: ask the LLM to write the report, given everything we gathered. */
+/** Step 4: ask the LLM to write the report, given everything we gathered. */
 async function writeReport(
   env: Env,
   skill: Skill,
   target: Target,
-  sources: BraveResult[],
+  sources: GatheredSource[],
   priorOnTarget: Report[],
   relatedAcrossTargets: string[],
-  wikiContext: string,
   model: string,
 ): Promise<{ title: string; body: string }> {
   const sourceBlock = sources.length
     ? sources
         .map(
           (s, i) =>
-            `[${i + 1}] ${s.title}\n${s.url}${s.age ? ` · ${s.age}` : ""}\n${s.description}`,
+            `[${i + 1}] ${s.title}\n${s.url}\n${s.content}`,
         )
         .join("\n\n")
     : "(No web search results — write from general knowledge but explicitly say so.)";
@@ -634,10 +746,9 @@ TARGET
 Name: ${target.name}
 Kind: ${target.kind ?? "(unspecified)"}
 Description: ${target.description ?? "(none)"}
-${wikiContext}
 
-WEB SEARCH RESULTS
-==================
+WEB SOURCES (extracted page content)
+====================================
 ${sourceBlock}
 ${priorBlock}
 ${relatedBlock}
@@ -671,7 +782,7 @@ export async function runResearch(
   env: Env,
   target: Target,
   skill: Skill,
-  triggeredBy: "cron" | "mission" | "manual",
+  triggeredBy: "cron" | "manual",
 ): Promise<Report> {
   await checkBudget(env, "reports");
 
@@ -683,10 +794,14 @@ export async function runResearch(
   const chatModel = await getChatModel(env);
 
   try {
-    const plan = await planResearch(env, skill, target, chatModel);
-    const sources = await gatherSources(env, plan.queries);
+    const toolCfg = parseSkillTools(skill.procedure_md);
+    // Skip query planning entirely in extract mode — sources are explicit.
+    const queries =
+      toolCfg.op === "extract" && toolCfg.sources?.length
+        ? []
+        : (await planResearch(env, skill, target, chatModel)).queries;
+    const sources = await gatherSources(env, queries, toolCfg);
     const { priorOnTarget, relatedAcrossTargets } = await recallMemory(env, target, skill);
-    const wikiContext = await maybeWikipediaContext(target, priorOnTarget.length > 0);
 
     const { title, body } = await writeReport(
       env,
@@ -695,7 +810,6 @@ export async function runResearch(
       sources,
       priorOnTarget,
       relatedAcrossTargets,
-      wikiContext,
       chatModel,
     );
 
@@ -794,124 +908,6 @@ export async function runResearch(
       .catch(() => {});
     throw err;
   }
-}
-
-// ─── missions: one-shot user instructions ─────────────────────────────────
-
-export interface MissionInput {
-  brief: string;                              // freeform user instruction
-  target_slug?: string;                       // pin to an existing target
-  skill_slug?: string;                        // pin to an existing skill
-  new_target_name?: string;                   // create this target if it doesn't exist
-  new_skill_brief?: string;                   // synthesise a new skill from this brief
-}
-
-export interface MissionResult {
-  target: Target;
-  skill: Skill;
-  report: Report;
-}
-
-/** Run a single user instruction end-to-end. Either:
- *   - target_slug + skill_slug (existing target + existing skill)
- *   - new_target_name + skill_slug (create target, use existing skill)
- *   - new_target_name + new_skill_brief (create both)
- *   - just brief (agent picks target name + finds/creates skill from brief) */
-export async function runMission(env: Env, input: MissionInput): Promise<MissionResult> {
-  let target: Target | null = null;
-  if (input.target_slug) target = await getTargetBySlug(env, input.target_slug);
-  if (!target && input.new_target_name) {
-    target = await createTarget(env, {
-      name: input.new_target_name,
-      description: input.brief.slice(0, 280),
-    });
-  }
-  if (!target) {
-    // Last resort: extract a target name from the brief via the LLM.
-    const guess = await llmExtractTargetFromBrief(env, input.brief);
-    target = await createTarget(env, {
-      name: guess.name,
-      kind: guess.kind ?? undefined,
-      description: input.brief.slice(0, 280),
-    });
-  }
-
-  let skill: Skill | null = null;
-  if (input.skill_slug) skill = await getSkillBySlug(env, input.skill_slug);
-  if (!skill && input.new_skill_brief) {
-    skill = await synthesizeSkill(env, { brief: input.new_skill_brief });
-  }
-  if (!skill) {
-    // Try to find an existing skill that fits, else synthesise one from the brief.
-    skill = await pickBestExistingSkill(env, input.brief);
-  }
-  if (!skill) {
-    skill = await synthesizeSkill(env, { brief: input.brief });
-  }
-
-  // Attach as primary skill if the target doesn't have one.
-  if (!target.primary_skill_id) {
-    await updateTarget(env, target.id, { primary_skill_id: skill.id });
-    target = (await getTargetById(env, target.id))!;
-  }
-
-  const report = await runResearch(env, target, skill, "mission");
-  return { target, skill, report };
-}
-
-async function llmExtractTargetFromBrief(
-  env: Env,
-  brief: string,
-): Promise<{ name: string; kind: string | null }> {
-  const model = await getChatModel(env);
-  const res: any = await env.AI.run(model, {
-    messages: [
-      {
-        role: "system",
-        content: `Extract the primary subject of the user's research brief.
-Return ONLY a JSON object: { "name": "...", "kind": "postcode|place|topic|person|company|other" }.
-The name should be short — what you'd put on a folder tab. No extra text.`,
-      },
-      { role: "user", content: brief },
-    ],
-    max_tokens: 120,
-  });
-  const raw = String(res.response ?? "");
-  const m = raw.match(/\{[\s\S]*\}/);
-  if (m) {
-    try {
-      const parsed = JSON.parse(m[0]);
-      const name = String(parsed.name ?? "").trim().slice(0, 80);
-      if (name) return { name, kind: String(parsed.kind ?? "").trim() || null };
-    } catch {
-      // ignore
-    }
-  }
-  return { name: brief.slice(0, 60), kind: null };
-}
-
-async function pickBestExistingSkill(env: Env, brief: string): Promise<Skill | null> {
-  const skills = await listSkills(env);
-  if (skills.length === 0) return null;
-  // Cheap heuristic: pass skill names + descriptions to the LLM and ask which
-  // (if any) fits. We don't want to embed-search here — N skills will stay small.
-  const catalog = skills
-    .map((s) => `- ${s.slug}: ${s.name} — ${s.description ?? ""}`)
-    .join("\n");
-  const model = await getChatModel(env);
-  const res: any = await env.AI.run(model, {
-    messages: [
-      {
-        role: "system",
-        content: `You match a research brief to a skill from a catalog. Return ONLY the slug of the single best skill, OR the literal word "none" if no skill is a clear fit. No quotes, no extra text.`,
-      },
-      { role: "user", content: `BRIEF\n=====\n${brief}\n\nSKILL CATALOG\n=============\n${catalog}\n\nWhich skill slug fits best (or "none")?` },
-    ],
-    max_tokens: 30,
-  });
-  const choice = String(res.response ?? "").trim().split(/\s+/)[0]?.toLowerCase();
-  if (!choice || choice === "none") return null;
-  return skills.find((s) => s.slug === choice) ?? null;
 }
 
 // ─── cron tick: pick due targets, re-run their skill ───────────────────────

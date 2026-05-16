@@ -1,121 +1,129 @@
 // External data sources for the research agent.
 //
-// Three things only:
-//   braveSearch(query)        — web search, the agent's main eyes on the world
-//   wikipediaSummary(title)   — encyclopedia lookup for context / geo / facts
-//   geocodeQuery(query)       — turn a place name into lat/lon (Nominatim)
+// One tool, two operations:
+//   tavilySearch(query)   — keyword search; returns top results WITH extracted
+//                           full-page content. Default 1 credit / call.
+//   tavilyExtract(urls)   — read specific URLs in full (RSS feeds, curated
+//                           sources, etc). 1 credit per 5 URLs.
 //
-// Everything is keyless except Brave (free tier — set BRAVE_API_KEY secret).
+// Both require the TAVILY_API_KEY secret.
 
 const UA = "WatchOMacho/4 (research agent on Cloudflare Workers)";
 
-// ─── Brave Search ─────────────────────────────────────────────────────────
+// ─── Tavily ───────────────────────────────────────────────────────────────
 
-export interface BraveResult {
+export interface TavilySearchResult {
   title: string;
   url: string;
-  description: string;
-  age?: string;          // "2 days ago", "1 week ago" etc, when Brave returns it
-  language?: string;
+  content: string;       // extracted content of the page, already cleaned
+  score: number;         // relevance 0..1
+  published_date?: string;
 }
 
-/** One search query against Brave Search. Returns up to `count` web results,
- *  ranked by relevance. Returns [] if no API key is configured (graceful
- *  degradation — the calling skill will write a thinner report). */
-export async function braveSearch(
+export interface TavilySearchOptions {
+  topic?: "general" | "news" | "finance";
+  time_range?: "day" | "week" | "month" | "year";
+  search_depth?: "basic" | "advanced";   // basic = 1 credit, advanced = 2
+  max_results?: number;                  // default 5
+}
+
+/** One Tavily search. Returns up to `max_results` results, each with the
+ *  page's extracted content. Returns [] if no key is configured or the API
+ *  errored — calling skill will write a thinner report. */
+export async function tavilySearch(
   apiKey: string | undefined,
   query: string,
-  count = 5,
-): Promise<BraveResult[]> {
+  options: TavilySearchOptions = {},
+): Promise<TavilySearchResult[]> {
   if (!apiKey) {
-    console.warn("braveSearch: BRAVE_API_KEY not set, skipping query:", query);
+    console.warn("tavilySearch: TAVILY_API_KEY not set, skipping query:", query);
     return [];
   }
   const q = query.slice(0, 400).trim();
   if (!q) return [];
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=${Math.min(20, Math.max(1, count))}`;
-  const r = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "Accept-Encoding": "gzip",
-      "X-Subscription-Token": apiKey,
-      "User-Agent": UA,
-    },
+  const r = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": UA },
+    body: JSON.stringify({
+      api_key: apiKey,
+      query: q,
+      search_depth: options.search_depth ?? "basic",
+      topic: options.topic ?? "general",
+      time_range: options.time_range,
+      max_results: options.max_results ?? 5,
+      include_raw_content: true,        // we want the page text
+    }),
   });
   if (!r.ok) {
     const body = await r.text().catch(() => "");
-    console.warn(`braveSearch ${r.status} for "${q}": ${body.slice(0, 200)}`);
+    console.warn(`tavilySearch ${r.status} for "${q}": ${body.slice(0, 200)}`);
     return [];
   }
   const data: any = await r.json();
-  const hits: any[] = data?.web?.results ?? [];
-  return hits.slice(0, count).map((h: any) => ({
+  return (data.results ?? []).map((h: any) => ({
     title: String(h.title ?? "").trim(),
     url: String(h.url ?? "").trim(),
-    description: String(h.description ?? "").replace(/<[^>]+>/g, "").trim(),
-    age: h.age ?? undefined,
-    language: h.language ?? undefined,
+    content: String(h.raw_content ?? h.content ?? ""),
+    score: Number(h.score ?? 0),
+    published_date: h.published_date,
   }));
 }
 
-// ─── Wikipedia ────────────────────────────────────────────────────────────
-
-export interface WikiSummary {
-  title: string;
-  extract: string;
+export interface TavilyExtractResult {
   url: string;
-  lat?: number;
-  lon?: number;
+  raw_content: string;
 }
 
-/** Look up a Wikipedia article by title. Returns null on no match. */
-export async function wikipediaSummary(title: string): Promise<WikiSummary | null> {
-  if (!title) return null;
-  const r = await fetch(
-    `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`,
-    { headers: { "User-Agent": UA, "Accept": "application/json" } },
-  );
-  if (!r.ok) return null;
+/** Read a list of URLs in full via Tavily's /extract endpoint. Up to 20 URLs
+ *  per call. Returns [] on no key, empty input, or API error. */
+export async function tavilyExtract(
+  apiKey: string | undefined,
+  urls: string[],
+  extract_depth: "basic" | "advanced" = "basic",
+): Promise<TavilyExtractResult[]> {
+  if (!apiKey || urls.length === 0) return [];
+  const r = await fetch("https://api.tavily.com/extract", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": UA },
+    body: JSON.stringify({
+      api_key: apiKey,
+      urls: urls.slice(0, 20),
+      extract_depth,
+    }),
+  });
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    console.warn(`tavilyExtract ${r.status}: ${body.slice(0, 200)}`);
+    return [];
+  }
   const data: any = await r.json();
-  return {
-    title: data.title,
-    extract: data.extract ?? "",
-    url: data.content_urls?.desktop?.page ?? "",
-    lat: data.coordinates?.lat,
-    lon: data.coordinates?.lon,
-  };
+  return (data.results ?? []).map((res: any) => ({
+    url: String(res.url ?? ""),
+    raw_content: String(res.raw_content ?? ""),
+  }));
 }
 
-// ─── Nominatim (OpenStreetMap geocoder) ───────────────────────────────────
+// ─── TOOLS registry ───────────────────────────────────────────────────────
+//
+// Single source of truth for what tools exist and how skills can invoke them.
+// Used by:
+//   - synthesizeSkill (agent.ts) — gives the catalog to the LLM so it can
+//     pick the right tool config when authoring a skill from a brief.
+//   - /admin/tools (dashboard.ts) — renders the catalog as a read-only page.
 
-export interface GeoHit {
-  display: string;
-  lat: number;
-  lon: number;
-  country?: string;
-  city?: string;
-}
-
-/** Forward-geocode a freeform query to lat/lon via Nominatim. Returns null
- *  on no match. Used to enrich targets that look like places. */
-export async function geocodeQuery(q: string): Promise<GeoHit | null> {
-  if (!q) return null;
-  const r = await fetch(
-    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${encodeURIComponent(q)}`,
-    { headers: { "User-Agent": UA, "Accept": "application/json" } },
-  );
-  if (!r.ok) return null;
-  const data: any = await r.json();
-  if (!Array.isArray(data) || data.length === 0) return null;
-  const hit = data[0];
-  const lat = parseFloat(hit.lat);
-  const lon = parseFloat(hit.lon);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-  return {
-    display: hit.display_name,
-    lat,
-    lon,
-    country: hit.address?.country,
-    city: hit.address?.city ?? hit.address?.town ?? hit.address?.village,
-  };
-}
+export const TOOLS = {
+  tavily: {
+    slug: "tavily",
+    display: "Tavily",
+    operations: {
+      search:
+        "Search the web by keyword. Returns top results WITH extracted full-page content. 1 credit/call (basic) or 2 credits (advanced).",
+      extract:
+        "Read a list of specific URLs in full. Returns clean text per URL. 1 credit per 5 URLs (basic) or 2 credits per 5 (advanced).",
+    },
+    when_to_use_search:
+      "When the skill needs to discover relevant pages from the open web by keyword.",
+    when_to_use_extract:
+      "When the skill has specific URLs to read (RSS feeds, curated sources, etc.).",
+  },
+} as const;

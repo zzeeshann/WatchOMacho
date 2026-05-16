@@ -2,7 +2,7 @@
 
 A guided tour of the project. Written for someone who has not seen the code, may not know Cloudflare, and wants to understand both *what the agent does* and *why every part of the stack exists*.
 
-The text moves from very general (*what is a serverless agent?*) to very specific (*how does the planner decide which Brave queries to run?*). You don't need prior experience with Cloudflare, agents, or RAG. JavaScript familiarity helps but isn't required.
+The text moves from very general (*what is a serverless agent?*) to very specific (*how does the planner decide which Tavily queries to run?*). You don't need prior experience with Cloudflare, agents, or RAG. JavaScript familiarity helps but isn't required.
 
 ---
 
@@ -19,7 +19,7 @@ What WatchOMacho is **not**:
 - *Not a chatbot.* It doesn't reply to messages. You define the task; it executes autonomously and writes to a page.
 - *Not a passive feed-watcher.* It does not monitor news firehoses or wait for events. It is *target-driven*: you set the agenda.
 - *Not a one-shot research tool.* Each target accumulates reports over time. The thirtieth report on a target is informed by the first twenty-nine via vector recall.
-- *Not a perfect substitute for Wikipedia or a search engine.* It synthesises web search results into a structured markdown report with citations. Quality reflects the source material and the model.
+- *Not a perfect substitute for a search engine.* It synthesises extracted web content into a structured markdown report with citations. Quality reflects the source material and the model.
 
 The rest of the book unpacks how this is built. We start with the cloud platform underneath everything, then climb up to the agent's brain.
 
@@ -99,7 +99,7 @@ WatchOMacho uses D1 for eight tables — [schema.sql](schema.sql) is short and w
 | `targets` | Things being researched. One row per HA0 4GP / Bhutan / "AI agents". |
 | `skills` | Reusable research procedures. Each row holds a markdown procedure document. |
 | `reports` | Every report the agent writes. Lives on the target's page. |
-| `runs` | Audit log: every research attempt (cron / mission / manual), success or failure. |
+| `runs` | Audit log: every research attempt (cron / manual), success or failure. |
 | `settings` | Live runtime config the admin can edit (budgets, cron cap, etc.). |
 | `daily_usage` | Per-UTC-day counters for the budget gates. |
 | `login_attempts` | IP + timestamp + success-bit, for the login throttle. |
@@ -166,32 +166,20 @@ The number 768 is an artefact of how `bge-base-en-v1.5` was trained. If you chan
 
 ---
 
-## Chapter 5 — Brave Search: the agent's eyes
+## Chapter 5 — Tavily: the agent's eyes
 
-Cloudflare doesn't have a Google-style web search product. So we use Brave's API.
+Cloudflare doesn't have a Google-style web search product. So we use [Tavily](https://tavily.com) — a search API built specifically for AI agents. Crucially, it returns *extracted full-page content* alongside each result, not just a 150-character snippet, so the writer LLM has real material to synthesise from.
 
-[Brave Search](https://api.search.brave.com) gives you a clean JSON-returning web search. Their **Free AI plan** allows 2000 queries/month with no credit card. We set the API key as a Worker secret (`BRAVE_API_KEY`) and call it from [src/apis.ts](src/apis.ts).
+Tavily's **Researcher (Free)** plan gives 1000 credits/month with no credit card. We set the API key as a Worker secret (`TAVILY_API_KEY`) and call it from [src/apis.ts](src/apis.ts).
 
-A typical query returns:
+One tool, two operations:
 
-```json
-{
-  "web": {
-    "results": [
-      { "title": "...", "url": "...", "description": "...", "age": "2 days ago" },
-      ...
-    ]
-  }
-}
-```
+- **`/search`** — keyword search. Returns top N results, each with `title`, `url`, and the page's `raw_content` already extracted and cleaned. Optional knobs: `topic` (`general` / `news` / `finance`), `time_range` (`day` / `week` / `month` / `year`), `search_depth` (`basic` = 1 credit, `advanced` = 2). Default is basic.
+- **`/extract`** — read a list of specific URLs in full. Useful for RSS feeds or curated source lists. 1 credit per 5 URLs.
 
-We dedupe by URL, keep up to 20 results across all queries in a run, and feed them to the LLM as numbered citations. The LLM cites them as `[1]`, `[2]`, etc. in the body.
+We dedupe by URL, keep up to 20 results across all queries in a run, cap each page's content at 4000 chars, and feed them to the LLM as numbered citations. The LLM cites them as `[1]`, `[2]`, etc. in the body.
 
-**This is the part of the agent that reaches outside Cloudflare.** Two outbound HTTP calls during a normal run:
-1. Wikipedia (only on first run for a target — for grounding).
-2. Brave Search (a few queries per run).
-
-Plus Nominatim if the target needs geocoding (rare). Everything else stays in-platform.
+**This is the only part of the agent that reaches outside Cloudflare.** One HTTP call per planned query (search mode) or one per batch of up to 20 URLs (extract mode). Everything else stays in-platform.
 
 ---
 
@@ -205,25 +193,21 @@ An **agent** has at least some of:
 - **Tool-using** — calls external APIs to do work.
 - **Goal-directed** — pursues an objective over multiple steps.
 
-WatchOMacho is all four. The cron makes it autonomous. The D1+R2+Vectorize stack gives it persistence. Brave Search and Wikipedia are tools it uses. And every research run is a multi-step plan-search-recall-write loop.
+WatchOMacho is all four. The cron makes it autonomous. The D1+R2+Vectorize stack gives it persistence. Tavily is the tool it uses. And every research run is a multi-step plan-search-recall-write loop.
 
 The shape of one research run looks like this:
 
 ```
         ┌───────────────┐
         │      Plan     │  ← LLM call: "given this skill and target, what to search for?"
-        └──────┬────────┘
+        └──────┬────────┘     (skipped in extract mode — sources are explicit)
                │
         ┌──────▼────────┐
-        │    Gather     │  ← N parallel Brave Search queries → deduped sources
-        └──────┬────────┘
-               │
+        │    Gather     │  ← Tavily: N parallel /search calls (each result already
+        └──────┬────────┘     includes extracted full-page content), or one /extract
+               │              call against an explicit URL list
         ┌──────▼────────┐
         │    Recall     │  ← Vectorize: 4 most similar past reports + same-target history
-        └──────┬────────┘
-               │
-        ┌──────▼────────┐
-        │   Wikipedia?  │  ← first-run only, for one-shot grounding
         └──────┬────────┘
                │
         ┌──────▼────────┐
@@ -235,7 +219,7 @@ The shape of one research run looks like this:
         └───────────────┘
 ```
 
-Two LLM calls + N web searches per run. Predictable cost, predictable structure.
+Two LLM calls + N Tavily calls per run. Predictable cost, predictable structure.
 
 ---
 
@@ -275,17 +259,7 @@ Skills have two authors:
 
 Skills live in the [`skills`](schema.sql) table. The procedure markdown is the single source of truth — when the agent runs, it reads `procedure_md` as part of the system prompt.
 
-### Mission
-
-A mission is *a single user instruction*. You type a brief like *"Research SW1A 1AA, present a housing report."* The agent:
-1. Identifies (or creates) the **target** named by the brief.
-2. Identifies (or creates) the **skill** the brief implies.
-3. Runs the standard plan→gather→recall→write loop.
-4. Returns links to the new report and the target.
-
-Missions are one-shot — they don't persist as their own row. The artefacts they produce (target, skill, report) do.
-
-The cron, the admin "Run now" button, and missions all eventually call the same `runResearch(target, skill, triggeredBy)` function in [src/agent.ts](src/agent.ts). The only difference is *where* the (target, skill) pair came from.
+The cron and the admin "Run now" button both call the same `runResearch(target, skill, triggeredBy)` function in [src/agent.ts](src/agent.ts). The only difference is what set the run in motion.
 
 ---
 
@@ -342,11 +316,10 @@ Submit. You land on `/admin/targets/mens-mental-health`. In the background:
 **Step 3: First run.** The agent calls `runResearch(target, skill, 'manual')`:
 
 1. **Plan** (LLM call). Returns a JSON object: `{ "queries": ["men's mental health statistics 2026", "men's mental health WHO guidelines", ...] }`.
-2. **Gather** (Brave Search, 5 parallel queries). Returns ~20 deduped results: links to WHO, NHS, peer-reviewed studies, news outlets.
+2. **Gather** (Tavily `/search`, 5 parallel queries). Returns ~20 deduped results — each one a link to a WHO / NHS / peer-reviewed / news page, plus the extracted text of that page.
 3. **Recall** (Vectorize). No prior reports for this target. Picks up no related context (empty Vectorize). Skip.
-4. **Wikipedia grounding** (first-run only). Pulls the Wikipedia summary for "Men's mental health". Adds it to context.
-5. **Write** (LLM call). Given skill + target + 20 sources + Wikipedia overview, writes a 500-word markdown report citing `[1]`-`[20]`.
-6. **Persist.** Markdown goes to R2. Row goes to `reports`. Embedding goes to Vectorize. Audit row goes to `runs`. Target's `last_run_at` and `next_run_at` updated.
+4. **Write** (LLM call). Given skill + target + extracted content from 20 sources, writes a 500-word markdown report citing `[1]`-`[20]`.
+5. **Persist.** Markdown goes to R2. Row goes to `reports`. Embedding goes to Vectorize. Audit row goes to `runs`. Target's `last_run_at` and `next_run_at` updated.
 
 You reload `/target/mens-mental-health`. The first report is there with cited sources.
 
@@ -364,15 +337,15 @@ The target accumulates reports over time. After a month you have ~30 reports tra
 
 Four source files, all in [src/](src/).
 
-### `src/apis.ts` — external sources (~150 lines)
+### `src/apis.ts` — external sources (~130 lines)
 
-The agent's only external dependencies. Three functions:
+The agent's only external dependency. Two functions plus a tools registry:
 
-- **`braveSearch(apiKey, query, count)`** — the workhorse. Single web search query, returns up to N typed results. Gracefully no-ops if the API key isn't configured.
-- **`wikipediaSummary(title)`** — first-run grounding tool. Returns title / extract / URL / lat-lon if any. Null if the article doesn't exist.
-- **`geocodeQuery(q)`** — Nominatim. Resolves a place name to lat/lon. Used sparingly.
+- **`tavilySearch(apiKey, query, options)`** — the workhorse. Single web search via Tavily's `/search`. Each result already includes the page's extracted full content. Optional `topic` / `time_range` / `search_depth` / `max_results`. Gracefully no-ops if the API key isn't configured.
+- **`tavilyExtract(apiKey, urls, depth)`** — read a list of specific URLs in full via Tavily's `/extract`. Up to 20 URLs per call. Used by skills that declare `**Tavily op:** extract` with a curated source list.
+- **`TOOLS`** — a const object describing every tool the agent can call. `synthesizeSkill` reads it when authoring a skill from a brief, and `/admin/tools` renders it as a read-only catalog. Code + metadata live in the same file so they can't drift apart.
 
-Notice what *isn't* here: no random-Wikipedia function, no live-event scanner, no per-source adapter. The v4 agent doesn't need them.
+These two functions are everything the agent needs to reach the open web. Adding typed tools (Land Registry, ONS, Companies House, etc.) is on the roadmap, not here.
 
 ### `src/agent.ts` — the brain (~550 lines)
 
@@ -382,13 +355,13 @@ Where every business decision lives. Six sections:
 2. **Targets.** `createTarget`, `getTargetBySlug`, `listTargets`, `updateTarget`, `deleteTarget`. CRUD plus a unique-slug helper that handles collisions.
 3. **Skills.** `createSkillFromMarkdown` (user-written), `synthesizeSkill` (LLM writes the procedure), `listSkills`, `updateSkill`, `deleteSkill`. The skill schema is *the procedure_md is the source of truth* — when running, we pass it as the system prompt's "skill" section.
 4. **Reports.** `listReportsForTarget`, `getReportById`. (No `createReport` — reports are only created by `runResearch`.)
-5. **The research loop.** Five private functions chained inside `runResearch`:
-   - `planResearch(skill, target)` → JSON list of queries
-   - `gatherSources(queries)` → deduped Brave results
+5. **The research loop.** Functions chained inside `runResearch`:
+   - `parseSkillTools(procedure_md)` → optional `**Tavily op:**` / `**Sources:**` / topic / time / depth headers a skill may declare
+   - `planResearch(skill, target)` → JSON list of queries (skipped in extract mode)
+   - `gatherSources(queries, toolCfg)` → Tavily `/search` per query, OR `/extract` against the curated URL list; dedup; cap each source's content at 4000 chars
    - `recallMemory(target, skill)` → past reports for this target + related from elsewhere
-   - `maybeWikipediaContext(target, hasPriorReports)` → first-run grounding only
    - `writeReport(...)` → the report markdown
-6. **Missions and cron.** `runMission` glues user briefs to `runResearch`. `cronTick` walks due targets and runs each.
+6. **Cron.** `cronTick` walks due targets and runs each via `runResearch`.
 
 ### `src/index.ts` — routes (~400 lines)
 
@@ -412,7 +385,7 @@ Sections:
 - **Utilities** — `escapeHtml`, `formatDate`, `timeAgo`, `timeUntil`, and a hand-rolled safe markdown renderer (no raw HTML, no images, no script).
 - **Page shell** — `shell(title, body)` wraps each page with header / nav / footer.
 - **Public pages** — `renderHome`, `renderTargetPage`, `renderSkillPage`, `renderReportPage`.
-- **Admin pages** — `renderAdminLogin`, `renderAdminPanel`, `renderAdminSkills`, `renderAdminTargetEdit`.
+- **Admin pages** — `renderAdminLogin`, `renderAdminPanel`, `renderAdminSkills`, `renderAdminTargetEdit`, `renderAdminTools`.
 
 The CSS deliberately matches [daylila.com](https://daylila.com) — DM Sans, warm off-white paper (`#FAF8F4`), forest-teal primary (`#1A6B62`), restrained editorial layout, single 768px column.
 
@@ -477,9 +450,9 @@ Free plan: **10,000 neurons/day**, account-wide, resets at 00:00 UTC. That's ~10
 
 Workers Paid ($5/mo): **10 million neurons/month** included → ~20,000 reports/month. Effectively unlimited for personal use.
 
-### Brave Search
+### Tavily
 
-Free AI plan: **2000 queries/month**. At 5 queries per report, ~13 reports/day before the limit. Above that, ~$3 per 1000 extra queries.
+Researcher (Free) plan: **1000 credits/month**. A basic search = 1 credit; an advanced search = 2; extract is 1 credit per 5 URLs. At ~5 basic searches per report, ~6 reports/day before the limit. Above that, Tavily's paid tiers start at low single digits per month.
 
 ### App-level budget gates
 
@@ -488,7 +461,7 @@ In addition to Cloudflare's caps, the app has its own per-day caps in the `setti
 | Setting | Default | What it caps |
 | --- | --- | --- |
 | `daily_report_limit` | 20 | New reports written per UTC day |
-| `daily_search_limit` | 500 | Brave Search queries per UTC day |
+| `daily_search_limit` | 500 | Tavily credits consumed per UTC day |
 | `cron_max_per_tick` | 2 | How many targets the cron advances per hourly tick |
 
 When a cap is hit, the next call throws `BudgetExceeded`. The HTTP layer translates that to a 429 response with a friendly JSON message; the cron skips its remaining work and waits for the next tick.

@@ -22,7 +22,6 @@ import {
   listReportsForTarget,
   listSkills,
   listTargets,
-  runMission,
   runResearch,
   setSetting,
   synthesizeSkill,
@@ -37,6 +36,7 @@ import {
   renderAdminPanel,
   renderAdminSkills,
   renderAdminTargetEdit,
+  renderAdminTools,
   renderHome,
   renderReportPage,
   renderSkillPage,
@@ -53,7 +53,7 @@ const SECURITY_HEADERS: Record<string, string> = {
     "img-src 'self' data:",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
-    "script-src 'self' 'unsafe-inline'",
+    "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com",
     "connect-src 'self'",
     "frame-ancestors 'none'",
     "base-uri 'self'",
@@ -270,6 +270,11 @@ export default {
         return html(await renderAdminSkills(env));
       }
 
+      if (path === "/admin/tools" && req.method === "GET") {
+        if (!isAdmin(req, env)) return redirect("/admin/login");
+        return html(renderAdminTools());
+      }
+
       if (path.startsWith("/admin/targets/") && req.method === "GET") {
         if (!isAdmin(req, env)) return redirect("/admin/login");
         const slug = path.slice("/admin/targets/".length);
@@ -407,33 +412,6 @@ export default {
         return redirect("/admin/skills");
       }
 
-      // Missions: one-shot user instructions
-      if (path === "/admin/mission" && req.method === "POST") {
-        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const form = await readForm(req);
-        const brief = (form.brief ?? "").trim();
-        if (!brief) return json({ error: "brief required" }, { status: 400 });
-        try {
-          const result = await runMission(env, {
-            brief,
-            target_slug: form.target_slug?.trim() || undefined,
-            skill_slug: form.skill_slug?.trim() || undefined,
-            new_target_name: form.new_target_name?.trim() || undefined,
-            new_skill_brief: form.new_skill_brief?.trim() || undefined,
-          });
-          return json({
-            ok: true,
-            target_slug: result.target.slug,
-            skill_slug: result.skill.slug,
-            report_id: result.report.id,
-            report_title: result.report.title,
-          });
-        } catch (e: any) {
-          if (e instanceof BudgetExceeded) throw e;
-          return json({ error: String(e?.message ?? e) }, { status: 400 });
-        }
-      }
-
       // Settings
       if (path === "/admin/settings" && req.method === "GET") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
@@ -453,7 +431,7 @@ export default {
           chat_model: chatModel,
           allowed_chat_models: ALLOWED_CHAT_MODELS,
           usage,
-          brave_api_key_set: !!env.BRAVE_API_KEY,
+          tavily_api_key_set: !!env.TAVILY_API_KEY,
         });
       }
 
