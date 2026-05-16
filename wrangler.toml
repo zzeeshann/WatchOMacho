@@ -1,0 +1,46 @@
+name = "watchomacho"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Custom domain. Requires daylila.com to already be a Zone on your Cloudflare
+# account (i.e. your domain's nameservers point at Cloudflare). On deploy,
+# wrangler creates the DNS record and the SSL cert automatically — no manual
+# DNS setup needed.
+routes = [
+  { pattern = "watchomacho.daylila.com", custom_domain = true }
+]
+
+# Runs the agent every 6 hours (UTC). Change to taste.
+# Examples: "0 */2 * * *" every 2h, "0 9 * * *" daily at 09:00 UTC
+[triggers]
+crons = ["0 */6 * * *"]
+
+# Workers AI — for chat + embeddings
+[ai]
+binding = "AI"
+
+# D1 — structured log of notes and runs
+# Create with: wrangler d1 create watchomacho-db
+# Then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "watchomacho-db"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# R2 — stores full markdown notes (one .md per learning)
+# Create with: wrangler r2 bucket create watchomacho-notes
+[[r2_buckets]]
+binding = "NOTES"
+bucket_name = "watchomacho-notes"
+
+# Vectorize — semantic memory so the agent doesn't repeat itself.
+# Create with:
+#   wrangler vectorize create watchomacho-memory --dimensions=768 --metric=cosine
+[[vectorize]]
+binding = "MEMORY"
+index_name = "watchomacho-memory"
+
+# Secrets are NOT defined here. Set with:
+#   wrangler secret put ADMIN_SECRET
+# (pick a long random string — this is the password to unlock the admin panel)
