@@ -36,6 +36,7 @@ import {
   renderAdminPanel,
   renderAdminSkills,
   renderAdminTargetEdit,
+  renderAdminTools,
   renderHome,
   renderReportPage,
   renderSkillPage,
@@ -269,6 +270,11 @@ export default {
         return html(await renderAdminSkills(env));
       }
 
+      if (path === "/admin/tools" && req.method === "GET") {
+        if (!isAdmin(req, env)) return redirect("/admin/login");
+        return html(renderAdminTools());
+      }
+
       if (path.startsWith("/admin/targets/") && req.method === "GET") {
         if (!isAdmin(req, env)) return redirect("/admin/login");
         const slug = path.slice("/admin/targets/".length);
@@ -425,7 +431,7 @@ export default {
           chat_model: chatModel,
           allowed_chat_models: ALLOWED_CHAT_MODELS,
           usage,
-          brave_api_key_set: !!env.BRAVE_API_KEY,
+          tavily_api_key_set: !!env.TAVILY_API_KEY,
         });
       }
 

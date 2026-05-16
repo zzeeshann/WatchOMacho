@@ -23,6 +23,7 @@ import {
   type Skill,
   type Target,
 } from "./agent";
+import { TOOLS } from "./apis";
 
 /** Short pretty label for a chat model id ("Llama 3.3 70B"). Strips the descriptor
  *  after the em-dash so it fits in compact UI spots. */
@@ -484,7 +485,7 @@ ${FONTS}
     <a href="/" class="brand">WatchOMacho</a>
     <nav class="nav">
       ${navLink("/", "Targets", "home")}
-      ${isAdmin ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/skills", "Skills", "skills")} <form method="post" action="/admin/logout" style="display:inline;margin-left:8px"><button class="btn btn-secondary" style="padding:4px 10px;font-size:11px">Logout</button></form>` : navLink("/admin/login", "Admin", "admin")}
+      ${isAdmin ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/skills", "Skills", "skills")} ${navLink("/admin/tools", "Tools", "tools")} <form method="post" action="/admin/logout" style="display:inline;margin-left:8px"><button class="btn btn-secondary" style="padding:4px 10px;font-size:11px">Logout</button></form>` : navLink("/admin/login", "Admin", "admin")}
     </nav>
   </div>
 </header>
@@ -899,7 +900,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
             <div class="field-help">${usage.reports} used today</div>
           </div>
           <div class="field" style="flex:1;margin-bottom:0">
-            <label>Searches / day</label>
+            <label>Tavily credits / day</label>
             <input type="number" name="daily_search_limit" min="0" max="100000" value="${escapeHtml(searchLim)}">
             <div class="field-help">${usage.searches} used today</div>
           </div>
@@ -1021,7 +1022,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help" style="margin-bottom:12px">Describe what the skill should do in one paragraph. The agent will write the procedure document for you.</p>
+      <p class="field-help" style="margin-bottom:12px">Describe what the skill should do in one paragraph. The agent will write the procedure document for you, including optional <a href="/admin/tools" style="color:var(--zee-primary)">Tavily headers</a> (search topic, time range, depth, or extract URLs) when the brief implies them.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="synthesize">
         <div class="field">
@@ -1038,6 +1039,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Write a skill by hand</h3></div>
+      <p class="field-help" style="margin-bottom:12px">Optional Tavily headers you can declare in the markdown (all defaults are sensible): <code>**Tavily op:** search|extract</code>, <code>**Search topic:** general|news|finance</code>, <code>**Time range:** day|week|month|year</code>, <code>**Depth:** basic|advanced</code>. Full catalog: <a href="/admin/tools" style="color:var(--zee-primary)">/admin/tools</a>.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="write">
         <div class="field">
@@ -1187,4 +1189,54 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
     </div>
   `;
   return shell(`${target.name} · Admin`, body, { activeNav: "admin", adminFooter: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin: tools catalog — read-only registry of what skills can call
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function renderAdminTools(): string {
+  const rows = Object.values(TOOLS).map((tool) => {
+    const opRows = Object.entries(tool.operations).map(([opName, opDesc]) => `
+      <tr>
+        <td style="white-space:nowrap;vertical-align:top;padding:8px 12px 8px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--zee-primary)">${escapeHtml(tool.slug)} (${escapeHtml(opName)})</td>
+        <td style="vertical-align:top;padding:8px 0;font-size:14px;color:var(--zee-text)">${escapeHtml(opDesc)}</td>
+      </tr>
+    `).join("");
+    return `
+      <div class="card">
+        <div class="h3-row"><h3>${escapeHtml(tool.display)}</h3></div>
+        <p class="field-help" style="margin-bottom:12px"><strong>When to use search:</strong> ${escapeHtml(tool.when_to_use_search)}</p>
+        <p class="field-help" style="margin-bottom:16px"><strong>When to use extract:</strong> ${escapeHtml(tool.when_to_use_extract)}</p>
+        <table style="width:100%;border-collapse:collapse"><tbody>${opRows}</tbody></table>
+      </div>
+    `;
+  }).join("");
+
+  const body = `
+    <section style="padding:24px 0 8px">
+      <p class="label">Admin</p>
+      <h1 class="headline" style="margin-top:8px;font-size:32px">Tools.</h1>
+      <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
+    </section>
+
+    ${rows}
+
+    <div class="card">
+      <div class="h3-row"><h3>Skill markdown headers</h3></div>
+      <p class="field-help" style="margin-bottom:8px">Any skill can declare these optional headers in its procedure markdown. Sensible defaults if omitted (search mode, basic depth, general topic, any time range).</p>
+      <pre style="background:rgba(232,228,222,0.4);padding:12px 14px;border-radius:6px;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.6;color:var(--zee-text)">**Tavily op:** search          (default)
+                OR
+               extract            (forces URL-based mode)
+
+**Sources:**                     (only used with extract op)
+- https://feeds.bbci.co.uk/news/world/rss.xml
+- https://rss.cnn.com/rss/edition_world.rss
+
+**Search topic:** general | news | finance     (default: general)
+**Time range:**   day | week | month | year     (default: any)
+**Depth:**        basic | advanced              (default: basic)</pre>
+    </div>
+  `;
+  return shell("Tools · WatchOMacho", body, { activeNav: "tools", adminFooter: true });
 }

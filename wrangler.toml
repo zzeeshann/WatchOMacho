@@ -44,6 +44,7 @@ index_name = "watchomacho-memory"
 
 # Secrets are NOT defined here. Set with:
 #   wrangler secret put ADMIN_SECRET    — admin panel password
-#   wrangler secret put BRAVE_API_KEY   — Brave Search API key (free tier ok)
-# Without BRAVE_API_KEY, web-search-backed skills will short-circuit and the
+#   wrangler secret put TAVILY_API_KEY  — Tavily API key (Researcher Free plan
+#                                         gives 1000 credits/month)
+# Without TAVILY_API_KEY, web-search-backed skills will short-circuit and the
 # agent will fall back to LLM-only knowledge (poor for "research" use cases).
