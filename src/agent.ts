@@ -13,6 +13,9 @@ import {
   currentWeather,
   wikipediaSummary,
   geocodeQuery,
+  recentEarthquakes,
+  topWikipediaPages,
+  type LiveEvent,
 } from "./apis";
 
 export interface Env {
@@ -60,6 +63,7 @@ interface PickedTopic {
   country?: string;
   lat?: number;
   lon?: number;
+  source_event_id?: string;     // for live-event dedup, see notes.source_event_id
 }
 
 interface RecalledNote {
@@ -426,8 +430,8 @@ async function runStep(
 
   await env.DB.prepare(
     `INSERT INTO notes
-       (id, title, topic, place, country, lat, lon, snippet, source, source_url, r2_key, word_count, created_at, triggered_by, exploration_id, step_index)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, title, topic, place, country, lat, lon, snippet, source, source_url, source_event_id, r2_key, word_count, created_at, triggered_by, exploration_id, step_index)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       noteId,
@@ -440,6 +444,7 @@ async function runStep(
       snippet,
       topic.source,
       topic.source_url || null,
+      topic.source_event_id ?? null,
       r2Key,
       wordCount,
       created,
@@ -919,4 +924,270 @@ export async function ask(env: Env, question: string) {
     answer: String(res.response ?? "").trim(),
     sources: notes.map((n: any) => n.title),
   };
+}
+
+// ─── subscriptions + live-feed digest ──────────────────────────────────────
+
+export interface Subscription {
+  id: string;
+  topic: string;
+  created_at: number;
+  active: number;
+}
+
+interface SubscriptionWithEmbedding extends Subscription {
+  embedding: number[] | null;
+}
+
+/** Embed a string into a 768-dim vector. Returns null if the call fails or
+ *  returns nothing usable; callers should treat that as "skip, retry later". */
+async function embed(env: Env, text: string): Promise<number[] | null> {
+  try {
+    const out: any = await env.AI.run(EMBED_MODEL, { text: [text.slice(0, 2000)] });
+    const v = out?.data?.[0];
+    return Array.isArray(v) && v.length > 0 ? (v as number[]) : null;
+  } catch (e) {
+    console.error("embed failed", e);
+    return null;
+  }
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length);
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < n; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+export async function addSubscription(env: Env, topic: string): Promise<Subscription> {
+  const trimmed = topic.trim();
+  if (!trimmed) throw new Error("topic is empty");
+  if (trimmed.length > 200) throw new Error("topic must be <= 200 chars");
+  const vec = await embed(env, trimmed);
+  const id = uid();
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO subscriptions (id, topic, embedding_json, created_at, active)
+     VALUES (?, ?, ?, ?, 1)`,
+  )
+    .bind(id, trimmed, vec ? JSON.stringify(vec) : null, now)
+    .run();
+  return { id, topic: trimmed, created_at: now, active: 1 };
+}
+
+export async function listSubscriptions(env: Env): Promise<Subscription[]> {
+  const rows = await env.DB.prepare(
+    "SELECT id, topic, created_at, active FROM subscriptions ORDER BY created_at DESC",
+  ).all<Subscription>();
+  return rows.results ?? [];
+}
+
+export async function deleteSubscription(env: Env, id: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM subscriptions WHERE id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM subscription_matches WHERE subscription_id = ?")
+    .bind(id)
+    .run()
+    .catch(() => {});
+}
+
+export async function setSubscriptionActive(env: Env, id: string, active: boolean): Promise<void> {
+  await env.DB.prepare("UPDATE subscriptions SET active = ? WHERE id = ?")
+    .bind(active ? 1 : 0, id)
+    .run();
+}
+
+async function loadActiveSubscriptions(env: Env): Promise<SubscriptionWithEmbedding[]> {
+  const rows = await env.DB.prepare(
+    "SELECT id, topic, embedding_json, created_at, active FROM subscriptions WHERE active = 1",
+  ).all<any>();
+  const out: SubscriptionWithEmbedding[] = [];
+  for (const r of rows.results ?? []) {
+    let vec: number[] | null = null;
+    if (r.embedding_json) {
+      try {
+        const parsed = JSON.parse(r.embedding_json);
+        if (Array.isArray(parsed) && parsed.length > 0) vec = parsed;
+      } catch {
+        // fall through with null
+      }
+    }
+    // Self-heal: an active subscription with no embedding (or a corrupted one)
+    // gets re-embedded the first time we touch it. One-time cost.
+    if (!vec) {
+      vec = await embed(env, r.topic);
+      if (vec) {
+        await env.DB.prepare("UPDATE subscriptions SET embedding_json = ? WHERE id = ?")
+          .bind(JSON.stringify(vec), r.id)
+          .run()
+          .catch(() => {});
+      }
+    }
+    out.push({
+      id: r.id,
+      topic: r.topic,
+      created_at: r.created_at,
+      active: r.active,
+      embedding: vec,
+    });
+  }
+  return out;
+}
+
+interface DigestMatch {
+  event: LiveEvent;
+  subscription: SubscriptionWithEmbedding;
+  score: number;
+}
+
+/** Scan the live feeds, embed each not-yet-seen event, and match against
+ *  active subscriptions. For every match above the threshold, write one
+ *  short field note via runStep. Returns counts so the caller can log them.
+ *
+ *  Safe to call on every cron tick: it dedups against notes.source_event_id
+ *  so we never write twice for the same event, and the daily-notes budget
+ *  gate still applies to each written entry. */
+export async function scanLiveFeeds(env: Env): Promise<{
+  scanned: number;
+  matched: number;
+  written: number;
+  skipped_seen: number;
+}> {
+  const subs = await loadActiveSubscriptions(env);
+  const usable = subs.filter((s) => s.embedding);
+  if (usable.length === 0) {
+    return { scanned: 0, matched: 0, written: 0, skipped_seen: 0 };
+  }
+
+  const threshold = parseFloat(await getSetting(env, "digest_match_threshold", "0.45"));
+  const cutoff = Number.isFinite(threshold) ? threshold : 0.45;
+
+  // Pull both feeds in parallel. If either fails, carry on with whatever we got.
+  const [eqs, wikis] = await Promise.all([
+    recentEarthquakes().catch((e) => {
+      console.error("usgs fetch failed", e);
+      return [] as LiveEvent[];
+    }),
+    topWikipediaPages(25).catch((e) => {
+      console.error("wiki-top fetch failed", e);
+      return [] as LiveEvent[];
+    }),
+  ]);
+  const events: LiveEvent[] = [...eqs, ...wikis];
+
+  let scanned = 0, matched = 0, written = 0, skipped_seen = 0;
+
+  for (const ev of events) {
+    scanned++;
+    // Dedup against the notes table: have we already written about this event?
+    const seen = await env.DB.prepare(
+      "SELECT id FROM notes WHERE source = ? AND source_event_id = ? LIMIT 1",
+    )
+      .bind("live-event", ev.event_id)
+      .first<{ id: string }>();
+    if (seen) {
+      skipped_seen++;
+      continue;
+    }
+
+    const vec = await embed(env, `${ev.title}. ${ev.context}`);
+    if (!vec) continue;
+
+    let best: DigestMatch | null = null;
+    for (const sub of usable) {
+      const score = cosineSimilarity(vec, sub.embedding!);
+      if (score >= cutoff && (!best || score > best.score)) {
+        best = { event: ev, subscription: sub, score };
+      }
+    }
+    if (!best) continue;
+    matched++;
+
+    // Resolve country / better location on match (one geocode per match — cheap).
+    let country: string | undefined = ev.country;
+    let place: string | undefined = ev.place;
+    let lat = ev.lat, lon = ev.lon;
+    if (lat != null && lon != null) {
+      const geo = await reverseGeocode(lat, lon).catch(() => null);
+      if (geo) {
+        country = country ?? geo.country;
+        place = place ?? geo.city ?? geo.country;
+      }
+    } else if (ev.source === "wiki-top") {
+      const w = await wikipediaSummary(String(ev.extra?.article ?? ev.title)).catch(() => null);
+      if (w) {
+        if (w.lat != null && w.lon != null) {
+          lat = w.lat;
+          lon = w.lon;
+          const geo = await reverseGeocode(w.lat, w.lon).catch(() => null);
+          if (geo) {
+            country = geo.country;
+            place = geo.city ?? geo.country;
+          }
+        }
+        ev.context = `${ev.context}\n\nWikipedia summary: ${w.extract}`;
+      }
+    }
+
+    const topic: PickedTopic = {
+      title: ev.title,
+      source: "live-event",
+      source_url: ev.url ?? "",
+      source_event_id: ev.event_id,
+      raw: `Live event spotted on ${new Date(ev.occurred_at).toISOString()}.\nSource: ${ev.source}.\n${ev.context}`,
+      place,
+      country,
+      lat,
+      lon,
+    };
+
+    const extra = `This is a *live event* you just spotted in the world, not a Wikipedia random-walk. The reader subscribed to "${best.subscription.topic}" and this surfaced because it matched. Write ~200 words (shorter than usual) in plain prose: what just happened, what's interesting about it, and one link to something you already know if you can. Open with the event itself — no preamble.`;
+
+    try {
+      const persisted = await runStep(env, topic, "digest", extra);
+      written++;
+      const now = Date.now();
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO subscription_matches (note_id, subscription_id, score, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+        .bind(persisted.noteId, best.subscription.id, best.score, now)
+        .run()
+        .catch(() => {});
+    } catch (e: any) {
+      if (e instanceof BudgetExceeded) {
+        // Out of budget — stop early, don't keep burning embeddings for matches
+        // we can't write. We'll resume on the next cron tick.
+        console.warn("digest stopped: daily budget exhausted");
+        break;
+      }
+      console.error("digest write failed", ev.event_id, e);
+    }
+  }
+
+  return { scanned, matched, written, skipped_seen };
+}
+
+/** Per-subscription recent matches, joined with the note. Used by the public
+ *  digest view and the admin panel. */
+export async function digestForSubscription(
+  env: Env,
+  subscriptionId: string,
+  limit = 20,
+): Promise<any[]> {
+  const rows = await env.DB.prepare(
+    `SELECT n.id, n.title, n.snippet, n.country, n.place, n.created_at, n.source_url, m.score
+       FROM subscription_matches m
+       JOIN notes n ON n.id = m.note_id
+      WHERE m.subscription_id = ?
+      ORDER BY m.created_at DESC
+      LIMIT ?`,
+  )
+    .bind(subscriptionId, limit)
+    .all<any>();
+  return rows.results ?? [];
 }

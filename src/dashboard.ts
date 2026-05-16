@@ -7,7 +7,7 @@
 //   renderAdminPanel()    — runs, ask, missions, cadence
 
 import type { Env } from "./agent";
-import { getSetting, getDailyUsage } from "./agent";
+import { getSetting, getDailyUsage, listSubscriptions, digestForSubscription } from "./agent";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared design tokens
@@ -164,6 +164,40 @@ export async function renderDashboard(env: Env): Promise<string> {
     .map((p) => [p.lat, p.lon]);
 
   const lastVisit = stats.last_visit ? timeAgo(stats.last_visit) : "—";
+
+  // Digest section: per active subscription, recent matched notes.
+  const allSubs = await listSubscriptions(env);
+  const activeSubs = allSubs.filter((s) => s.active);
+  const digestGroups = await Promise.all(
+    activeSubs.map(async (s) => ({
+      subscription: s,
+      matches: await digestForSubscription(env, s.id, 8),
+    })),
+  );
+  const visibleDigest = digestGroups.filter((g) => g.matches.length > 0);
+
+  const digestHtml = activeSubs.length === 0
+    ? ""
+    : visibleDigest.length === 0
+      ? `<div class="digest-empty">Watching ${activeSubs.length} topic${activeSubs.length === 1 ? "" : "s"} — nothing has matched yet. Quiet day in the world.</div>`
+      : visibleDigest.map((g) => `
+          <div class="dig-group reveal">
+            <div class="dig-head">
+              <span class="dig-label">Subscribed to</span>
+              <span class="dig-topic">${escapeHtml(g.subscription.topic)}</span>
+              <span class="dig-count">${g.matches.length} match${g.matches.length === 1 ? "" : "es"}</span>
+            </div>
+            <div class="dig-cards">
+              ${g.matches.map((m: any) => `
+                <a class="dig-card" href="/note/${escapeHtml(m.id)}">
+                  <div class="dig-when mono">${escapeHtml(timeAgo(m.created_at))}</div>
+                  <div class="dig-title">${escapeHtml(m.title)}</div>
+                  ${m.country || m.place ? `<div class="dig-place">${escapeHtml([m.place, m.country].filter(Boolean).join(", "))}</div>` : ""}
+                  <p class="dig-snippet">${escapeHtml(m.snippet)}</p>
+                  <div class="dig-score mono">match · ${(Number(m.score) || 0).toFixed(2)}</div>
+                </a>`).join("")}
+            </div>
+          </div>`).join("");
 
   const visibleRows = rows.slice(0, 20);
   const entries = visibleRows.length === 0
@@ -402,6 +436,95 @@ footer a:hover { color: var(--oxblood); border-color: var(--oxblood); }
   h2 { font-size: 26px; }
   .section-head { margin: 64px 0 24px; }
 }
+.digest { margin-top: 24px; }
+.digest-empty {
+  padding: 32px;
+  text-align: center;
+  color: var(--sepia);
+  font-style: italic;
+  border: 1px dashed var(--line);
+  border-radius: 2px;
+}
+.dig-group {
+  margin-top: 32px;
+  padding-top: 28px;
+  border-top: 1px solid var(--line);
+}
+.dig-group:first-child { border-top: none; margin-top: 0; padding-top: 0; }
+.dig-head {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.dig-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--sepia);
+}
+.dig-topic {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 26px;
+  color: var(--oxblood);
+  font-style: italic;
+  letter-spacing: -0.01em;
+  font-variation-settings: "opsz" 144;
+}
+.dig-count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--sepia);
+}
+.dig-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+}
+.dig-card {
+  background: rgba(221, 208, 179, 0.4);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 16px 18px;
+  text-decoration: none;
+  color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: transform 0.2s, border-color 0.2s;
+}
+.dig-card:hover {
+  border-color: var(--oxblood);
+  transform: translateY(-2px);
+}
+.dig-when { font-size: 10px; letter-spacing: 0.14em; color: var(--sepia); text-transform: uppercase; }
+.dig-title {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+.dig-place { font-style: italic; color: var(--teal); font-size: 13px; }
+.dig-snippet { font-size: 14px; color: var(--ink-soft); line-height: 1.5; margin-top: 4px; }
+.dig-score {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--sepia);
+  text-transform: uppercase;
+  margin-top: auto;
+  padding-top: 8px;
+}
+@media (max-width: 720px) {
+  .dig-cards { grid-template-columns: 1fr; }
+  .dig-topic { font-size: 22px; }
+}
 </style>
 </head>
 <body>
@@ -433,6 +556,14 @@ footer a:hover { color: var(--oxblood); border-color: var(--oxblood); }
     <span><i style="background:rgba(58,107,126,0.55)"></i> Mission link</span>
   </div>
   <div id="map" class="reveal" style="animation-delay: 0.3s"></div>
+
+  ${activeSubs.length > 0 ? `
+  <div class="section-head" style="margin-top: 80px;">
+    <h2>Today's <em>signal</em></h2>
+    <span class="section-meta">${activeSubs.length} topic${activeSubs.length === 1 ? "" : "s"} watched · live feeds</span>
+  </div>
+  <div class="digest">${digestHtml}</div>
+  ` : ""}
 
   <div class="section-head" style="margin-top: 80px;">
     <h2>Recent <em>field notes</em></h2>
@@ -782,15 +913,18 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     "SELECT id, brief, status, current_step, total_steps, synthesis_note_id, error, created_at, updated_at FROM explorations ORDER BY created_at DESC LIMIT 10",
   ).all<any>();
 
-  const [frequency, strategy, lastCronStr, noteLimStr, askLimStr, missLimStr, usage] = await Promise.all([
+  const [frequency, strategy, lastCronStr, noteLimStr, askLimStr, missLimStr, thresholdStr, usage, subs] = await Promise.all([
     getSetting(env, "frequency_hours", "6"),
     getSetting(env, "topic_strategy", "mixed"),
     getSetting(env, "last_cron_run", "0"),
     getSetting(env, "daily_note_limit", "30"),
     getSetting(env, "daily_ask_limit", "100"),
     getSetting(env, "daily_mission_limit", "5"),
+    getSetting(env, "digest_match_threshold", "0.45"),
     getDailyUsage(env),
+    listSubscriptions(env),
   ]);
+  const threshold = Number(thresholdStr) || 0.45;
   const noteLim = Number(noteLimStr) || 0;
   const askLim = Number(askLimStr) || 0;
   const missLim = Number(missLimStr) || 0;
@@ -844,6 +978,23 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     `<option value="${n}"${freqNum === n ? " selected" : ""}>${label}</option>`;
   const stratOption = (v: string, label: string, desc: string) =>
     `<option value="${v}"${strategy === v ? " selected" : ""}>${label} — ${desc}</option>`;
+
+  const subsHtml = subs.length === 0
+    ? `<div class="sub-empty">No subscriptions yet. Add a topic above — the agent will only write when a live event matches one of these.</div>`
+    : subs.map((s) => `
+        <div class="sub-row ${s.active ? "" : "sub-muted"}">
+          <div class="sub-topic">${escapeHtml(s.topic)}</div>
+          <div class="sub-meta mono">${escapeHtml(formatDate(s.created_at))} · ${s.active ? "active" : "muted"}</div>
+          <div class="sub-actions">
+            <form method="post" action="/admin/subscriptions/${escapeHtml(s.id)}/toggle" style="display:inline">
+              <input type="hidden" name="active" value="${s.active ? "0" : "1"}">
+              <button type="submit" class="sub-btn">${s.active ? "mute" : "unmute"}</button>
+            </form>
+            <form method="post" action="/admin/subscriptions/${escapeHtml(s.id)}/delete" style="display:inline">
+              <button type="submit" class="sub-btn sub-btn-danger" onclick="return confirm('Delete this topic?')">delete</button>
+            </form>
+          </div>
+        </div>`).join("");
 
   const budgetRow = (label: string, used: number, limit: number) => {
     const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
@@ -1062,10 +1213,65 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
 .bg-danger > div { background: var(--oxblood); }
 .bg-fig { font-family: var(--font-mono); font-size: 13px; color: var(--ink); text-align: right; }
 .bg-fig span { color: var(--sepia); }
+.panel-wide { grid-column: 1 / -1; }
+.sub-list {
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border-top: 1px solid var(--line);
+}
+.sub-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 16px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.sub-row.sub-muted .sub-topic { color: var(--sepia); font-style: italic; }
+.sub-topic { font-size: 16px; color: var(--ink); }
+.sub-meta { font-size: 10px; letter-spacing: 0.12em; color: var(--sepia); text-transform: uppercase; }
+.sub-actions { display: flex; gap: 8px; }
+.sub-btn {
+  background: transparent;
+  border: 1px solid var(--sepia);
+  color: var(--sepia);
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.sub-btn:hover { color: var(--ink); border-color: var(--ink); }
+.sub-btn-danger:hover { color: var(--oxblood); border-color: var(--oxblood); }
+.sub-empty {
+  margin-top: 20px;
+  padding: 24px;
+  text-align: center;
+  color: var(--sepia);
+  font-style: italic;
+  border: 1px dashed var(--line);
+  border-radius: 2px;
+}
+.scan-result {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: var(--paper);
+  border-left: 3px solid var(--teal);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+  letter-spacing: 0.04em;
+}
 @media (max-width: 720px) {
   .admin-grid, .missions, .panel-row { grid-template-columns: 1fr; gap: 20px; }
   .panel { padding: 24px; }
   table.runs th, table.runs td { padding: 10px 8px; font-size: 13px; }
+  .sub-row { grid-template-columns: 1fr; gap: 6px; }
+  .sub-actions { justify-content: flex-start; }
 }
 </style>
 </head>
@@ -1136,12 +1342,31 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
               ${stratOption("random", "random", "pure serendipity")}
               ${stratOption("bridge", "bridge", "always link two past notes")}
               ${stratOption("gap", "gap", "favour unvisited countries")}
+              ${stratOption("digest", "digest", "watch live feeds, write on match")}
             </select>
           </div>
         </div>
         <button type="submit">Save</button>
       </form>
       <div class="next-run">Last cron run: <strong>${lastCron > 0 ? escapeHtml(timeAgo(lastCron)) : "never"}</strong> · Next: <strong>${escapeHtml(nextCronLabel)}</strong></div>
+    </div>
+
+    <div class="panel panel-wide">
+      <h3>Interest <em>subscriptions</em></h3>
+      <p class="desc">Topics you actually care about. In <strong>digest</strong> mode the agent scans live feeds (USGS earthquakes, surging Wikipedia articles) every cron tick and writes a short note only when an event matches one of these by meaning. Quiet days cost nothing.</p>
+      <form id="sub-form" style="display:flex;gap:8px;align-items:stretch">
+        <input type="text" name="topic" placeholder="e.g. 'Pacific volcanism', 'central Asian languages', 'container shipping anomalies'" maxlength="200" required style="flex:1">
+        <button type="submit">Add topic</button>
+      </form>
+      <div class="sub-list">${subsHtml}</div>
+      <form id="digest-form" style="margin-top:20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <label style="font-family:var(--font-mono);font-size:10px;letter-spacing:0.14em;text-transform:uppercase;color:var(--sepia)">Match threshold</label>
+        <input type="number" name="digest_match_threshold" min="0" max="1" step="0.01" value="${escapeHtml(threshold.toFixed(2))}" style="width:90px">
+        <span style="font-size:13px;color:var(--ink-soft);font-style:italic">0 = match everything · 1 = identical only · 0.45 = topically related</span>
+        <button type="submit" style="margin-left:auto">Save</button>
+        <button type="button" id="scan-now-btn" class="sub-btn">Scan feeds now</button>
+      </form>
+      <div id="scan-result" class="scan-result" style="display:none"></div>
     </div>
 
     <div class="panel">
@@ -1270,6 +1495,54 @@ table.runs td.mono { font-family: var(--font-mono); font-size: 12px; color: var(
   document.getElementById('budget-form').addEventListener('submit', (e) => {
     e.preventDefault();
     saveSettings(e.target, e.target.querySelector('button'), 'Save budgets');
+  });
+
+  document.getElementById('sub-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const btn = form.querySelector('button');
+    btn.disabled = true;
+    try {
+      const fd = new FormData(form);
+      const res = await fetch('/admin/subscriptions', { method: 'POST', body: fd });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        alert(d.error || ('HTTP ' + res.status));
+        return;
+      }
+      window.location.reload();
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById('digest-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    saveSettings(e.target, e.target.querySelector('button[type=submit]'), 'Save');
+  });
+
+  document.getElementById('scan-now-btn').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const result = document.getElementById('scan-result');
+    btn.disabled = true;
+    btn.textContent = 'Scanning…';
+    result.style.display = 'block';
+    result.textContent = 'Fetching feeds and matching against your subscriptions…';
+    try {
+      const res = await fetch('/admin/digest/scan', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        result.textContent = data.error || ('HTTP ' + res.status);
+        return;
+      }
+      result.textContent = 'Scanned ' + data.scanned + ' events · ' + data.matched + ' matched · ' + data.written + ' written · ' + data.skipped_seen + ' already seen.';
+      if (data.written > 0) setTimeout(() => window.location.reload(), 1500);
+    } catch (err) {
+      result.textContent = 'Scan failed: ' + (err && err.message || err);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Scan feeds now';
+    }
   });
 </script>
 </body>
