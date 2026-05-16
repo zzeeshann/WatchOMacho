@@ -1,52 +1,74 @@
--- WatchOMacho schema. Runs in Cloudflare D1.
--- All CREATE statements are idempotent so this file doubles as a migration.
+-- WatchOMacho v4 schema. Fresh installs run this; existing installs run
+-- migration-v6.sql which does the same set of CREATE statements after
+-- dropping the old tables.
+--
+-- Mental model: Targets (things the agent researches) get Skills (named
+-- procedures) applied to them, producing Reports (markdown writeups) that
+-- accumulate on each target's page over time. The cron walks active targets
+-- and re-runs their skill on the configured cadence.
 
-CREATE TABLE IF NOT EXISTS notes (
+CREATE TABLE IF NOT EXISTS targets (
   id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  topic TEXT NOT NULL,            -- 'world-explorer'
-  place TEXT,                     -- city or named place if any
-  country TEXT,                   -- resolved country name
-  lat REAL,
-  lon REAL,
-  snippet TEXT NOT NULL,          -- ~240 chars preview shown on the dashboard
-  source TEXT NOT NULL,           -- 'wikipedia' | 'restcountries' | 'user-prompt' | 'exploration' | 'synthesis' | 'live-event'
-  source_url TEXT,
-  source_event_id TEXT,           -- stable id from the live source (USGS event id, "wiki-top:date:title"), for dedup
-  r2_key TEXT NOT NULL,           -- path in R2 holding the full markdown
-  word_count INTEGER,
-  created_at INTEGER NOT NULL,    -- unix ms
-  triggered_by TEXT NOT NULL,     -- 'cron' | 'manual' | 'prompt' | 'exploration' | 'digest'
-  exploration_id TEXT,            -- if produced as part of an exploration
-  step_index INTEGER              -- step number within that exploration
+  slug TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  cadence_hours INTEGER NOT NULL DEFAULT 24,
+  primary_skill_id TEXT,
+  last_run_at INTEGER,
+  next_run_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_notes_country ON notes(country);
-CREATE INDEX IF NOT EXISTS idx_notes_exploration ON notes(exploration_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_source_event
-  ON notes(source, source_event_id)
-  WHERE source_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_targets_status_next ON targets(status, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_targets_created ON targets(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS skills (
+  id TEXT PRIMARY KEY,
+  slug TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT,
+  procedure_md TEXT NOT NULL,
+  author TEXT NOT NULL,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skills_created ON skills(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS reports (
+  id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL,
+  skill_id TEXT,
+  title TEXT NOT NULL,
+  snippet TEXT NOT NULL,
+  r2_key TEXT NOT NULL,
+  word_count INTEGER,
+  sources_json TEXT,
+  run_id TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_skill ON reports(skill_id);
 
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
+  target_id TEXT,
+  skill_id TEXT,
   triggered_by TEXT NOT NULL,
-  status TEXT NOT NULL,           -- 'success' | 'error'
-  topic_chosen TEXT,
-  note_id TEXT,
-  error TEXT,
+  status TEXT NOT NULL,
+  report_id TEXT,
   duration_ms INTEGER,
+  error TEXT,
   created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
 
--- Key/value table for runtime config the admin can edit live.
--- Known keys:
---   frequency_hours          : how often the cron should actually run learnOnce (default '6')
---   last_cron_run            : unix ms of the last successful cron-triggered learn (default '0')
---   topic_strategy           : 'mixed' | 'random' | 'bridge' | 'gap' | 'digest' (default 'mixed')
---   digest_match_threshold   : cosine similarity needed for a live event to match a subscription (default '0.45')
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
@@ -54,68 +76,22 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES
-  ('frequency_hours', '6', 0),
-  ('last_cron_run', '0', 0),
-  ('topic_strategy', 'mixed', 0),
-  ('digest_match_threshold', '0.45', 0);
+  ('daily_report_limit', '20', 0),
+  ('daily_search_limit', '500', 0),
+  ('cron_max_per_tick', '2', 0),
+  ('last_cron_run', '0', 0);
 
--- Multi-step research missions kicked off from the admin panel.
--- The agent generates a plan, then writes one note per step, then a final
--- synthesis note that ties them together.
-CREATE TABLE IF NOT EXISTS explorations (
-  id TEXT PRIMARY KEY,
-  brief TEXT NOT NULL,            -- the user's brief, verbatim
-  status TEXT NOT NULL,           -- 'planning' | 'in_progress' | 'synthesizing' | 'complete' | 'error'
-  plan_json TEXT,                 -- JSON array of sub-topic strings
-  current_step INTEGER NOT NULL DEFAULT 0,
-  total_steps INTEGER NOT NULL DEFAULT 0,
-  synthesis_note_id TEXT,         -- the final connecting note, when written
-  error TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  completed_at INTEGER
+CREATE TABLE IF NOT EXISTS daily_usage (
+  date TEXT PRIMARY KEY,
+  reports INTEGER NOT NULL DEFAULT 0,
+  searches INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_explorations_created ON explorations(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_explorations_status ON explorations(status);
-
--- Memory-recall edges. When the agent recalls past note B while writing note A,
--- we store (A, B, 'recall', score). The map and the journal use these to draw
--- the actual knowledge graph the agent is building.
-CREATE TABLE IF NOT EXISTS connections (
-  from_note_id TEXT NOT NULL,
-  to_note_id TEXT NOT NULL,
-  kind TEXT NOT NULL,             -- 'recall' | 'exploration' | 'manual'
-  score REAL,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (from_note_id, to_note_id, kind)
+CREATE TABLE IF NOT EXISTS login_attempts (
+  ip TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  ok INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_connections_from ON connections(from_note_id);
-CREATE INDEX IF NOT EXISTS idx_connections_to ON connections(to_note_id);
-
--- User's freeform interest topics. Each row has an embedding (JSON-stringified
--- 768-float vector from bge-base-en-v1.5) so the live-feed scanner can match
--- incoming events by cosine similarity. Set active=0 to mute without deleting.
-CREATE TABLE IF NOT EXISTS subscriptions (
-  id TEXT PRIMARY KEY,
-  topic TEXT NOT NULL,
-  embedding_json TEXT,
-  created_at INTEGER NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE INDEX IF NOT EXISTS idx_subscriptions_active ON subscriptions(active);
-
--- Records which subscription a given note matched, and at what similarity.
--- Drives the per-topic digest view.
-CREATE TABLE IF NOT EXISTS subscription_matches (
-  note_id TEXT NOT NULL,
-  subscription_id TEXT NOT NULL,
-  score REAL NOT NULL,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (note_id, subscription_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_sub_matches_sub ON subscription_matches(subscription_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sub_matches_note ON subscription_matches(note_id);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_ts ON login_attempts(ip, ts);

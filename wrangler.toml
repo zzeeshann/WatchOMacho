@@ -29,10 +29,11 @@ binding = "DB"
 database_name = "watchomacho-db"
 database_id = "35a02280-dab6-4d64-be0c-0d5a3b5b484a"
 
-# R2 — stores full markdown notes (one .md per learning)
+# R2 — stores full markdown reports (one .md per research run).
+# Bucket name kept for continuity; binding renamed to REPORTS.
 # Create with: wrangler r2 bucket create watchomacho-notes
 [[r2_buckets]]
-binding = "NOTES"
+binding = "REPORTS"
 bucket_name = "watchomacho-notes"
 
 # Vectorize — semantic memory so the agent doesn't repeat itself.
@@ -43,5 +44,7 @@ binding = "MEMORY"
 index_name = "watchomacho-memory"
 
 # Secrets are NOT defined here. Set with:
-#   wrangler secret put ADMIN_SECRET
-# (pick a long random string — this is the password to unlock the admin panel)
+#   wrangler secret put ADMIN_SECRET    — admin panel password
+#   wrangler secret put BRAVE_API_KEY   — Brave Search API key (free tier ok)
+# Without BRAVE_API_KEY, web-search-backed skills will short-circuit and the
+# agent will fall back to LLM-only knowledge (poor for "research" use cases).
