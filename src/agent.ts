@@ -21,8 +21,49 @@ export interface Env {
   BRAVE_API_KEY?: string;
 }
 
-const CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
+
+// ─── chat model registry ──────────────────────────────────────────────────
+//
+// The agent reads the active chat model from the `chat_model` setting at run
+// time (editable live from the admin panel). Every value must be in this
+// allow-list — anything else falls back to the default so a typo can't break
+// production.
+
+export const ALLOWED_CHAT_MODELS = [
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  "@cf/mistralai/mistral-small-3.1-24b-instruct",
+  "@cf/qwen/qwen2.5-coder-32b-instruct",
+  "@cf/meta/llama-4-scout-17b-16e-instruct",
+  "@cf/google/gemma-3-12b-it",
+  "@cf/meta/llama-3.1-8b-instruct-fast",
+  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+  "@cf/qwen/qwq-32b",
+] as const;
+
+export const CHAT_MODEL_LABELS: Record<string, string> = {
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast": "Llama 3.3 70B (fast) — strongest, tightest free cap",
+  "@cf/mistralai/mistral-small-3.1-24b-instruct": "Mistral Small 3.1 (24B) — strong, looser cap",
+  "@cf/qwen/qwen2.5-coder-32b-instruct": "Qwen 2.5 Coder (32B) — best for structured output",
+  "@cf/meta/llama-4-scout-17b-16e-instruct": "Llama 4 Scout (17B MoE) — newest, fast",
+  "@cf/google/gemma-3-12b-it": "Gemma 3 (12B) — Google's reliable mid-size",
+  "@cf/meta/llama-3.1-8b-instruct-fast": "Llama 3.1 8B (fast) — cheapest, most generous cap",
+  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b": "DeepSeek R1 Distill (32B) — reasoning",
+  "@cf/qwen/qwq-32b": "Qwen QwQ (32B) — reasoning",
+};
+
+export const DEFAULT_CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+export function isAllowedChatModel(m: string): boolean {
+  return (ALLOWED_CHAT_MODELS as readonly string[]).includes(m);
+}
+
+/** Read the currently-selected chat model from settings, falling back to the
+ *  default if the setting is unset or contains an unknown value. */
+export async function getChatModel(env: Env): Promise<string> {
+  const val = await getSetting(env, "chat_model", DEFAULT_CHAT_MODEL);
+  return isAllowedChatModel(val) ? val : DEFAULT_CHAT_MODEL;
+}
 
 // ─── basics ────────────────────────────────────────────────────────────────
 
@@ -342,7 +383,8 @@ export async function synthesizeSkill(
 ): Promise<Skill> {
   const brief = input.brief.trim();
   if (!brief) throw new Error("brief required");
-  const res: any = await env.AI.run(CHAT_MODEL, {
+  const model = await getChatModel(env);
+  const res: any = await env.AI.run(model, {
     messages: [
       { role: "system", content: SKILL_TEMPLATE },
       { role: "user", content: `Skill brief: "${brief}"\n\nWrite the procedure document now.` },
@@ -424,6 +466,7 @@ export interface Report {
   word_count: number | null;
   sources_json: string | null;
   run_id: string | null;
+  chat_model: string | null;
   created_at: number;
 }
 
@@ -453,8 +496,8 @@ interface SourceCitation {
 
 /** Step 1: ask the LLM what to search for. Returns an array of queries with
  *  {target} placeholders already expanded. */
-async function planResearch(env: Env, skill: Skill, target: Target): Promise<ResearchPlan> {
-  const res: any = await env.AI.run(CHAT_MODEL, {
+async function planResearch(env: Env, skill: Skill, target: Target, model: string): Promise<ResearchPlan> {
+  const res: any = await env.AI.run(model, {
     messages: [
       {
         role: "system",
@@ -561,6 +604,7 @@ async function writeReport(
   priorOnTarget: Report[],
   relatedAcrossTargets: string[],
   wikiContext: string,
+  model: string,
 ): Promise<{ title: string; body: string }> {
   const sourceBlock = sources.length
     ? sources
@@ -600,7 +644,7 @@ ${relatedBlock}
 
 Now write the report. Follow the output structure defined in the skill. End with a "Sources" section listing the URLs you actually used (cite by [n] in the body where you draw from a source). Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
 
-  const res: any = await env.AI.run(CHAT_MODEL, {
+  const res: any = await env.AI.run(model, {
     messages: [
       {
         role: "system",
@@ -634,8 +678,12 @@ export async function runResearch(
   const runId = uid();
   const t0 = Date.now();
 
+  // Resolve the chat model ONCE at the start so every step of this run uses
+  // the same model and the persisted report records exactly that model.
+  const chatModel = await getChatModel(env);
+
   try {
-    const plan = await planResearch(env, skill, target);
+    const plan = await planResearch(env, skill, target, chatModel);
     const sources = await gatherSources(env, plan.queries);
     const { priorOnTarget, relatedAcrossTargets } = await recallMemory(env, target, skill);
     const wikiContext = await maybeWikipediaContext(target, priorOnTarget.length > 0);
@@ -648,6 +696,7 @@ export async function runResearch(
       priorOnTarget,
       relatedAcrossTargets,
       wikiContext,
+      chatModel,
     );
 
     const reportId = uid();
@@ -674,10 +723,10 @@ export async function runResearch(
     );
 
     await env.DB.prepare(
-      `INSERT INTO reports (id, target_id, skill_id, title, snippet, r2_key, word_count, sources_json, run_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO reports (id, target_id, skill_id, title, snippet, r2_key, word_count, sources_json, run_id, chat_model, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(reportId, target.id, skill.id, title, snippet, r2Key, wordCount, sourcesJson, runId, created)
+      .bind(reportId, target.id, skill.id, title, snippet, r2Key, wordCount, sourcesJson, runId, chatModel, created)
       .run();
 
     // Embed for cross-target recall.
@@ -814,7 +863,8 @@ async function llmExtractTargetFromBrief(
   env: Env,
   brief: string,
 ): Promise<{ name: string; kind: string | null }> {
-  const res: any = await env.AI.run(CHAT_MODEL, {
+  const model = await getChatModel(env);
+  const res: any = await env.AI.run(model, {
     messages: [
       {
         role: "system",
@@ -848,7 +898,8 @@ async function pickBestExistingSkill(env: Env, brief: string): Promise<Skill | n
   const catalog = skills
     .map((s) => `- ${s.slug}: ${s.name} — ${s.description ?? ""}`)
     .join("\n");
-  const res: any = await env.AI.run(CHAT_MODEL, {
+  const model = await getChatModel(env);
+  const res: any = await env.AI.run(model, {
     messages: [
       {
         role: "system",
