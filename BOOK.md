@@ -1,0 +1,561 @@
+# WatchOMacho — the book
+
+A guided tour of the project. Written for someone who has not seen the code, may not know Cloudflare, and wants to understand both *what the agent does* and *why every part of the stack exists*.
+
+The text moves from very general (*what is a serverless agent?*) to very specific (*how does the planner decide which Brave queries to run?*). You don't need prior experience with Cloudflare, agents, or RAG. JavaScript familiarity helps but isn't required.
+
+---
+
+## Foreword — what this is, and what it isn't
+
+WatchOMacho is a **research agent you give jobs to**.
+
+You hand it a *thing to research* — a postcode, a person, a country, a company, an abstract topic. You also give it a *way of researching* — a markdown procedure document called a **skill**. The agent applies the skill to the target, performs web research, and writes a markdown **report** that lives on the target's public page. On the cadence you set, it comes back and writes another report, building up that page over time.
+
+That sentence — *"a research agent you give jobs to"* — is the entire product. Everything in this codebase exists to serve it.
+
+What WatchOMacho is **not**:
+
+- *Not a chatbot.* It doesn't reply to messages. You define the task; it executes autonomously and writes to a page.
+- *Not a passive feed-watcher.* It does not monitor news firehoses or wait for events. It is *target-driven*: you set the agenda.
+- *Not a one-shot research tool.* Each target accumulates reports over time. The thirtieth report on a target is informed by the first twenty-nine via vector recall.
+- *Not a perfect substitute for Wikipedia or a search engine.* It synthesises web search results into a structured markdown report with citations. Quality reflects the source material and the model.
+
+The rest of the book unpacks how this is built. We start with the cloud platform underneath everything, then climb up to the agent's brain.
+
+---
+
+## Chapter 1 — Why Cloudflare?
+
+For most of the web's history, running a website meant renting a server: a physical computer in a rack, billed 24/7 whether anyone visited or not. You patched its OS, monitored its CPU, restarted it when it crashed, and prayed when your single machine in one city went down.
+
+**Serverless** rejects all of that. You upload your *function* — a small program that says *"when an HTTP request arrives, do this"* — and the cloud provider handles the rest: running it, scaling it, placing copies of it close to whoever is calling. You pay only for the milliseconds and memory your function actually uses. When nobody's visiting, you pay nothing.
+
+The trade-off: your function has to start fast, finish fast, and not assume anything sticks around between invocations.
+
+**Cloudflare** is one of the giants in this space. They run an enormous network of data centres in over 300 cities — primarily as a CDN, then they realised they could run your code on the same network. The product is **Cloudflare Workers**. Today they offer compute (Workers), storage (D1, R2, KV, Vectorize), AI inference (Workers AI), and scheduling (Cron Triggers) — all bound together on the same edge network.
+
+For WatchOMacho this is ideal:
+- **One vendor, one CLI, one dashboard, one bill** for compute + storage + AI.
+- **Generous free tier**: tens of thousands of free requests per day, free Workers AI neurons, 5 GB of D1, 10 GB of R2, 30 million queried Vectorize dimensions per month.
+- **Single-region or global doesn't matter** — the same Worker code runs in every data centre automatically.
+- **A polished CLI (`wrangler`)** that handles deploys, secrets, database creation, schema migrations.
+
+The £0 monthly cost at hobby scale is what makes this project sustainable as a personal toy. Once usage grows, Workers Paid ($5/mo) lifts every cap by orders of magnitude.
+
+---
+
+## Chapter 2 — What is a Worker?
+
+A Cloudflare Worker is a self-contained JavaScript/TypeScript program that exports a `fetch` handler:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return new Response("Hello world");
+  }
+};
+```
+
+Three things to notice:
+
+1. **`request`** is a standard Web `Request` object — the same one you'd get with `fetch()` in a browser. No Node.js, no Express. The Web Platform is the platform.
+2. **`env`** is your bindings: handles to your databases, buckets, vector index, AI models, secrets. Every Cloudflare resource you allocate gets bound into this object. Talking to D1 isn't HTTP — it's `env.DB.prepare("SELECT …")`. Talking to an LLM isn't HTTP — it's `env.AI.run("…")`. The handles are typed and in-process.
+3. **`ctx.waitUntil(promise)`** lets your handler keep working *after* the response has been sent. The user gets their reply instantly; meanwhile the Worker continues writing to the database, calling APIs, embedding text. This is essential for agents that have to do slow work without making the caller wait.
+
+A Worker can also export `scheduled` for cron triggers:
+
+```ts
+async scheduled(event, env, ctx) {
+  ctx.waitUntil(doWork(env));
+}
+```
+
+That handler runs on a cron schedule you define in `wrangler.toml`. WatchOMacho's cron fires every hour and walks through any targets due for an update.
+
+**Limits to know:**
+- Free plan: ~10 ms CPU per request (extended via `waitUntil`).
+- Workers Paid: 30 s CPU per request.
+- No filesystem. No long-lived in-memory state. Anything that persists goes into a binding.
+
+The whole of [src/index.ts](src/index.ts) is one Worker — the `fetch` handler routes incoming HTTP requests; the `scheduled` handler runs on the cron tick.
+
+---
+
+## Chapter 3 — The four storage primitives
+
+A Worker on its own forgets everything between invocations. Cloudflare provides a small zoo of storage products; each is good at exactly one thing.
+
+### D1 — SQL for serverless
+
+**Mental model:** managed, replicated SQLite. You write standard SQL, you bind to a database in `wrangler.toml`, you call `env.DB.prepare("...").bind(...).all()` from your Worker.
+
+**Good for:** structured, relational data with rows, columns, and indexes. Anything you'd say "I want to query this" about.
+
+WatchOMacho uses D1 for eight tables — [schema.sql](schema.sql) is short and worth reading top to bottom:
+
+| Table | Purpose |
+| --- | --- |
+| `targets` | Things being researched. One row per HA0 4GP / Bhutan / "AI agents". |
+| `skills` | Reusable research procedures. Each row holds a markdown procedure document. |
+| `reports` | Every report the agent writes. Lives on the target's page. |
+| `runs` | Audit log: every research attempt (cron / mission / manual), success or failure. |
+| `settings` | Live runtime config the admin can edit (budgets, cron cap, etc.). |
+| `daily_usage` | Per-UTC-day counters for the budget gates. |
+| `login_attempts` | IP + timestamp + success-bit, for the login throttle. |
+
+Why SQL for all this? Because the dashboard needs "all reports for this target, sorted by date" and "which target is due to run next" — and SQL is what you reach for. The agent itself rarely needs joins, but the humans looking at it do.
+
+### R2 — object storage
+
+**Mental model:** S3 (Amazon's object store), cheaper, with no egress fees. You `put` a blob at a key like `reports/foo.md`; you `get` it back later.
+
+**Good for:** large blobs you don't want to query, just store and retrieve whole.
+
+WatchOMacho uses R2 for **the full markdown of every report**. A short snippet (~240 chars) lives in D1 for quick listing; the full ~500-word body lives in R2 at `reports/<timestamp>-<id>.md`. When you load a report page, the Worker fetches the row from D1 (for metadata), then fetches the body from R2.
+
+The split exists because D1 is great at *querying* but not at *storing long strings* — you don't want to put kilobytes of text into every D1 row.
+
+### Vectorize — semantic memory
+
+**Mental model:** a database that doesn't index by exact strings — it indexes by *meaning*. You give it a list of 768 numbers (a "vector embedding") representing a piece of text, and later you can ask *"what's similar to this other vector?"* and get the closest matches back.
+
+WatchOMacho uses Vectorize so the agent can **remember everything it has ever written**, and pull the most relevant past reports when working on a new one.
+
+Each time the agent writes a report:
+1. We embed `title + body` into 768 numbers using `bge-base-en-v1.5`.
+2. Store the vector with metadata `{target_id, target_name, target_slug, skill_slug, title, snippet, created_at}`.
+
+When the agent writes a *new* report on the same target, it queries Vectorize with the new task's text and gets back the 4 most similar past reports. Those are passed to the LLM as context with the instruction *"do not repeat — build on these, surface what's changed."*
+
+This is the entire memory mechanism. It's called **RAG** in the trade: Retrieval-Augmented Generation.
+
+### KV — key/value (not used)
+
+KV is Cloudflare's globally-replicated string-to-string dictionary. Good for caches and session stores. WatchOMacho doesn't use it because D1's `settings` table plays the same role and gives us joined queries when we want them. Worth knowing it exists.
+
+---
+
+## Chapter 4 — Workers AI: the brain
+
+Cloudflare runs LLMs and embedding models on its own GPUs and exposes them as a binding. Your Worker calls `env.AI.run(modelName, input)` and gets the response back — no API keys, no rate-limit dance, no separate service.
+
+WatchOMacho uses two models:
+
+### Chat model: `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
+
+Meta's Llama 3.3 70-billion-parameter instruction-tuned model, quantised to FP8 for speed. This is the part of the agent that *writes things*: research plans, report bodies, skill procedures.
+
+You give it two kinds of messages:
+- A **system** message that sets its personality and rules.
+- One or more **user** messages with the actual prompt.
+
+`env.AI.run(CHAT_MODEL, { messages: [...], max_tokens: 1200 })` returns the generated text.
+
+If your account doesn't have access to 70B or you want lower cost, swap to `@cf/meta/llama-3.1-8b-instruct-fast` — same API, smaller model, faster, and a more generous free-tier quota. Quality dips meaningfully but is still acceptable for a hobby agent.
+
+### Embedding model: `@cf/baai/bge-base-en-v1.5`
+
+Different shape of model. You don't ask it to write — you ask it to *describe* text as a list of 768 numbers. Texts about similar topics produce similar vectors; unrelated texts produce dissimilar ones.
+
+WatchOMacho uses embeddings for two things:
+1. **Storing memory:** every report is embedded and put into Vectorize.
+2. **Recall:** when writing a new report, we embed the *task description* (target + skill), query Vectorize for similar past reports, and pass them into the LLM as context.
+
+The number 768 is an artefact of how `bge-base-en-v1.5` was trained. If you change the embedding model you must recreate the Vectorize index with the matching dimension.
+
+---
+
+## Chapter 5 — Brave Search: the agent's eyes
+
+Cloudflare doesn't have a Google-style web search product. So we use Brave's API.
+
+[Brave Search](https://api.search.brave.com) gives you a clean JSON-returning web search. Their **Free AI plan** allows 2000 queries/month with no credit card. We set the API key as a Worker secret (`BRAVE_API_KEY`) and call it from [src/apis.ts](src/apis.ts).
+
+A typical query returns:
+
+```json
+{
+  "web": {
+    "results": [
+      { "title": "...", "url": "...", "description": "...", "age": "2 days ago" },
+      ...
+    ]
+  }
+}
+```
+
+We dedupe by URL, keep up to 20 results across all queries in a run, and feed them to the LLM as numbered citations. The LLM cites them as `[1]`, `[2]`, etc. in the body.
+
+**This is the part of the agent that reaches outside Cloudflare.** Two outbound HTTP calls during a normal run:
+1. Wikipedia (only on first run for a target — for grounding).
+2. Brave Search (a few queries per run).
+
+Plus Nominatim if the target needs geocoding (rare). Everything else stays in-platform.
+
+---
+
+## Chapter 6 — What is an agent?
+
+A **chatbot** is reactive. You type, it responds. Stateless or near-stateless. No goals beyond replying.
+
+An **agent** has at least some of:
+- **Autonomy** — acts on its own schedule.
+- **Persistence** — memory survives across runs.
+- **Tool-using** — calls external APIs to do work.
+- **Goal-directed** — pursues an objective over multiple steps.
+
+WatchOMacho is all four. The cron makes it autonomous. The D1+R2+Vectorize stack gives it persistence. Brave Search and Wikipedia are tools it uses. And every research run is a multi-step plan-search-recall-write loop.
+
+The shape of one research run looks like this:
+
+```
+        ┌───────────────┐
+        │      Plan     │  ← LLM call: "given this skill and target, what to search for?"
+        └──────┬────────┘
+               │
+        ┌──────▼────────┐
+        │    Gather     │  ← N parallel Brave Search queries → deduped sources
+        └──────┬────────┘
+               │
+        ┌──────▼────────┐
+        │    Recall     │  ← Vectorize: 4 most similar past reports + same-target history
+        └──────┬────────┘
+               │
+        ┌──────▼────────┐
+        │   Wikipedia?  │  ← first-run only, for one-shot grounding
+        └──────┬────────┘
+               │
+        ┌──────▼────────┐
+        │     Write     │  ← LLM call: produce a markdown report citing sources
+        └──────┬────────┘
+               │
+        ┌──────▼────────┐
+        │    Persist    │  ← R2 (markdown body) + D1 (row) + Vectorize (new embedding) + runs log
+        └───────────────┘
+```
+
+Two LLM calls + N web searches per run. Predictable cost, predictable structure.
+
+---
+
+## Chapter 7 — The three concepts
+
+This is the only chapter that matters for *using* the agent. The rest is plumbing.
+
+### Target
+
+A target is *the thing being researched*. Anything you can name: `HA0 4GP`, `Bhutan`, `Pacific volcanism`, `OpenAI`, `Elinor Ostrom`. Targets are persistent: once you add one, it has its own URL (`/target/<slug>`) and accumulates reports there forever.
+
+Fields a target has:
+- **Name** (display label) and **slug** (URL-safe).
+- **Kind** (optional): postcode / place / topic / person / company / freeform. Helps the agent set context.
+- **Description** (optional): a sentence explaining *why* you care, fed to the agent as extra context.
+- **Status**: `active` / `paused` / `archived`. Only `active` targets are picked by the cron.
+- **Cadence**: how often the cron should re-run the skill on this target (1 h / 6 h / 12 h / 24 h / 3 days / weekly).
+- **Primary skill**: which skill the cron applies. (V4 attaches one skill per target.)
+- **Last and next run timestamps**: cron uses `next_run_at <= now` to decide what's due.
+
+Targets live in the [`targets`](schema.sql) table.
+
+### Skill
+
+A skill is *a reusable research procedure*. Concretely, a markdown document that tells the agent how to approach a kind of research question. Examples a user might write:
+
+- **Public-health topic research** — surface stats, leading orgs, recent news, evidence-based interventions, controversies, demographics.
+- **UK postcode housing research** — current market prices, planning permissions, demographics, crime, transport.
+- **Company brief** — leadership, recent news, products, financial signals, controversies.
+- **Person profile** — biography, recent public statements, work, controversies.
+
+Skills are reusable. One *postcode housing research* skill can be applied to twenty different postcodes. Each application produces a fresh report; the skill itself stays unchanged.
+
+Skills have two authors:
+- **user-written**: you paste the procedure markdown yourself.
+- **agent-synthesised**: you provide a one-line brief and the LLM writes the procedure document for you. Useful when you know what you want but don't want to draft the structure.
+
+Skills live in the [`skills`](schema.sql) table. The procedure markdown is the single source of truth — when the agent runs, it reads `procedure_md` as part of the system prompt.
+
+### Mission
+
+A mission is *a single user instruction*. You type a brief like *"Research SW1A 1AA, present a housing report."* The agent:
+1. Identifies (or creates) the **target** named by the brief.
+2. Identifies (or creates) the **skill** the brief implies.
+3. Runs the standard plan→gather→recall→write loop.
+4. Returns links to the new report and the target.
+
+Missions are one-shot — they don't persist as their own row. The artefacts they produce (target, skill, report) do.
+
+The cron, the admin "Run now" button, and missions all eventually call the same `runResearch(target, skill, triggeredBy)` function in [src/agent.ts](src/agent.ts). The only difference is *where* the (target, skill) pair came from.
+
+---
+
+## Chapter 8 — A worked example
+
+Imagine you want to keep an eye on men's mental health globally. Here's the actual flow.
+
+**Step 1: Create a skill.** You open `/admin/skills` and use *Synthesise a skill*:
+
+> Research a public-health topic. Surface current statistics, leading organisations, recent news (last 12 months), evidence-based interventions, controversies, demographics affected. Lean on WHO, NHS, CDC, gov.uk, peer-reviewed studies. Avoid commercial wellness sites.
+
+The LLM writes a `procedure_md` like:
+
+```markdown
+# Public-health topic research
+
+**Purpose:** Produce a current-state report on a public-health topic, anchored in evidence.
+
+**When to use:** Topics about diseases, conditions, social-health phenomena, or population health interventions.
+
+**Approach:** Lean on official health bodies (WHO, NHS, CDC), gov.uk for UK context, and peer-reviewed research. Avoid commercial sites and supplement vendors.
+
+**Search queries:**
+- {target} statistics 2026
+- {target} WHO OR NHS guidelines
+- {target} peer reviewed research 2025 2026
+- {target} latest news
+- {target} interventions evidence
+
+**Output structure:**
+- # {target} — what we know now
+- Current data
+- Recent developments
+- What works (evidence-based interventions)
+- What's contested
+- Sources
+```
+
+This document is now in the `skills` table, with a public page at `/skill/public-health-topic-research`.
+
+**Step 2: Create a target.** You open `/admin`, fill in *Add a target*:
+
+| Field | Value |
+| --- | --- |
+| Name | `Men's mental health` |
+| Kind | `topic` |
+| Description | `Patterns, causes, evidence-based interventions, and current data on mental-health outcomes specifically in men.` |
+| Cadence | every 24 hours |
+| Skill to apply | the one you just made |
+| Run once immediately | ✓ |
+
+Submit. You land on `/admin/targets/mens-mental-health`. In the background:
+
+**Step 3: First run.** The agent calls `runResearch(target, skill, 'manual')`:
+
+1. **Plan** (LLM call). Returns a JSON object: `{ "queries": ["men's mental health statistics 2026", "men's mental health WHO guidelines", ...] }`.
+2. **Gather** (Brave Search, 5 parallel queries). Returns ~20 deduped results: links to WHO, NHS, peer-reviewed studies, news outlets.
+3. **Recall** (Vectorize). No prior reports for this target. Picks up no related context (empty Vectorize). Skip.
+4. **Wikipedia grounding** (first-run only). Pulls the Wikipedia summary for "Men's mental health". Adds it to context.
+5. **Write** (LLM call). Given skill + target + 20 sources + Wikipedia overview, writes a 500-word markdown report citing `[1]`-`[20]`.
+6. **Persist.** Markdown goes to R2. Row goes to `reports`. Embedding goes to Vectorize. Audit row goes to `runs`. Target's `last_run_at` and `next_run_at` updated.
+
+You reload `/target/mens-mental-health`. The first report is there with cited sources.
+
+**Step 4: Tomorrow (cron tick).** Around the same time the next day, the cron fires. The handler:
+1. Selects active targets where `next_run_at <= now`. Finds yours.
+2. Runs `runResearch(target, skill, 'cron')`.
+3. This time, *Recall* surfaces yesterday's report. The LLM is instructed *"do not repeat — build on this, surface what's changed."*
+4. New report appears at the top of the target's page.
+
+The target accumulates reports over time. After a month you have ~30 reports tracing how the field moved.
+
+---
+
+## Chapter 9 — The codebase, file by file
+
+Four source files, all in [src/](src/).
+
+### `src/apis.ts` — external sources (~150 lines)
+
+The agent's only external dependencies. Three functions:
+
+- **`braveSearch(apiKey, query, count)`** — the workhorse. Single web search query, returns up to N typed results. Gracefully no-ops if the API key isn't configured.
+- **`wikipediaSummary(title)`** — first-run grounding tool. Returns title / extract / URL / lat-lon if any. Null if the article doesn't exist.
+- **`geocodeQuery(q)`** — Nominatim. Resolves a place name to lat/lon. Used sparingly.
+
+Notice what *isn't* here: no random-Wikipedia function, no live-event scanner, no per-source adapter. The v4 agent doesn't need them.
+
+### `src/agent.ts` — the brain (~550 lines)
+
+Where every business decision lives. Six sections:
+
+1. **Basics + budgets + settings.** `uid()`, `slugify()`, the `BudgetExceeded` error, daily usage tracking, settings get/set.
+2. **Targets.** `createTarget`, `getTargetBySlug`, `listTargets`, `updateTarget`, `deleteTarget`. CRUD plus a unique-slug helper that handles collisions.
+3. **Skills.** `createSkillFromMarkdown` (user-written), `synthesizeSkill` (LLM writes the procedure), `listSkills`, `updateSkill`, `deleteSkill`. The skill schema is *the procedure_md is the source of truth* — when running, we pass it as the system prompt's "skill" section.
+4. **Reports.** `listReportsForTarget`, `getReportById`. (No `createReport` — reports are only created by `runResearch`.)
+5. **The research loop.** Five private functions chained inside `runResearch`:
+   - `planResearch(skill, target)` → JSON list of queries
+   - `gatherSources(queries)` → deduped Brave results
+   - `recallMemory(target, skill)` → past reports for this target + related from elsewhere
+   - `maybeWikipediaContext(target, hasPriorReports)` → first-run grounding only
+   - `writeReport(...)` → the report markdown
+6. **Missions and cron.** `runMission` glues user briefs to `runResearch`. `cronTick` walks due targets and runs each.
+
+### `src/index.ts` — routes (~400 lines)
+
+Pure routing. The Worker receives a `Request`, looks at method + path, and dispatches to either:
+- A `render*` function from `dashboard.ts` for HTML pages, or
+- An agent function from `agent.ts` for actions / API JSON.
+
+Notable bits:
+- **`isAdmin(req)`** — reads the `watchomacho_admin` cookie, does a constant-time compare against `ADMIN_SECRET`. Used to gate every admin route.
+- **`readForm(req)`** — accepts form-urlencoded, multipart, or JSON request bodies indiscriminately. Keeps the admin UI simple.
+- **`SECURITY_HEADERS`** — appended to every response. Strict CSP, no external scripts beyond Google Fonts, no inline frames.
+- **The login throttle** — 10 failed attempts per IP per rolling 10 minutes → 429.
+- **`scheduled`** at the bottom — the cron handler. Simply calls `cronTick(env)` inside `waitUntil`.
+
+### `src/dashboard.ts` — HTML rendering (~900 lines)
+
+Server-rendered HTML. No client framework. Every page is a string returned to the browser.
+
+Sections:
+- **Design tokens** — the Daylila colour palette, font setup, base CSS. All inlined per response.
+- **Utilities** — `escapeHtml`, `formatDate`, `timeAgo`, `timeUntil`, and a hand-rolled safe markdown renderer (no raw HTML, no images, no script).
+- **Page shell** — `shell(title, body)` wraps each page with header / nav / footer.
+- **Public pages** — `renderHome`, `renderTargetPage`, `renderSkillPage`, `renderReportPage`.
+- **Admin pages** — `renderAdminLogin`, `renderAdminPanel`, `renderAdminSkills`, `renderAdminTargetEdit`.
+
+The CSS deliberately matches [daylila.com](https://daylila.com) — DM Sans, warm off-white paper (`#FAF8F4`), forest-teal primary (`#1A6B62`), restrained editorial layout, single 768px column.
+
+---
+
+## Chapter 10 — Security model
+
+Five layers, all small, all important.
+
+### 1. Admin cookie
+
+The admin panel is gated by a single secret stored as a Worker secret (`ADMIN_SECRET`). On successful login the secret is written into an `HttpOnly; Secure; SameSite=Strict` cookie. Every admin route calls `isAdmin(req)` which reads the cookie and compares against `env.ADMIN_SECRET` in constant time (XOR-fold).
+
+`SameSite=Strict` means the cookie is never sent on cross-site requests — CSRF is structurally impossible.
+
+### 2. Login throttle
+
+If an IP makes 10 failed login attempts in 10 minutes, the endpoint returns 429 *without even checking the secret*. Kills credential-stuffing and typo storms.
+
+### 3. Secret comparison
+
+`timingSafeEqual()` compares cookies and submitted secrets character-by-character without short-circuiting on the first difference. Defeats timing-based extraction.
+
+### 4. Content security policy
+
+Every response carries strict headers:
+```
+content-security-policy: default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';
+```
+
+No external scripts beyond Google Fonts. No inline images from untrusted sources. No frames.
+
+### 5. Safe markdown rendering
+
+The agent writes markdown reports. The reports are user-visible HTML. If the markdown renderer allowed raw `<script>` tags, a hostile prompt could potentially produce a stored XSS.
+
+The renderer in `dashboard.ts` is a hand-rolled subset: only headings, paragraphs, lists, bold/italic, inline code, and links. No raw HTML pass-through. Links are filtered — only `http(s)://` and relative paths are allowed; anything else (`javascript:`, `data:`, etc.) becomes `#`. All other characters are HTML-escaped before substitution.
+
+### 6. SQL safety
+
+Every D1 query uses `prepare("...").bind(...)`. No string concatenation into SQL. Even agent-written content (titles, skill names, report bodies) goes through bind parameters.
+
+---
+
+## Chapter 11 — Cost, budgets, and the gates
+
+### Workers AI neurons
+
+Cloudflare bills AI inference in "neurons" — a normalised compute unit so every model can be billed the same way. Rough costs:
+
+| Operation | Neurons each |
+| --- | --- |
+| 1 chat call to Llama 3.3 70B (~3k in, 500 out) | 200–500 |
+| 1 chat call to Llama 3.1 8B | 50–150 |
+| 1 embedding (bge-base-en-v1.5) | 1–3 |
+
+A typical research run = 2 chat calls + 1 embedding ≈ **~500–1000 neurons**.
+
+### Daily quotas
+
+Free plan: **10,000 neurons/day**, account-wide, resets at 00:00 UTC. That's ~10–20 reports/day depending on model. Larger models also have per-model caps stricter than the headline 10k.
+
+Workers Paid ($5/mo): **10 million neurons/month** included → ~20,000 reports/month. Effectively unlimited for personal use.
+
+### Brave Search
+
+Free AI plan: **2000 queries/month**. At 5 queries per report, ~13 reports/day before the limit. Above that, ~$3 per 1000 extra queries.
+
+### App-level budget gates
+
+In addition to Cloudflare's caps, the app has its own per-day caps in the `settings` table:
+
+| Setting | Default | What it caps |
+| --- | --- | --- |
+| `daily_report_limit` | 20 | New reports written per UTC day |
+| `daily_search_limit` | 500 | Brave Search queries per UTC day |
+| `cron_max_per_tick` | 2 | How many targets the cron advances per hourly tick |
+
+When a cap is hit, the next call throws `BudgetExceeded`. The HTTP layer translates that to a 429 response with a friendly JSON message; the cron skips its remaining work and waits for the next tick.
+
+These are the project's *own* safety rails. Set them low and raise deliberately.
+
+---
+
+## Chapter 12 — Making it yours
+
+### The agent's voice
+
+`writeReport()` in [src/agent.ts](src/agent.ts) sets the system prompt for the report writer. Defaults to a restrained editorial tone — no hype, no clichés, sentence-case headings, cite sources by number. Change it freely; the change picks up on the next run.
+
+### The chat model
+
+```ts
+const CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";   // bigger / better
+const CHAT_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";        // smaller / cheaper
+```
+
+One constant in `agent.ts`. Swap, redeploy, done.
+
+### Cron cadence
+
+The cron schedule in `wrangler.toml` defines the *rate at which the Worker wakes up*. The per-target cadence in the `targets` table decides *which targets get updated on each wake-up*. Default Worker schedule is hourly:
+
+```toml
+[triggers]
+crons = ["0 * * * *"]
+```
+
+If you want it less frequent, change to `0 */6 * * *` (every 6 hours), etc. Per-target you can pick weekly cadence for slow topics, hourly for fast-moving ones.
+
+### Adding a new tool
+
+The simplest extension: a new function in `apis.ts` that returns a typed result, and a way to plumb it into `runResearch`. For example, "lookup Land Registry sold prices for a UK postcode":
+1. Add `landRegistry(postcode): Promise<...>` in `apis.ts`.
+2. Optionally call it inside `runResearch` when `target.kind === 'postcode'` and inject the result into the `userMsg` block before `writeReport`.
+
+The skill's procedure_md can also reference your tool by name; the model will mention it in its plan even if it can't directly call it. That's a UX detail to tune.
+
+### A new domain
+
+The agent is generic — any kind of research, any kind of target. If you want to bias the system toward a domain (housing, biology, finance), express it in the *skill*, not the code. Skills are the user-editable surface area on purpose.
+
+---
+
+## Chapter 13 — What's deliberately out of scope
+
+Things considered and rejected (or deferred):
+
+- **Tool-calling loop with model function calls.** Cleaner but more failure modes. Current "LLM plans queries → we execute → LLM writes" is simpler and predictable.
+- **Multiple skills per target.** Schema supports a `primary_skill_id` only. Combining a "housing" run and a "transport" run is two targets, not one target with two skills. Reduces ambiguity.
+- **Skill versioning.** Edit a skill → you've edited it. No history. (PR-worthy if anyone wants it.)
+- **Self-improving Curator.** A periodic process that re-grades old reports and rewrites underperforming skills. Conceptually right, deferred until usage justifies it.
+- **Authentication beyond a single admin secret.** Multi-user isn't the point — this is a personal tool. If you want shared use, an OAuth provider in front of the admin routes is the right move.
+- **Per-source adapters (Land Registry, ONS, NOAA, USGS).** Easy to add (one function in `apis.ts` + reference in a skill). Not added by default because the agent has no idea what they mean — they need to be wired with intent.
+
+---
+
+## Chapter 14 — Where to look next
+
+- **Quick start** — [README.md](README.md). 10-minute setup.
+- **Architecture reference** — [ARCHITECTURE.md](ARCHITECTURE.md). Schema, data flow, API surface as quick-lookup tables.
+- **The code itself** — [src/](src/). Four files, ~2000 lines total. Worth reading top to bottom.
+
+---
+
+That's the book. The shortest way to understand this project is to add a target, attach a skill, and watch a report appear. The shortest way to make it yours is to write the skill *you'd* use and apply it to *your* targets.
