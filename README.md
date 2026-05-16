@@ -15,8 +15,8 @@ Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Tri
 ```
 
 - **Target** — a thing the agent watches. Each target has its own page that accumulates reports over time. Statuses: `active`, `paused`, `archived`.
-- **Skill** — a named markdown procedure the agent reads at run-time. Skills are reusable across targets (apply *housing research* to HA0 4GP, SE1, E14, …). You can write skills by hand or describe a brief and let the agent synthesise the procedure.
-- **Mission** — one user instruction. *"Research HA0 4GP, present a housing report."* The agent picks/creates a target, picks/creates a skill, runs it, and links you to the report.
+- **Skill** — a named markdown procedure the agent reads at run-time. Skills are reusable across targets (apply *housing research* to SW1A 1AA, SE1, E14, …). You can write skills by hand or describe a brief and let the agent synthesise the procedure.
+- **Mission** — one user instruction. *"Research SW1A 1AA, present a housing report."* The agent picks/creates a target, picks/creates a skill, runs it, and links you to the report.
 
 The cron walks active targets and re-runs the attached skill on each one's cadence. Quiet targets stay quiet, busy ones keep producing updates.
 
@@ -90,8 +90,8 @@ If you set a custom-domain route in `wrangler.toml`, wrangler handles DNS + SSL 
 
 1. Open `/admin/login` and unlock with your secret.
 2. Open **Skills** → write or synthesise one (e.g. *"Housing research for UK postcodes"*).
-3. Open **Admin** → add a target (e.g. `HA0 4GP`), attach the skill, tick *Run once immediately*.
-4. ~30 seconds later, the target's public page (`/target/ha0-4gp`) shows the first report.
+3. Open **Admin** → add a target (e.g. `SW1A 1AA`), attach the skill, tick *Run once immediately*.
+4. ~30 seconds later, the target's public page (`/target/sw1a-1aa`) shows the first report.
 5. Every cron tick after that, the agent re-runs the skill and appends an update.
 
 ## Customising

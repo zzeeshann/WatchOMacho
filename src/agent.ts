@@ -1,7 +1,7 @@
 // The agent's brain.
 //
 // Three concepts:
-//   Target   — a thing being researched (HA0 4GP, Bhutan, "AI agents")
+//   Target   — a thing being researched (SW1A 1AA, Bhutan, "AI agents")
 //   Skill    — a named procedure the agent owns (housing-research, etc.)
 //   Mission  — a single user instruction that runs a Skill against a Target
 //
