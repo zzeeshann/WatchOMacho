@@ -26,7 +26,7 @@ binding = "AI"
 [[d1_databases]]
 binding = "DB"
 database_name = "watchomacho-db"
-database_id = "REPLACE_WITH_YOUR_D1_ID"
+database_id = "35a02280-dab6-4d64-be0c-0d5a3b5b484a"
 
 # R2 — stores full markdown notes (one .md per learning)
 # Create with: wrangler r2 bucket create watchomacho-notes
