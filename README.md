@@ -7,6 +7,8 @@ Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Tri
 > **New to the project?** Read [BOOK.md](BOOK.md) — a guided tour from "what is Cloudflare?" to "how the agent's research loop works", in 14 short chapters. No prior experience assumed.
 >
 > **Want a quick reference?** [ARCHITECTURE.md](ARCHITECTURE.md) has the schema, data flow, API surface, and bindings in scannable tables.
+>
+> **Where it's going?** [ROADMAP.md](ROADMAP.md) lays out the four-level improvement ladder (Brave snippets → full page content → typed tools → agentic loop), cost trajectory, and what's deliberately deferred.
 
 ## The three concepts
 
