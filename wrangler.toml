@@ -11,9 +11,9 @@ routes = [
   { pattern = "watchomacho.daylila.com", custom_domain = true }
 ]
 
-# Cron fires every hour. The worker reads the live `frequency_hours` setting
-# (editable from the admin panel) and decides whether to actually run learnOnce
-# on each tick, AND pumps any in-progress explorations forward by one step.
+# Cron fires every hour. Each tick picks up to `cron_max_per_tick` active
+# targets whose `next_run_at` has passed and runs their primary skill against
+# them (see cronTick in src/agent.ts).
 [triggers]
 crons = ["0 * * * *"]
 
@@ -30,11 +30,10 @@ database_name = "watchomacho-db"
 database_id = "35a02280-dab6-4d64-be0c-0d5a3b5b484a"
 
 # R2 — stores full markdown reports (one .md per research run).
-# Bucket name kept for continuity; binding renamed to REPORTS.
-# Create with: wrangler r2 bucket create watchomacho-notes
+# Create with: wrangler r2 bucket create watchomacho-reports
 [[r2_buckets]]
 binding = "REPORTS"
-bucket_name = "watchomacho-notes"
+bucket_name = "watchomacho-reports"
 
 # Vectorize — semantic memory so the agent doesn't repeat itself.
 # Create with:

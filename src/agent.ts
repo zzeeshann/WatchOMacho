@@ -1,9 +1,8 @@
 // The agent's brain.
 //
-// Three concepts:
+// Two concepts:
 //   Target   — a thing being researched (SW1A 1AA, Bhutan, "AI agents")
 //   Skill    — a named procedure the agent owns (housing-research, etc.)
-//   Mission  — a single user instruction that runs a Skill against a Target
 //
 // One artefact:
 //   Report   — markdown writeup produced by running a Skill on a Target.
@@ -671,7 +670,7 @@ export async function runResearch(
   env: Env,
   target: Target,
   skill: Skill,
-  triggeredBy: "cron" | "mission" | "manual",
+  triggeredBy: "cron" | "manual",
 ): Promise<Report> {
   await checkBudget(env, "reports");
 
@@ -794,124 +793,6 @@ export async function runResearch(
       .catch(() => {});
     throw err;
   }
-}
-
-// ─── missions: one-shot user instructions ─────────────────────────────────
-
-export interface MissionInput {
-  brief: string;                              // freeform user instruction
-  target_slug?: string;                       // pin to an existing target
-  skill_slug?: string;                        // pin to an existing skill
-  new_target_name?: string;                   // create this target if it doesn't exist
-  new_skill_brief?: string;                   // synthesise a new skill from this brief
-}
-
-export interface MissionResult {
-  target: Target;
-  skill: Skill;
-  report: Report;
-}
-
-/** Run a single user instruction end-to-end. Either:
- *   - target_slug + skill_slug (existing target + existing skill)
- *   - new_target_name + skill_slug (create target, use existing skill)
- *   - new_target_name + new_skill_brief (create both)
- *   - just brief (agent picks target name + finds/creates skill from brief) */
-export async function runMission(env: Env, input: MissionInput): Promise<MissionResult> {
-  let target: Target | null = null;
-  if (input.target_slug) target = await getTargetBySlug(env, input.target_slug);
-  if (!target && input.new_target_name) {
-    target = await createTarget(env, {
-      name: input.new_target_name,
-      description: input.brief.slice(0, 280),
-    });
-  }
-  if (!target) {
-    // Last resort: extract a target name from the brief via the LLM.
-    const guess = await llmExtractTargetFromBrief(env, input.brief);
-    target = await createTarget(env, {
-      name: guess.name,
-      kind: guess.kind ?? undefined,
-      description: input.brief.slice(0, 280),
-    });
-  }
-
-  let skill: Skill | null = null;
-  if (input.skill_slug) skill = await getSkillBySlug(env, input.skill_slug);
-  if (!skill && input.new_skill_brief) {
-    skill = await synthesizeSkill(env, { brief: input.new_skill_brief });
-  }
-  if (!skill) {
-    // Try to find an existing skill that fits, else synthesise one from the brief.
-    skill = await pickBestExistingSkill(env, input.brief);
-  }
-  if (!skill) {
-    skill = await synthesizeSkill(env, { brief: input.brief });
-  }
-
-  // Attach as primary skill if the target doesn't have one.
-  if (!target.primary_skill_id) {
-    await updateTarget(env, target.id, { primary_skill_id: skill.id });
-    target = (await getTargetById(env, target.id))!;
-  }
-
-  const report = await runResearch(env, target, skill, "mission");
-  return { target, skill, report };
-}
-
-async function llmExtractTargetFromBrief(
-  env: Env,
-  brief: string,
-): Promise<{ name: string; kind: string | null }> {
-  const model = await getChatModel(env);
-  const res: any = await env.AI.run(model, {
-    messages: [
-      {
-        role: "system",
-        content: `Extract the primary subject of the user's research brief.
-Return ONLY a JSON object: { "name": "...", "kind": "postcode|place|topic|person|company|other" }.
-The name should be short — what you'd put on a folder tab. No extra text.`,
-      },
-      { role: "user", content: brief },
-    ],
-    max_tokens: 120,
-  });
-  const raw = String(res.response ?? "");
-  const m = raw.match(/\{[\s\S]*\}/);
-  if (m) {
-    try {
-      const parsed = JSON.parse(m[0]);
-      const name = String(parsed.name ?? "").trim().slice(0, 80);
-      if (name) return { name, kind: String(parsed.kind ?? "").trim() || null };
-    } catch {
-      // ignore
-    }
-  }
-  return { name: brief.slice(0, 60), kind: null };
-}
-
-async function pickBestExistingSkill(env: Env, brief: string): Promise<Skill | null> {
-  const skills = await listSkills(env);
-  if (skills.length === 0) return null;
-  // Cheap heuristic: pass skill names + descriptions to the LLM and ask which
-  // (if any) fits. We don't want to embed-search here — N skills will stay small.
-  const catalog = skills
-    .map((s) => `- ${s.slug}: ${s.name} — ${s.description ?? ""}`)
-    .join("\n");
-  const model = await getChatModel(env);
-  const res: any = await env.AI.run(model, {
-    messages: [
-      {
-        role: "system",
-        content: `You match a research brief to a skill from a catalog. Return ONLY the slug of the single best skill, OR the literal word "none" if no skill is a clear fit. No quotes, no extra text.`,
-      },
-      { role: "user", content: `BRIEF\n=====\n${brief}\n\nSKILL CATALOG\n=============\n${catalog}\n\nWhich skill slug fits best (or "none")?` },
-    ],
-    max_tokens: 30,
-  });
-  const choice = String(res.response ?? "").trim().split(/\s+/)[0]?.toLowerCase();
-  if (!choice || choice === "none") return null;
-  return skills.find((s) => s.slug === choice) ?? null;
 }
 
 // ─── cron tick: pick due targets, re-run their skill ───────────────────────

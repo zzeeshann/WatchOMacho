@@ -14,7 +14,6 @@ Fast reference. For narrative explanation, read [BOOK.md](BOOK.md). For setup, [
                     ┌──────────▼───────────┐
                     │   ADMIN HTTP REQ     │
                     │   /admin/targets/X/run │
-                    │   /admin/mission     │
                     └──────────┬───────────┘
                                │
               ┌────────────────▼───────────────┐
@@ -121,7 +120,7 @@ created_at
 id TEXT PRIMARY KEY
 target_id TEXT
 skill_id TEXT
-triggered_by TEXT                  -- 'cron' | 'mission' | 'manual'
+triggered_by TEXT                  -- 'cron' | 'manual'
 status TEXT                        -- 'success' | 'error'
 report_id TEXT                     -- if successful
 duration_ms INTEGER
@@ -192,7 +191,7 @@ The full markdown of every report. `text/markdown; charset=utf-8`. Never queried
 | File | Lines | What's in it |
 | --- | --- | --- |
 | [src/apis.ts](src/apis.ts) | ~150 | `braveSearch`, `wikipediaSummary`, `geocodeQuery` |
-| [src/agent.ts](src/agent.ts) | ~550 | Targets / skills / reports CRUD, `runResearch` loop, `runMission`, `cronTick`, budget gates |
+| [src/agent.ts](src/agent.ts) | ~550 | Targets / skills / reports CRUD, `runResearch` loop, `cronTick`, budget gates |
 | [src/index.ts](src/index.ts) | ~400 | HTTP routing, auth/cookie, `readForm`, `scheduled` handler, security headers |
 | [src/dashboard.ts](src/dashboard.ts) | ~900 | All HTML rendering: public pages + admin pages + safe markdown renderer |
 
@@ -230,7 +229,6 @@ Total: ~2000 lines of TypeScript.
 | POST | `/admin/targets/:slug/update` | Patch target |
 | POST | `/admin/targets/:slug/run` | Run immediately |
 | POST | `/admin/targets/:slug/delete` | Delete target + reports |
-| POST | `/admin/mission` | One-shot mission — `brief`, optional `target_slug`, `skill_slug`, `new_target_name`, `new_skill_brief` |
 | GET | `/admin/settings` | Current settings + usage (JSON) |
 | POST | `/admin/settings` | Update budgets |
 | POST | `/admin/cron/tick` | Run a cron tick now (testing) |

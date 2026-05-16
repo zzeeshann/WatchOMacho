@@ -1,14 +1,14 @@
 {
   "name": "watchomacho",
   "version": "0.1.0",
-  "description": "An autonomous AI agent that wanders the world via public APIs and writes field notes.",
+  "description": "A Cloudflare Workers research agent that watches user-defined targets and writes markdown reports on a cadence.",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:create": "wrangler d1 create watchomacho-db",
     "db:init": "wrangler d1 execute watchomacho-db --remote --file=schema.sql",
-    "bucket:create": "wrangler r2 bucket create watchomacho-notes",
+    "bucket:create": "wrangler r2 bucket create watchomacho-reports",
     "vector:create": "wrangler vectorize create watchomacho-memory --dimensions=768 --metric=cosine",
     "secret": "wrangler secret put ADMIN_SECRET"
   },

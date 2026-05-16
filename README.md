@@ -10,21 +10,20 @@ Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Tri
 >
 > **Where it's going?** [ROADMAP.md](ROADMAP.md) lays out the four-level improvement ladder (Brave snippets → full page content → typed tools → agentic loop), cost trajectory, and what's deliberately deferred.
 
-## The three concepts
+## The two concepts
 
 ```
-   ┌────────────┐    ┌──────────┐    ┌──────────┐
-   │  MISSION   │ →  │  SKILL   │ →  │  TARGET  │
-   │ user-given │    │ markdown │    │ /target/ │
-   │            │    │ procedure│    │   :slug  │
-   └────────────┘    └──────────┘    └──────────┘
+   ┌──────────┐    ┌──────────┐    ┌──────────┐
+   │  SKILL   │ →  │  TARGET  │ →  │  REPORT  │
+   │ markdown │    │ /target/ │    │ markdown │
+   │ procedure│    │   :slug  │    │ output   │
+   └──────────┘    └──────────┘    └──────────┘
 ```
 
 - **Target** — a thing the agent watches. Each target has its own page that accumulates reports over time. Statuses: `active`, `paused`, `archived`.
 - **Skill** — a named markdown procedure the agent reads at run-time. Skills are reusable across targets (apply *housing research* to SW1A 1AA, SE1, E14, …). You can write skills by hand or describe a brief and let the agent synthesise the procedure.
-- **Mission** — one user instruction. *"Research SW1A 1AA, present a housing report."* The agent picks/creates a target, picks/creates a skill, runs it, and links you to the report.
 
-The cron walks active targets and re-runs the attached skill on each one's cadence. Quiet targets stay quiet, busy ones keep producing updates.
+A **report** is what comes out when the agent runs a skill against a target. The cron walks active targets and re-runs the attached skill on each one's cadence. Quiet targets stay quiet, busy ones keep producing updates.
 
 ## What a run does, end-to-end
 
@@ -168,7 +167,6 @@ Admin (cookie auth):
 | `POST` | `/admin/targets/:slug/update` | Patch target |
 | `POST` | `/admin/targets/:slug/run` | Run immediately |
 | `POST` | `/admin/targets/:slug/delete` | Delete target + reports |
-| `POST` | `/admin/mission` | One-shot mission (form: `brief`, optional pins) |
 | `GET` / `POST` | `/admin/settings` | Read / write budgets |
 | `POST` | `/admin/cron/tick` | Manually trigger a cron tick (testing) |
 

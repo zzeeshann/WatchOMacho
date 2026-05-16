@@ -2,6 +2,8 @@
 
 Forward plan for WatchOMacho. Where v4 is, where it's going, and what's deliberately out of scope right now.
 
+> **⚠️ Active plan = [PLAN.md](PLAN.md).** This roadmap describes the original 4-level ladder. After discussion on 2026-05-16, the immediate next step is captured in `PLAN.md` (Tavily-only toolbox + Tailwind CSS), which collapses what was previously "Level 2 + Level 3" into a single simpler refactor. **Read `PLAN.md` first if you're continuing the project.** The "Considered and rejected" / cost trajectory / decision rationale below still apply; the level numbering does not — Tavily ships what Levels 2 and 3 were going to ship.
+
 ## Where we are — v4 (current)
 
 **One research agent. Targets get reports via reusable Skills, on a cadence.**

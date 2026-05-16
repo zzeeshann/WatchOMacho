@@ -22,7 +22,6 @@ import {
   listReportsForTarget,
   listSkills,
   listTargets,
-  runMission,
   runResearch,
   setSetting,
   synthesizeSkill,
@@ -405,33 +404,6 @@ export default {
         const skill = await getSkillBySlug(env, slug);
         if (skill) await deleteSkill(env, skill.id);
         return redirect("/admin/skills");
-      }
-
-      // Missions: one-shot user instructions
-      if (path === "/admin/mission" && req.method === "POST") {
-        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const form = await readForm(req);
-        const brief = (form.brief ?? "").trim();
-        if (!brief) return json({ error: "brief required" }, { status: 400 });
-        try {
-          const result = await runMission(env, {
-            brief,
-            target_slug: form.target_slug?.trim() || undefined,
-            skill_slug: form.skill_slug?.trim() || undefined,
-            new_target_name: form.new_target_name?.trim() || undefined,
-            new_skill_brief: form.new_skill_brief?.trim() || undefined,
-          });
-          return json({
-            ok: true,
-            target_slug: result.target.slug,
-            skill_slug: result.skill.slug,
-            report_id: result.report.id,
-            report_title: result.report.title,
-          });
-        } catch (e: any) {
-          if (e instanceof BudgetExceeded) throw e;
-          return json({ error: String(e?.message ?? e) }, { status: 400 });
-        }
       }
 
       // Settings

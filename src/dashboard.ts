@@ -798,15 +798,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
   ).all<any>();
 
   const skillOptions = skills.length === 0
-    ? `<option value="">(no skills yet — create one below)</option>`
+    ? `<option value="">(no skills yet — use "Manage skills →" to create one)</option>`
     : `<option value="">(none — attach later)</option>` + skills.map((s) =>
         `<option value="${escapeHtml(s.slug)}">${escapeHtml(s.name)}</option>`,
-      ).join("");
-
-  const targetOptions = targets.length === 0
-    ? `<option value="">(no targets)</option>`
-    : `<option value="">(let agent pick / create)</option>` + targets.map((t) =>
-        `<option value="${escapeHtml(t.slug)}">${escapeHtml(t.name)}</option>`,
       ).join("");
 
   const active = targets.filter((t) => t.status === "active");
@@ -843,7 +837,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     <section style="padding:24px 0 12px">
       <p class="label">Admin</p>
       <h1 class="headline" style="margin-top:8px;font-size:32px">Console.</h1>
-      <p class="subhead">Active targets: <strong style="color:var(--zee-text)">${active.length}</strong>${dueNow.length ? ` · due now: <strong style="color:var(--zee-primary)">${dueNow.length}</strong>` : ""} · skills: <strong style="color:var(--zee-text)">${skills.length}</strong>.</p>
+      <p class="subhead"><strong style="color:var(--zee-text)">${active.length}</strong> ${active.length === 1 ? "target" : "targets"}${dueNow.length ? ` · <strong style="color:var(--zee-primary)">${dueNow.length}</strong> due now` : ""} · <strong style="color:var(--zee-text)">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
     </section>
 
     <div class="card">
@@ -879,36 +873,10 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           </div>
         </div>
         <label style="font-size:13px;color:var(--zee-muted);display:flex;align-items:center;gap:8px;margin-bottom:14px">
-          <input type="checkbox" name="run_now" value="1"> Run once immediately after adding
+          <input type="checkbox" name="run_now" value="1"> Run once now
         </label>
         <button class="btn" type="submit">Add target</button>
       </form>
-    </div>
-
-    <div class="card">
-      <div class="h3-row"><h3>Mission (one-shot)</h3></div>
-      <p class="field-help" style="margin-bottom:12px">Type an instruction. The agent picks/creates the target and the skill, and writes a report now.</p>
-      <form id="mission-form">
-        <div class="field">
-          <label>Brief</label>
-          <textarea name="brief" placeholder="e.g. 'Research SW1A 1AA, London — present a housing report.' or 'Apply transport-analysis to NW6'" required></textarea>
-        </div>
-        <div class="row" style="gap:16px">
-          <div class="field" style="flex:1;margin-bottom:0">
-            <label>Pin target (optional)</label>
-            <select name="target_slug">${targetOptions}</select>
-          </div>
-          <div class="field" style="flex:1;margin-bottom:0">
-            <label>Pin skill (optional)</label>
-            <select name="skill_slug">
-              <option value="">(let agent pick)</option>
-              ${skills.map((s) => `<option value="${escapeHtml(s.slug)}">${escapeHtml(s.name)}</option>`).join("")}
-            </select>
-          </div>
-        </div>
-        <button class="btn" type="submit" style="margin-top:14px">Send mission</button>
-      </form>
-      <div id="mission-result" style="margin-top:16px;display:none"></div>
     </div>
 
     <div class="card">
@@ -922,7 +890,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         <div class="field" style="margin-bottom:16px">
           <label>Chat model</label>
           <select name="chat_model">${modelOptions}</select>
-          <div class="field-help">Used for planning, report writing, and skill synthesis. Change applies on the next run. Switching to a model with a more generous free-tier quota helps if you keep hitting the 4006 error.</div>
+          <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
         </div>
         <div class="row" style="gap:16px">
           <div class="field" style="flex:1;margin-bottom:0">
@@ -936,14 +904,14 @@ export async function renderAdminPanel(env: Env): Promise<string> {
             <div class="field-help">${usage.searches} used today</div>
           </div>
           <div class="field" style="flex:1;margin-bottom:0">
-            <label>Cron max / tick</label>
+            <label>Runs / hour</label>
             <input type="number" name="cron_max_per_tick" min="1" max="20" value="${escapeHtml(perTick)}">
-            <div class="field-help">Max targets advanced per hour</div>
+            <div class="field-help">Cap per hourly cron firing</div>
           </div>
         </div>
         <div class="row" style="margin-top:14px">
           <button class="btn" type="submit">Save</button>
-          <button id="cron-now-btn" type="button" class="btn btn-secondary">Tick cron now</button>
+          <button id="cron-now-btn" type="button" class="btn btn-secondary">Run cron now</button>
           <span id="cron-result" style="font-size:12px;color:var(--zee-muted)"></span>
         </div>
       </form>
@@ -999,29 +967,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         }
       });
 
-      $('mission-form').addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const btn = e.target.querySelector('button[type=submit]');
-        const result = $('mission-result');
-        btn.disabled = true; btn.textContent = 'Sending…';
-        result.style.display = 'block';
-        result.innerHTML = '<span class="field-help">The agent is planning, searching, and writing. This usually takes 15–45 seconds.</span>';
-        try {
-          const res = await fetch('/admin/mission', { method: 'POST', body: new FormData(e.target) });
-          const d = await res.json();
-          if (!res.ok) {
-            result.innerHTML = '<span style="color:rgb(180,60,60)">' + (d.error || ('HTTP ' + res.status)) + '</span>';
-            return;
-          }
-          result.innerHTML = '<strong style="font-weight:500">' + d.report_title + '</strong><br>' +
-            '<a class="btn btn-secondary" style="margin-top:10px" href="/report/' + d.report_id + '">Read report →</a> ' +
-            '<a class="btn btn-secondary" href="/target/' + d.target_slug + '">Target page →</a>';
-        } catch (err) {
-          result.innerHTML = '<span style="color:rgb(180,60,60)">Failed: ' + (err && err.message || err) + '</span>';
-        } finally {
-          btn.disabled = false; btn.textContent = 'Send mission';
-        }
-      });
     </script>
   `;
   return shell("Admin · WatchOMacho", body, { activeNav: "admin", adminFooter: true });

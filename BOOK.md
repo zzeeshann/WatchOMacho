@@ -99,7 +99,7 @@ WatchOMacho uses D1 for eight tables — [schema.sql](schema.sql) is short and w
 | `targets` | Things being researched. One row per HA0 4GP / Bhutan / "AI agents". |
 | `skills` | Reusable research procedures. Each row holds a markdown procedure document. |
 | `reports` | Every report the agent writes. Lives on the target's page. |
-| `runs` | Audit log: every research attempt (cron / mission / manual), success or failure. |
+| `runs` | Audit log: every research attempt (cron / manual), success or failure. |
 | `settings` | Live runtime config the admin can edit (budgets, cron cap, etc.). |
 | `daily_usage` | Per-UTC-day counters for the budget gates. |
 | `login_attempts` | IP + timestamp + success-bit, for the login throttle. |
@@ -275,17 +275,7 @@ Skills have two authors:
 
 Skills live in the [`skills`](schema.sql) table. The procedure markdown is the single source of truth — when the agent runs, it reads `procedure_md` as part of the system prompt.
 
-### Mission
-
-A mission is *a single user instruction*. You type a brief like *"Research SW1A 1AA, present a housing report."* The agent:
-1. Identifies (or creates) the **target** named by the brief.
-2. Identifies (or creates) the **skill** the brief implies.
-3. Runs the standard plan→gather→recall→write loop.
-4. Returns links to the new report and the target.
-
-Missions are one-shot — they don't persist as their own row. The artefacts they produce (target, skill, report) do.
-
-The cron, the admin "Run now" button, and missions all eventually call the same `runResearch(target, skill, triggeredBy)` function in [src/agent.ts](src/agent.ts). The only difference is *where* the (target, skill) pair came from.
+The cron and the admin "Run now" button both call the same `runResearch(target, skill, triggeredBy)` function in [src/agent.ts](src/agent.ts). The only difference is what set the run in motion.
 
 ---
 
@@ -372,7 +362,7 @@ The agent's only external dependencies. Three functions:
 - **`wikipediaSummary(title)`** — first-run grounding tool. Returns title / extract / URL / lat-lon if any. Null if the article doesn't exist.
 - **`geocodeQuery(q)`** — Nominatim. Resolves a place name to lat/lon. Used sparingly.
 
-Notice what *isn't* here: no random-Wikipedia function, no live-event scanner, no per-source adapter. The v4 agent doesn't need them.
+These three functions are everything the agent needs to reach the open web. Adding more tools (Land Registry, ONS, Companies House, etc.) is on the roadmap, not in v4.
 
 ### `src/agent.ts` — the brain (~550 lines)
 
@@ -388,7 +378,7 @@ Where every business decision lives. Six sections:
    - `recallMemory(target, skill)` → past reports for this target + related from elsewhere
    - `maybeWikipediaContext(target, hasPriorReports)` → first-run grounding only
    - `writeReport(...)` → the report markdown
-6. **Missions and cron.** `runMission` glues user briefs to `runResearch`. `cronTick` walks due targets and runs each.
+6. **Cron.** `cronTick` walks due targets and runs each via `runResearch`.
 
 ### `src/index.ts` — routes (~400 lines)
 
