@@ -2,12 +2,15 @@
 // HTTP routes + cron handler. Business logic lives in agent.ts.
 
 import {
+  ALLOWED_CHAT_MODELS,
   BudgetExceeded,
+  DEFAULT_CHAT_MODEL,
   cronTick,
   createSkillFromMarkdown,
   createTarget,
   deleteSkill,
   deleteTarget,
+  getChatModel,
   getDailyUsage,
   getReportById,
   getSetting,
@@ -15,6 +18,7 @@ import {
   getSkillBySlug,
   getTargetById,
   getTargetBySlug,
+  isAllowedChatModel,
   listReportsForTarget,
   listSkills,
   listTargets,
@@ -433,11 +437,12 @@ export default {
       // Settings
       if (path === "/admin/settings" && req.method === "GET") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const [reportLim, searchLim, perTick, lastCron] = await Promise.all([
+        const [reportLim, searchLim, perTick, lastCron, chatModel] = await Promise.all([
           getSetting(env, "daily_report_limit", "20"),
           getSetting(env, "daily_search_limit", "500"),
           getSetting(env, "cron_max_per_tick", "2"),
           getSetting(env, "last_cron_run", "0"),
+          getChatModel(env),
         ]);
         const usage = await getDailyUsage(env);
         return json({
@@ -445,6 +450,8 @@ export default {
           daily_search_limit: Number(searchLim),
           cron_max_per_tick: Number(perTick),
           last_cron_run: Number(lastCron),
+          chat_model: chatModel,
+          allowed_chat_models: ALLOWED_CHAT_MODELS,
           usage,
           brave_api_key_set: !!env.BRAVE_API_KEY,
         });
@@ -468,6 +475,13 @@ export default {
             await setSetting(env, k, String(n));
             updated[k] = String(n);
           }
+        }
+        if (form.chat_model !== undefined && form.chat_model !== "") {
+          if (!isAllowedChatModel(form.chat_model)) {
+            return json({ error: "chat_model must be one of the supported models" }, { status: 400 });
+          }
+          await setSetting(env, "chat_model", form.chat_model);
+          updated.chat_model = form.chat_model;
         }
         return json({ ok: true, updated });
       }

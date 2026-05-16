@@ -6,6 +6,10 @@
 // Admin pages:     /admin  /admin/skills  /admin/targets/:slug  /admin/login
 
 import {
+  ALLOWED_CHAT_MODELS,
+  CHAT_MODEL_LABELS,
+  DEFAULT_CHAT_MODEL,
+  getChatModel,
   getDailyUsage,
   getReportById,
   getSetting,
@@ -19,6 +23,15 @@ import {
   type Skill,
   type Target,
 } from "./agent";
+
+/** Short pretty label for a chat model id ("Llama 3.3 70B"). Strips the descriptor
+ *  after the em-dash so it fits in compact UI spots. */
+function chatModelShortLabel(id: string | null | undefined): string {
+  if (!id) return "—";
+  const full = CHAT_MODEL_LABELS[id] ?? id;
+  const dashIdx = full.indexOf("—");
+  return (dashIdx === -1 ? full : full.slice(0, dashIdx)).trim();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Design tokens — matches daylila.com
@@ -632,6 +645,7 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
             <div style="flex:1;min-width:0">
               <p class="piece-title">${escapeHtml(r.title)} <span class="piece-arrow" aria-hidden="true">→</span></p>
               <p class="piece-meta">${escapeHtml(r.snippet)}</p>
+              ${r.chat_model ? `<p class="piece-meta" style="margin-top:6px;font-size:11px">model: <span style="color:var(--zee-text)">${escapeHtml(chatModelShortLabel(r.chat_model))}</span></p>` : ""}
             </div>
             <span class="piece-date tt">${escapeHtml(formatDate(r.created_at))}</span>
           </div>
@@ -728,6 +742,7 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
         <span class="label-muted">${escapeHtml(formatDate(report.created_at))}</span>
         ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" style="color:var(--zee-primary)">${escapeHtml(skill.name)}</a></span>` : ""}
         <span class="label-muted">${report.word_count ?? 0} words</span>
+        ${report.chat_model ? `<span class="label-muted" title="${escapeHtml(report.chat_model)}">written by <strong style="color:var(--zee-text);font-weight:500">${escapeHtml(chatModelShortLabel(report.chat_model))}</strong></span>` : ""}
       </div>
     </section>
     <div class="divider"></div>
@@ -764,14 +779,19 @@ export function renderAdminLogin(error?: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminPanel(env: Env): Promise<string> {
-  const [targets, skills, usage, reportLim, searchLim, perTick] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
     getSetting(env, "daily_report_limit", "20"),
     getSetting(env, "daily_search_limit", "500"),
     getSetting(env, "cron_max_per_tick", "2"),
+    getChatModel(env),
   ]);
+
+  const modelOptions = ALLOWED_CHAT_MODELS.map((m) =>
+    `<option value="${escapeHtml(m)}"${m === currentChatModel ? " selected" : ""}>${escapeHtml(CHAT_MODEL_LABELS[m] ?? m)}</option>`,
+  ).join("");
 
   const runRows = await env.DB.prepare(
     "SELECT * FROM runs ORDER BY created_at DESC LIMIT 12",
@@ -899,6 +919,11 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     <div class="card">
       <div class="h3-row"><h3>Budgets & settings</h3></div>
       <form id="settings-form">
+        <div class="field" style="margin-bottom:16px">
+          <label>Chat model</label>
+          <select name="chat_model">${modelOptions}</select>
+          <div class="field-help">Used for planning, report writing, and skill synthesis. Change applies on the next run. Switching to a model with a more generous free-tier quota helps if you keep hitting the 4006 error.</div>
+        </div>
         <div class="row" style="gap:16px">
           <div class="field" style="flex:1;margin-bottom:0">
             <label>Reports / day</label>

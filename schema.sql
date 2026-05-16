@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS reports (
   word_count INTEGER,
   sources_json TEXT,
   run_id TEXT,
+  chat_model TEXT,                          -- which Workers AI model wrote this report
   created_at INTEGER NOT NULL
 );
 
@@ -79,7 +80,8 @@ INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES
   ('daily_report_limit', '20', 0),
   ('daily_search_limit', '500', 0),
   ('cron_max_per_tick', '2', 0),
-  ('last_cron_run', '0', 0);
+  ('last_cron_run', '0', 0),
+  ('chat_model', '@cf/meta/llama-3.3-70b-instruct-fp8-fast', 0);
 
 CREATE TABLE IF NOT EXISTS daily_usage (
   date TEXT PRIMARY KEY,
