@@ -2,7 +2,7 @@
 
 A research agent you give jobs to. You hand it a **target** (a postcode, a person, a company, a topic) and a **skill** (a reusable research procedure) — the agent applies the skill, writes a report, and keeps the target's page fresh on a cadence you set.
 
-Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. Web research via [Tavily](https://tavily.com) — one tool, two operations (search + extract).
+Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. The agent has five tools available — web search/extraction via [Tavily](https://tavily.com), plus four typed UK public-data tools (HM Land Registry sold prices, ONS / postcodes.io geography, data.police.uk crime stats, Companies House). A skill can declare one or more tools.
 
 > **New to the project?** Read [BOOK.md](BOOK.md) — a guided tour from "what is Cloudflare?" to "how the agent's research loop works", in 14 short chapters. No prior experience assumed.
 >
@@ -29,13 +29,13 @@ A **report** is what comes out when the agent runs a skill against a target. The
 
 For each `(target, skill)` execution:
 
-1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries. (Skipped if the skill declares `**Tavily op:** extract` with explicit URLs.)
-2. **Gather** — Tavily runs every query in parallel; each result already includes the page's extracted full content. For extract-mode skills, Tavily reads the listed URLs in full.
+1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries. (Skipped if the skill doesn't declare a Tavily search op — e.g. extract-mode or pure typed-tool skills.)
+2. **Gather** — the agent dispatches over the skill's declared tools in order. Tavily search/extract for web work; Land Registry / ONS / Police / Companies House for typed UK data. Structured tool output is flattened to markdown so the writer sees one consistent source format.
 3. **Recall** — Vectorize returns the most relevant past reports (so the new one *builds on* prior ones rather than repeating).
 4. **Write** — the LLM writes a ~500-word markdown report following the skill's output structure, citing sources by number.
 5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs`.
 
-Two LLM calls + N Tavily calls per run. Predictable cost, predictable structure.
+Two LLM calls + N tool calls per run. Predictable cost, predictable structure.
 
 ## Setup — about 10 minutes
 
@@ -79,10 +79,23 @@ echo "$SECRET"  # save it
 
 # Tavily API key (free at app.tavily.com)
 npx wrangler secret put TAVILY_API_KEY
-# paste your key when prompted
+
+# Optional — Companies House developer key (free, register at
+# developer.company-information.service.gov.uk). Only needed if you want
+# skills that call the companies_house tool. Without it, that one tool
+# short-circuits to no results; everything else keeps working.
+npx wrangler secret put CH_API_KEY
+
+# Optional — AI Gateway (paid Anthropic / Google chat models, bypasses
+# Workers AI's shared 10k neurons/day pool). See "Chat models" below.
+npx wrangler secret put AI_GATEWAY_ACCOUNT_ID    # Cloudflare account ID (hex string in dashboard URL)
+npx wrangler secret put AI_GATEWAY_NAME          # Gateway name you created in CF dashboard
+npx wrangler secret put CF_AIG_TOKEN             # CF API token with "AI Gateway: Run" scope (Unified Billing — recommended)
+# ─ OR ─ if you'd rather bring your own Anthropic key + pay Anthropic directly:
+npx wrangler secret put ANTHROPIC_API_KEY        # console.anthropic.com key
 ```
 
-Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes).
+Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes). Without `CH_API_KEY` only the Companies House tool is unavailable. Without the AI Gateway secrets the dropdown's Haiku option errors when selected; Workers AI models keep working.
 
 ### 4. Deploy
 
@@ -99,6 +112,22 @@ If you set a custom-domain route in `wrangler.toml`, wrangler handles DNS + SSL 
 3. Open **Admin** → add a target (e.g. `SW1A 1AA`), attach the skill, tick *Run once immediately*.
 4. ~30 seconds later, the target's public page (`/target/sw1a-1aa`) shows the first report.
 5. Every cron tick after that, the agent re-runs the skill and appends an update.
+
+## The toolbox
+
+Five tools are wired in [src/apis.ts](src/apis.ts) and registered in the `TOOLS` const. The catalog is rendered live at `/admin/tools`. A skill declares which tools it uses via markdown headers in its `procedure_md`:
+
+| Tool | Operations | Inputs | Key needed? |
+| --- | --- | --- | --- |
+| **Tavily** | `search`, `extract` | keyword query / URL list | yes (free 1000/mo) |
+| **HM Land Registry** | `sold-prices` | UK postcode | no |
+| **ONS / postcodes.io** | `context` | UK postcode | no |
+| **data.police.uk** | `crimes` | UK postcode (England/Wales/NI) | no |
+| **Companies House** | `search`, `by-postcode` | name / UK postcode | yes (free) |
+
+A skill declares a tool with a header like `**Tavily op:** search` or `**Land Registry op:** sold-prices`. Per-tool optional headers (e.g. `**Months:** 6`, `**Search topic:** news`) live underneath. Multi-tool skills are normal — a "postcode dossier" skill might declare all five.
+
+Adding a new tool means: add a fetch function to `apis.ts`, add a `TOOLS` entry, add a dispatch case in `gatherSources` (in [src/agent.ts](src/agent.ts)). The synthesis prompt and `/admin/tools` page pick up the new entry automatically.
 
 ## Customising
 
@@ -120,19 +149,40 @@ Set from `/admin`:
 
 Counters reset at 00:00 UTC.
 
-### Models
+### Chat models
 
-[src/agent.ts](src/agent.ts) uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` for chat and `@cf/baai/bge-base-en-v1.5` for embeddings. If your account doesn't have access to Llama 3.3 70B, swap to `@cf/meta/llama-3.1-8b-instruct-fast` — same API, smaller, still fine.
+The chat model is editable live from `/admin`. Dropdown options:
+
+**Cloudflare Workers AI** (free 10k neurons/day, shared across all models on your account):
+- `@cf/meta/llama-3.3-70b-instruct-fp8-fast` — ~28 reports/day
+- `@cf/meta/llama-3.1-8b-instruct-fast` — ~100 reports/day, weaker writing
+- Mistral Small 3.1, Llama 4 Scout, Gemma 3, QwQ, DeepSeek R1 etc. (see allow-list in `agent.ts`)
+
+**Anthropic via AI Gateway** (paid, bypasses Workers AI quota):
+- `anthropic/claude-haiku-4-5-20251001` — **default**. ~$0.01 per WatchOMacho report. Best writing quality among the cheap tier. Routed through your `watchomacho` AI Gateway.
+
+The dispatcher (`runChat()` in `agent.ts`) routes by model-id prefix: `@cf/...` → `env.AI.run`; `anthropic/...` → `https://gateway.ai.cloudflare.com/.../anthropic/v1/messages` with either `cf-aig-authorization` (Unified Billing — Cloudflare pays Anthropic on your behalf via prepaid credits) or `x-api-key` (BYOK — you pay Anthropic directly).
+
+Every report records which model wrote it (`reports.chat_model` column), displayed on the report page and in the report list. Useful for comparing model quality over time.
+
+Embeddings still go to Workers AI's `@cf/baai/bge-base-en-v1.5` — they're tiny (~3 neurons each) and easy to keep on the free pool.
 
 ## Cost
 
-On the free tier, with 20 reports/day and ~5 searches per report:
+Hobby use (~5 reports/day on Haiku 4.5):
 
-- Workers requests: free under 100k/day
-- Workers AI: 10k neurons/day free. Two chat calls + one embedding per report ≈ ~250 neurons. 20 reports/day ≈ 5k neurons — under the cap.
-- Tavily: 1000 credits/month free on the Researcher plan = ~33/day. At 1 credit per basic search and 5 searches per report, that's ~6 reports/day before paying. Lower `daily_report_limit` (or `daily_search_limit`) to stay zero-cost, or upgrade Tavily's plan.
-- Vectorize: 30M queried dimensions/month free
-- R2: 10GB free, no egress
+- **Cloudflare AI Gateway credits: ~$1.60/month** (Haiku, ~$0.01 per report)
+- Tavily: free (1000 credits/mo cap; ~25 credits/day at 5 basic searches each)
+- Workers requests: free (under 100k/day)
+- Workers AI (embeddings only): free (under 10k neurons/day)
+- Vectorize: free (under 30M queried dimensions/month)
+- R2: free (under 10GB; one Tailwind CSS bundle + reports)
+- D1: free (under 5GB)
+- Cron Triggers: free
+
+At 20 reports/day on Haiku: ~$6/month.
+
+**To stay 100% free**, switch the dropdown to a Workers AI model (Llama 3.1 8B fast gives ~100 reports/day on the shared neurons pool) and don't bother with AI Gateway / Anthropic. Reports look thinner but the loop still works.
 - D1: 5GB free
 - Cron Triggers: free
 

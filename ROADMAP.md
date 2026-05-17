@@ -2,7 +2,10 @@
 
 Forward plan for WatchOMacho. Where v4 is, where it's going, and what's deliberately out of scope right now.
 
-> **⚠️ Active plan = [PLAN.md](PLAN.md).** This roadmap describes the original 4-level ladder. After discussion on 2026-05-16 the toolbox was collapsed to Tavily-only (one vendor, search + extract) — that ships in `PLAN.md` and effectively delivers what was previously Level 2. Use this roadmap for *future* level 3/4 thinking; for the current refactor, read `PLAN.md`.
+> **Status (2026-05-17):**
+> - Level 1+2 shipped via Tavily ([PLAN.md](PLAN.md))
+> - Level 3 partially shipped — first four UK typed tools (Land Registry, ONS, data.police.uk, Companies House) + multi-tool refactor ([PLAN_LEVEL3.md](PLAN_LEVEL3.md))
+> - Level 4 (true agentic tool-use loop) still deferred
 
 ## Where we are — v4 + Tavily (current)
 
@@ -37,20 +40,25 @@ Both shortcomings are addressed in a later level below.
 ### ~~Level 2~~ — DELIVERED by Tavily
 ~~After Brave returns URLs, our code fetches the top 3–5 pages and extracts text.~~ Tavily's `/search` does this in one HTTP call (no need for a separate `fetchPage()` step or Cloudflare Browser Rendering). Skip this level — the work is done.
 
-### Level 3 — Typed tools (specialist depth)
-Wire specific public APIs the agent can call when relevant. Each skill can prefer certain tools.
+### Level 3 — Typed tools (specialist depth) — INITIAL FOUR DELIVERED 2026-05-17
 
-UK-focused candidates (all free, all keyless except Companies House):
-- **Land Registry Open Data** — sold-price history per postcode
-- **ONS API** — census, demographics, deprivation indices
-- **data.police.uk** — crime stats per area
-- **Companies House** — businesses at an address
+The first four UK-focused typed tools shipped on top of Tavily, alongside a multi-tool refactor that lets a skill declare any combination of tools (one of each). The agent's `gatherSources` dispatches over a `SkillToolCall[]`; each typed tool flattens its structured output to a markdown table or labelled block so the writer prompt stays uniform.
+
+**Delivered:**
+- **HM Land Registry Open Data** — sold-price history per postcode (SPARQL endpoint, keyless)
+- **ONS / postcodes.io** — UK postcode administrative geography (country, region, district, ward, constituency, LSOA, MSOA, parish)
+- **data.police.uk** — street-level crime aggregated by category, last N months (keyless, England/Wales/NI only — not Scotland)
+- **Companies House** — search by name or filter by registered-office postcode (free API key required)
+
+Each is in `src/apis.ts` with a typed return shape, an entry in the `TOOLS` registry, and a dispatch case in `gatherSources` (in `agent.ts`). A skill declares a tool with a header like `**Land Registry op:** sold-prices` + optional per-tool params (`**Months:** 6`, `**Limit:** 25`, etc.). The synthesis prompt and `/admin/tools` page render the catalog dynamically, so future tools surface automatically.
+
+**Remaining UK candidates (not yet wired):**
 - **EPC Open Data** — energy performance certificates
 - **TfL Unified API** — London transport stops, departures
 - **OpenStreetMap Overpass** — amenities (shops, parks, schools)
 - **data.gov.uk** — schools, hospitals, flood zones
 
-Global candidates:
+**Global candidates (not yet wired):**
 - **OpenAlex** / arXiv — academic papers
 - **Wikidata SPARQL** — structured facts
 - **Open-Meteo** — weather + history
@@ -58,28 +66,28 @@ Global candidates:
 - **HackerNews API** — for topic targets
 - **GDELT** — global events
 
-**Implementation pattern**: each tool gets a function in `apis.ts` returning typed data, plus an entry in the `TOOLS` registry. A skill's `procedure_md` references tools by name (e.g. `**Land Registry op:** sold-prices`). `runResearch` collects all tool outputs and feeds them to the LLM alongside the Tavily-extracted web content.
+**Implementation pattern** (same as the four delivered): write a fetch function in `apis.ts` returning typed data, add an entry to the `TOOLS` registry (slug, display, summary, operations, headers), and add a dispatch case in `gatherSources`. Each handler returns `GatheredSource[]` with `{ title, url, content }` — flatten structured data to a markdown table inside `content` so the writer LLM sees one shape.
 
-**Risk of overreach**: don't wire everything. Pick 2–3 tools that match your actual research targets. More tools = more context for the LLM = more cost + cognitive load on the model.
+**Risk of overreach**: still applies. Pick 2–3 more tools that match your actual research targets, not every UK API in existence. More tools = more context for the LLM = more cost + cognitive load on the model.
 
 ### Level 4 — True agentic tool-use loop
 The LLM iteratively calls tools, sees results, decides next steps, calls more tools, then writes. Requires real function-calling support — Claude and GPT do this cleanly; Workers AI Llama is more limited.
 
-Only do this when (a) skills are too rigid to express what you need, or (b) you've moved chat to Anthropic via AI Gateway and want to use Sonnet/Opus's tool-use directly.
+**Partially enabled (2026-05-17)** by the AI Gateway + Anthropic Haiku 4.5 integration. The dispatcher (`runChat()`) now routes `anthropic/...` model IDs through Cloudflare AI Gateway, with Unified Billing so Cloudflare bills you for Anthropic usage on a single invoice (no separate Anthropic account needed). That's the infrastructure piece. The agentic loop itself (LLM-driven tool selection, multi-turn) is still deferred — current pipeline is rigid plan-gather-write. Switch to Claude's native tool-use API only when skills become too constraining.
 
 ---
 
 ## Cost trajectory
 
-| Phase | Tavily/mo | Workers AI | Anthropic | Approx total |
+| Phase | Tavily/mo | Workers AI | Anthropic (via Unified Billing) | Approx total |
 |---|---|---|---|---|
-| v4 + Tavily (now) | 1k free | 10k/day free | 0 | £0 |
-| + Workers Paid | 1k free | 10M/mo included | 0 | $5/mo |
-| + Tavily paid (Bootstrap) | $30 | included | 0 | $35/mo |
-| Level 3 (typed tools) + Paid | similar | similar | 0 | $35/mo |
-| Level 4 (Anthropic) | + Tavily | embeddings only | $10–30 | $45–65/mo |
+| v4 + Tavily, Workers AI chat (free path) | 1k free | 10k/day free | 0 | £0 (~6 reports/day cap from Tavily) |
+| + Tavily paid (Bootstrap) | $30 | 10k/day free | 0 | $30/mo |
+| **v4 + Haiku 4.5 chat (current default)** | 1k free | embeddings only | ~$0.01/report | **~$2/mo at 5 reports/day, ~$6/mo at 20 reports/day** |
+| + Tavily paid + Haiku at 20 reports/day | $30 | embeddings only | $6 | ~$36/mo |
+| Full agentic Level 4 (Sonnet tool-use loop) | + Tavily | embeddings only | $10–30 | $40–60/mo |
 
-Hobby usage stays at £0 until Tavily's free credits are exhausted (~6 reports/day). Anthropic gets serious only at Level 4.
+Hobby use on Haiku stays well under $10/month. The Workers AI free path remains available — switch the dropdown to `@cf/meta/llama-3.1-8b-instruct-fast` for ~100 free reports/day in the shared neurons pool.
 
 ---
 

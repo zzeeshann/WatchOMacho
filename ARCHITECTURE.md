@@ -30,20 +30,22 @@ Fast reference. For narrative explanation, read [BOOK.md](BOOK.md). For setup, [
                                │
           ┌───────────────┬───────────┬──────────────┐
           ▼               ▼           ▼              ▼
-      ┌────────┐     ┌─────────┐  ┌──────┐  ┌──────────────┐
-      │ Tavily │     │ Workers │  │ D1   │  │ Vectorize    │
-      │ search │     │   AI    │  │      │  │   (memory)   │
-      │ + ext  │     │ Llama+  │  │      │  │              │
-      │        │     │ bge-base│  │      │  │              │
-      └────────┘     └─────────┘  └──────┘  └──────────────┘
+      ┌──────────────┐ ┌─────────┐  ┌──────┐  ┌──────────────┐
+      │ TOOLS:       │ │ Workers │  │ D1   │  │ Vectorize    │
+      │  tavily      │ │   AI    │  │      │  │   (memory)   │
+      │  land_reg    │ │ Llama+  │  │      │  │              │
+      │  ons         │ │ bge-base│  │      │  │              │
+      │  police      │ │         │  │      │  │              │
+      │  companies   │ │         │  │      │  │              │
+      └──────────────┘ └─────────┘  └──────┘  └──────────────┘
           │                          │
           │                          ▼
           │                      ┌──────┐
-          └──────────────────────►  R2  │ (full markdown of each report)
-                                 └──────┘
+          └──────────────────────►  R2  │ (full markdown of each report
+                                 └──────┘   + /static/tailwind.v1.css)
 ```
 
-External: Tavily (search + extract).
+External: Tavily (web search + extract), HM Land Registry SPARQL, postcodes.io (ONS area data), data.police.uk, Companies House.
 Internal: Workers AI (chat + embeddings), D1, R2, Vectorize.
 
 ---
@@ -55,14 +57,14 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | # | Step | Calls | Cost |
 | --- | --- | --- | --- |
 | 1 | **Budget check** | D1 read | ~free |
-| 2 | **Parse skill** — extract optional `**Tavily op:**` / `**Sources:**` / topic / time range / depth headers | local | free |
-| 3 | **Plan** — LLM picks 3–6 search queries (skipped in extract mode) | 1 chat call | ~150–300 neurons |
-| 4 | **Gather** — Tavily `/search` for each planned query, OR `/extract` for an explicit URL list. Each result includes the page's extracted full content. | N HTTP calls | N Tavily credits (1 per basic search; 1 per 5 URLs extracted) |
+| 2 | **Parse skill** — scan procedure_md for any registered tool's `**<Tool> op:**` header; collect each tool's per-tool params into a `SkillToolCall[]`. Default to one Tavily search if none declared. | local | free |
+| 3 | **Plan** — LLM picks 3–6 search queries (only if at least one tool call is Tavily search) | 1 chat call | ~150–300 neurons |
+| 4 | **Gather** — dispatch over the `SkillToolCall[]`. Each tool's handler fetches and flattens to markdown `{ title, url, content }`. Typed-tool output (Land Registry rows, ONS context, police crimes, Companies House hits) is rendered as a markdown table or labelled block so the writer sees a uniform source format. | N HTTP calls across the tools | Tavily: N credits; everything else: free |
 | 5 | **Recall** — Vectorize for related past reports + D1 for same-target history | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
-| 6 | **Write** — LLM produces the markdown report from extracted page content + recalled context | 1 chat call | ~300–700 neurons (richer input than v4's snippet-only) |
+| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context | 1 chat call | ~300–700 neurons |
 | 7 | **Persist** — R2 put + D1 insert + embed + Vectorize upsert + update target.next_run_at + audit row | 1 R2 put + 4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
 
-**Total per run:** ~2 chat calls + 1 embedding + 3–6 Tavily calls → roughly **600–1200 neurons + 3–6 Tavily credits**.
+**Total per run:** ~2 chat calls + 1 embedding + (3–6 Tavily calls if used) + (0–N typed-tool HTTP calls) → roughly **600–1200 neurons + 0–6 Tavily credits**. Typed-tool calls are upstream-rate-limited but cost nothing.
 
 ---
 
@@ -190,12 +192,12 @@ The full markdown of every report. `text/markdown; charset=utf-8`. Never queried
 
 | File | Lines | What's in it |
 | --- | --- | --- |
-| [src/apis.ts](src/apis.ts) | ~130 | `tavilySearch`, `tavilyExtract`, `TOOLS` registry |
-| [src/agent.ts](src/agent.ts) | ~570 | Targets / skills / reports CRUD, `parseSkillTools`, `runResearch` loop, `cronTick`, budget gates |
-| [src/index.ts](src/index.ts) | ~400 | HTTP routing, auth/cookie, `readForm`, `scheduled` handler, security headers |
-| [src/dashboard.ts](src/dashboard.ts) | ~1240 | All HTML rendering: public pages + admin pages (incl. `/admin/tools`) + safe markdown renderer |
+| [src/apis.ts](src/apis.ts) | ~540 | Five tool integrations (Tavily search/extract, Land Registry SPARQL, ONS via postcodes.io, data.police.uk, Companies House) + `TOOLS` registry |
+| [src/agent.ts](src/agent.ts) | ~1280 | Targets / skills / reports CRUD, `runChat()` dispatcher (Workers AI + Anthropic via AI Gateway), `parseSkillTools` (multi-tool), `gatherSources` dispatch + per-tool gatherers (with Tavily score filter), `runResearch` loop, `cronTick`, budget gates |
+| [src/index.ts](src/index.ts) | ~530 | HTTP routing (incl. `/static/tailwind.v1.css` from R2 + `/admin/targets/:slug/run` background invocation via `ctx.waitUntil`), auth/cookie, `readForm`, `scheduled` handler, security headers |
+| [src/dashboard.ts](src/dashboard.ts) | ~1360 | All HTML rendering: public pages + admin pages (incl. `/admin/tools` rendering any registered tool), markdown renderer with `<sup class="cite">` citation rewriter, canonical Sources footer from D1, `stripMarkdown()` helper for snippets |
 
-Total: ~2300 lines of TypeScript.
+Total: ~3700 lines of TypeScript. Tailwind CSS is built locally via `npm run build:css` and served from R2 (not bundled into the Worker).
 
 ---
 
@@ -221,7 +223,7 @@ Total: ~2300 lines of TypeScript.
 | POST | `/admin/logout` | Clear cookie |
 | GET | `/admin` | Overview |
 | GET | `/admin/skills` | Skill library |
-| GET | `/admin/tools` | Read-only catalog of tools (Tavily search/extract) skills can call |
+| GET | `/admin/tools` | Read-only catalog of all five tools and their skill-markdown headers |
 | POST | `/admin/skills` | Create skill — `mode=synthesize&brief=…` OR `mode=write&name&procedure_md` |
 | POST | `/admin/skills/:slug/update` | Edit skill |
 | POST | `/admin/skills/:slug/delete` | Delete skill |
@@ -273,19 +275,29 @@ Daily budget gates stop early on `BudgetExceeded`.
 | Secret | Required? | Purpose |
 | --- | --- | --- |
 | `ADMIN_SECRET` | yes | Admin panel password. Generate with `openssl rand -hex 32`. |
-| `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search is skipped — reports become LLM-knowledge-only. |
+| `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search/extract is skipped — reports rely on LLM general knowledge + whichever typed tools the skill declares. |
+| `CH_API_KEY` | optional | Companies House developer API key (free, register at developer.company-information.service.gov.uk). Only needed if a skill calls the `companies_house` tool. Without it that one tool short-circuits to no results; everything else keeps working. |
+| `AI_GATEWAY_ACCOUNT_ID` | optional | Cloudflare account ID (hex string in any dashboard URL). Required if you use `anthropic/...` chat models via AI Gateway. |
+| `AI_GATEWAY_NAME` | optional | The gateway name you created in CF dashboard → AI → AI Gateway (e.g. `watchomacho`). Same requirement as `AI_GATEWAY_ACCOUNT_ID`. |
+| `CF_AIG_TOKEN` | one of these two | Cloudflare API token with `AI Gateway: Run` scope. Enables Unified Billing — Cloudflare pays Anthropic on your behalf via prepaid credits loaded into your CF account. Single invoice. |
+| `ANTHROPIC_API_KEY` | one of these two | Anthropic console API key. BYOK alternative to `CF_AIG_TOKEN` — you pay Anthropic directly. Use one OR the other, not both. |
 
-Set both via `npx wrangler secret put …`. Never commit.
+Set all via `npx wrangler secret put …`. Never commit.
 
 ---
 
 ## Models
 
-| Use | Model |
-| --- | --- |
-| Chat (planning + report writing + skill synthesis) | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` |
-| Embeddings (memory) | `@cf/baai/bge-base-en-v1.5` |
+The chat model is editable live from `/admin`. The dispatcher (`runChat()` in `agent.ts`) routes by model-id prefix:
 
-Configured as constants in [src/agent.ts](src/agent.ts:26-27). Swap by editing those two lines and redeploying.
+| Prefix | Path | Auth | Billing |
+| --- | --- | --- | --- |
+| `@cf/...` | `env.AI.run(model, input)` (Workers AI binding) | none | Cloudflare neurons pool (10k/day free) |
+| `anthropic/...` | `https://gateway.ai.cloudflare.com/v1/{ACCOUNT_ID}/{GATEWAY_NAME}/anthropic/v1/messages` | `cf-aig-authorization: Bearer {CF_AIG_TOKEN}` OR `x-api-key: {ANTHROPIC_API_KEY}` | Cloudflare credits (Unified Billing) OR Anthropic directly (BYOK) |
 
-To downgrade chat to a smaller, cheaper, more generous-quota model: `@cf/meta/llama-3.1-8b-instruct-fast`.
+| Use | Default | Notes |
+| --- | --- | --- |
+| Chat (planning + report writing + skill synthesis) | `anthropic/claude-haiku-4-5-20251001` | ~$0.01/report via Unified Billing. Allow-listed via `ALLOWED_CHAT_MODELS` in `agent.ts` (8 Workers AI options + 1 AI Gateway option as of writing). |
+| Embeddings (memory) | `@cf/baai/bge-base-en-v1.5` | Always Workers AI. Tiny — fits comfortably in free pool. |
+
+`DEFAULT_CHAT_MODEL` in `agent.ts` is what the cron tick + new installs use when the `chat_model` setting is missing. Adding a new model: append to `ALLOWED_CHAT_MODELS`, add a human-readable label to `CHAT_MODEL_LABELS`, and (if it's a new provider prefix) extend `runAnthropicChat`-style handler. Reports record their model in the `chat_model` column so you can A/B retrospectively.

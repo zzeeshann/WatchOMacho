@@ -10,8 +10,12 @@
 //              re-runs the Skill on its configured cadence.
 
 import {
-  tavilySearch,
+  companiesHouseSearch,
+  landRegSoldPrices,
+  onsContext,
+  policeCrimes,
   tavilyExtract,
+  tavilySearch,
   TOOLS,
   type TavilySearchOptions,
 } from "./apis";
@@ -23,6 +27,16 @@ export interface Env {
   MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
   TAVILY_API_KEY?: string;
+  CH_API_KEY?: string;                 // Companies House developer API key (optional)
+  // ─── AI Gateway (optional; enables `anthropic/...` chat models) ──────────
+  AI_GATEWAY_ACCOUNT_ID?: string;      // Cloudflare account ID (visible in any dashboard URL)
+  AI_GATEWAY_NAME?: string;            // The gateway name you created in CF dashboard
+  // Auth: pick ONE of the two below.
+  // Preferred: CF_AIG_TOKEN  — Cloudflare API token, billed via Cloudflare
+  //                            (Unified Billing — single invoice, no Anthropic account)
+  // Fallback: ANTHROPIC_API_KEY — your own Anthropic console key, billed by Anthropic
+  CF_AIG_TOKEN?: string;
+  ANTHROPIC_API_KEY?: string;
 }
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -35,6 +49,7 @@ const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
 // production.
 
 export const ALLOWED_CHAT_MODELS = [
+  // ─── Cloudflare Workers AI (free 10k neurons/day, shared across all models) ─
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   "@cf/mistralai/mistral-small-3.1-24b-instruct",
   "@cf/qwen/qwen2.5-coder-32b-instruct",
@@ -43,20 +58,23 @@ export const ALLOWED_CHAT_MODELS = [
   "@cf/meta/llama-3.1-8b-instruct-fast",
   "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
   "@cf/qwen/qwq-32b",
+  // ─── AI Gateway → Anthropic (pay-per-token, bypasses Workers AI quota) ─────
+  "anthropic/claude-haiku-4-5-20251001",
 ] as const;
 
 export const CHAT_MODEL_LABELS: Record<string, string> = {
-  "@cf/meta/llama-3.3-70b-instruct-fp8-fast": "Llama 3.3 70B (fast) — strongest, tightest free cap",
-  "@cf/mistralai/mistral-small-3.1-24b-instruct": "Mistral Small 3.1 (24B) — strong, looser cap",
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast": "Llama 3.3 70B (fast) — ~28 reports/day on free pool",
+  "@cf/mistralai/mistral-small-3.1-24b-instruct": "Mistral Small 3.1 (24B) — ~43 reports/day on free pool",
   "@cf/qwen/qwen2.5-coder-32b-instruct": "Qwen 2.5 Coder (32B) — best for structured output",
-  "@cf/meta/llama-4-scout-17b-16e-instruct": "Llama 4 Scout (17B MoE) — newest, fast",
-  "@cf/google/gemma-3-12b-it": "Gemma 3 (12B) — Google's reliable mid-size",
-  "@cf/meta/llama-3.1-8b-instruct-fast": "Llama 3.1 8B (fast) — cheapest, most generous cap",
+  "@cf/meta/llama-4-scout-17b-16e-instruct": "Llama 4 Scout (17B MoE) — ~47 reports/day on free pool",
+  "@cf/google/gemma-3-12b-it": "Gemma 3 (12B) — ~44 reports/day on free pool",
+  "@cf/meta/llama-3.1-8b-instruct-fast": "Llama 3.1 8B (fast) — ~100 reports/day on free pool",
   "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b": "DeepSeek R1 Distill (32B) — reasoning",
   "@cf/qwen/qwq-32b": "Qwen QwQ (32B) — reasoning",
+  "anthropic/claude-haiku-4-5-20251001": "Claude Haiku 4.5 (AI Gateway) — paid, ~$0.01/report, no Workers AI quota",
 };
 
-export const DEFAULT_CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+export const DEFAULT_CHAT_MODEL = "anthropic/claude-haiku-4-5-20251001";
 
 export function isAllowedChatModel(m: string): boolean {
   return (ALLOWED_CHAT_MODELS as readonly string[]).includes(m);
@@ -67,6 +85,112 @@ export function isAllowedChatModel(m: string): boolean {
 export async function getChatModel(env: Env): Promise<string> {
   const val = await getSetting(env, "chat_model", DEFAULT_CHAT_MODEL);
   return isAllowedChatModel(val) ? val : DEFAULT_CHAT_MODEL;
+}
+
+// ─── chat dispatcher ──────────────────────────────────────────────────────
+//
+// Single chat entry point. Routes by model prefix:
+//   "@cf/..."         → Cloudflare Workers AI via env.AI.run
+//   "anthropic/..."   → Anthropic Messages API via Cloudflare AI Gateway
+//
+// Returns a uniform { response: string } so call sites stay identical
+// regardless of provider. Embedding calls (EMBED_MODEL) keep using
+// env.AI.run directly — they're not chat.
+
+interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+interface RunChatInput {
+  messages: ChatMessage[];
+  max_tokens?: number;
+}
+
+interface RunChatOutput {
+  response: string;
+}
+
+async function runChat(env: Env, model: string, input: RunChatInput): Promise<RunChatOutput> {
+  if (model.startsWith("@cf/")) {
+    const res: any = await env.AI.run(model, {
+      messages: input.messages,
+      max_tokens: input.max_tokens,
+    });
+    return { response: String(res.response ?? "") };
+  }
+
+  if (model.startsWith("anthropic/")) {
+    return runAnthropicChat(env, model.slice("anthropic/".length), input);
+  }
+
+  throw new Error(`Unknown chat model prefix: ${model}`);
+}
+
+async function runAnthropicChat(
+  env: Env,
+  anthropicModel: string,
+  input: RunChatInput,
+): Promise<RunChatOutput> {
+  if (!env.AI_GATEWAY_ACCOUNT_ID || !env.AI_GATEWAY_NAME) {
+    throw new Error(
+      "AI_GATEWAY_ACCOUNT_ID + AI_GATEWAY_NAME secrets required for anthropic/... models",
+    );
+  }
+  if (!env.CF_AIG_TOKEN && !env.ANTHROPIC_API_KEY) {
+    throw new Error(
+      "Set either CF_AIG_TOKEN (Unified Billing, recommended) or ANTHROPIC_API_KEY",
+    );
+  }
+
+  // Anthropic puts system messages in a separate `system` field, not in
+  // messages. Combine all system messages into one string.
+  const systemParts: string[] = [];
+  const otherMsgs: ChatMessage[] = [];
+  for (const m of input.messages) {
+    if (m.role === "system") systemParts.push(m.content);
+    else otherMsgs.push(m);
+  }
+
+  const url = `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_NAME}/anthropic/v1/messages`;
+
+  // Auth: Unified Billing if CF_AIG_TOKEN is set (Cloudflare bills via your
+  // CF account credits); otherwise BYOK with your Anthropic console key.
+  // With Unified Billing, the `x-api-key` header must be omitted entirely —
+  // an empty value triggers Anthropic's pre-validation 401.
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "anthropic-version": "2023-06-01",
+  };
+  if (env.CF_AIG_TOKEN) {
+    headers["cf-aig-authorization"] = `Bearer ${env.CF_AIG_TOKEN}`;
+  } else {
+    headers["x-api-key"] = env.ANTHROPIC_API_KEY!;
+  }
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: anthropicModel,
+      max_tokens: input.max_tokens ?? 1024,
+      system: systemParts.length ? systemParts.join("\n\n") : undefined,
+      messages: otherMsgs.map((m) => ({ role: m.role, content: m.content })),
+    }),
+  });
+
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    throw new Error(`Anthropic ${r.status}: ${body.slice(0, 400)}`);
+  }
+
+  const data: any = await r.json();
+  // Anthropic returns content as an array of typed blocks; we expect one text block.
+  const text = (data.content ?? [])
+    .filter((b: any) => b?.type === "text")
+    .map((b: any) => String(b.text ?? ""))
+    .join("");
+  return { response: text };
 }
 
 // ─── basics ────────────────────────────────────────────────────────────────
@@ -307,22 +431,30 @@ export interface Skill {
   updated_at: number;
 }
 
-const SKILL_TEMPLATE = `You are designing a reusable research skill for an AI agent that produces markdown reports.
+/** Build the synthesis prompt by rendering the TOOLS catalog dynamically.
+ *  Called once per synthesizeSkill invocation. When a new tool is added to
+ *  apis.ts it shows up here automatically — no manual prompt update needed. */
+function buildSkillTemplate(): string {
+  const toolBlocks = Object.values(TOOLS).map((tool) => {
+    const ops = Object.entries(tool.operations)
+      .map(
+        ([opName, op]) =>
+          `  - ${opName}: ${op.description}\n      When to use: ${op.when_to_use}`,
+      )
+      .join("\n");
+    const headers = tool.headers
+      .map((h) => `    **${h.key}:** ${h.values}`)
+      .join("\n");
+    return `${tool.display} — ${tool.summary}\n  Operations:\n${ops}\n  Headers:\n${headers}`;
+  }).join("\n\n");
+
+  return `You are designing a reusable research skill for an AI agent that produces markdown reports.
 
 Available tools you can call from a skill:
 
-tavily (search):  Search the web by keyword. Returns top results with
-                  extracted full-page content. Add **Tavily op:** search
-                  to declare. Default if no Tavily op header.
+${toolBlocks}
 
-tavily (extract): Read a list of specific URLs in full. Add
-                  **Tavily op:** extract to declare, plus **Sources:**
-                  list with one URL per bullet.
-
-Optional headers for search mode:
-  **Search topic:** general | news | finance
-  **Time range:**   day | week | month | year
-  **Depth:**        basic | advanced
+A skill can declare ONE OR MORE tools (one of each). Each tool is declared by its op header (e.g. **Tavily op:** search or **Land Registry op:** sold-prices). Headers are case-sensitive. Only add tool headers the brief actually justifies — don't over-declare.
 
 Given the skill brief below, write a procedure document with these sections, in plain markdown:
 
@@ -332,16 +464,21 @@ Given the skill brief below, write a procedure document with these sections, in 
 
 **When to use:** the kind of target this works on (postcodes, companies, people, topics, places).
 
-(Optional Tavily headers here, only if the brief implies them — e.g. "hourly news on X" → **Tavily op:** search + **Search topic:** news + **Time range:** day. Don't add headers you don't need.)
+(Optional tool headers here — see catalog above. Examples:
+  • "hourly news on X" → **Tavily op:** search + **Search topic:** news + **Time range:** day
+  • "UK postcode dossier" → **Tavily op:** search + **Land Registry op:** sold-prices + **ONS op:** context + **Police op:** crimes
+  • "specific RSS feeds" → **Tavily op:** extract + **Sources:** bulleted URL list
+Don't add headers you don't need.)
 
-**Approach:** 3–6 sentences of approach. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
+**Approach:** 3–6 sentences. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
 
-**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each query goes on its own bulleted line. (Skip this section if **Tavily op:** is extract — list URLs under **Sources:** instead.)
+**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each on its own bulleted line. Skip this section if no Tavily search op is declared (extract uses **Sources:** instead, and pure typed-tool skills don't need search queries).
 
 **Output structure:** the headings the final report should use, with one sentence each describing what goes under each heading. End with a "Sources" section.
 
 Be specific. The agent will execute this procedure literally. Do not include any preamble or commentary outside the document.
 `;
+}
 
 export async function listSkills(env: Env): Promise<Skill[]> {
   const rows = await env.DB.prepare(
@@ -405,14 +542,14 @@ export async function synthesizeSkill(
   const brief = input.brief.trim();
   if (!brief) throw new Error("brief required");
   const model = await getChatModel(env);
-  const res: any = await env.AI.run(model, {
+  const res = await runChat(env, model, {
     messages: [
-      { role: "system", content: SKILL_TEMPLATE },
+      { role: "system", content: buildSkillTemplate() },
       { role: "user", content: `Skill brief: "${brief}"\n\nWrite the procedure document now.` },
     ],
     max_tokens: 900,
   });
-  const procedure_md = String(res.response ?? "").trim();
+  const procedure_md = res.response.trim();
   if (procedure_md.length < 60) throw new Error("LLM returned an empty / too-short skill document");
 
   // Pull a name out of the first H1 if the brief didn't supply one.
@@ -518,7 +655,7 @@ interface SourceCitation {
 /** Step 1: ask the LLM what to search for. Returns an array of queries with
  *  {target} placeholders already expanded. */
 async function planResearch(env: Env, skill: Skill, target: Target, model: string): Promise<ResearchPlan> {
-  const res: any = await env.AI.run(model, {
+  const res = await runChat(env, model, {
     messages: [
       {
         role: "system",
@@ -536,7 +673,7 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
     ],
     max_tokens: 400,
   });
-  const raw = String(res.response ?? "");
+  const raw = res.response;
   const m = raw.match(/\{[\s\S]*\}/);
   if (m) {
     try {
@@ -569,113 +706,276 @@ interface GatheredSource {
 // chat model in ALLOWED_CHAT_MODELS.
 const MAX_CHARS_PER_SOURCE = 4000;
 
-/** Parse the optional Tavily-related markdown headers a skill may declare.
- *  Every header is optional — a skill with none gets search mode + sensible
- *  defaults. Conventions:
- *
- *    **Tavily op:** search | extract
- *    **Sources:**                       (only used with extract op)
- *      - https://...
- *      - https://...
- *    **Search topic:** general | news | finance
- *    **Time range:** day | week | month | year
- *    **Depth:** basic | advanced
- */
-export interface SkillToolConfig {
-  op: "search" | "extract";
-  sources?: string[];
-  topic?: "general" | "news" | "finance";
-  timeRange?: "day" | "week" | "month" | "year";
-  depth?: "basic" | "advanced";
+// A skill can declare ONE OR MORE tool calls. Each call records which tool
+// slug, which op, and the per-tool parameters parsed from the skill's
+// markdown headers (e.g. "Months" → "6"). `sources` is Tavily-extract-only.
+export interface SkillToolCall {
+  tool: string;                       // TOOLS slug, e.g. "tavily"
+  op: string;                         // op name, e.g. "search" | "sold-prices"
+  params: Record<string, string>;     // header key → raw value
+  sources?: string[];                 // Tavily extract URL list
 }
 
-export function parseSkillTools(procedureMd: string): SkillToolConfig {
-  const opMatch = procedureMd.match(/\*\*Tavily op:\*\*\s*(search|extract)/i);
-  const op: "search" | "extract" =
-    opMatch && opMatch[1].toLowerCase() === "extract" ? "extract" : "search";
+// Each tool's op header key. Convention: "<display> op", but a few diverge
+// (e.g. "Tavily op" not "Tavily op"). Source of truth lives here so the
+// parser doesn't have to guess from `display`.
+const OP_HEADER_BY_TOOL: Record<string, string> = {
+  tavily: "Tavily op",
+  land_registry: "Land Registry op",
+  ons: "ONS op",
+  police: "Police op",
+  companies_house: "Companies House op",
+};
 
-  const topicMatch = procedureMd.match(/\*\*Search topic:\*\*\s*(general|news|finance)/i);
-  const topic = topicMatch
-    ? (topicMatch[1].toLowerCase() as "general" | "news" | "finance")
-    : undefined;
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
-  const timeMatch = procedureMd.match(/\*\*Time range:\*\*\s*(day|week|month|year)/i);
-  const timeRange = timeMatch
-    ? (timeMatch[1].toLowerCase() as "day" | "week" | "month" | "year")
-    : undefined;
+/** Parse all tool declarations in a skill's procedure markdown. A skill may
+ *  declare any subset of the registered tools (one of each). Returns a list
+ *  of tool calls; an empty list of declarations defaults to a single Tavily
+ *  search call so existing skills keep working unchanged. */
+export function parseSkillTools(procedureMd: string): SkillToolCall[] {
+  const calls: SkillToolCall[] = [];
 
-  const depthMatch = procedureMd.match(/\*\*Depth:\*\*\s*(basic|advanced)/i);
-  const depth = depthMatch
-    ? (depthMatch[1].toLowerCase() as "basic" | "advanced")
-    : undefined;
+  for (const tool of Object.values(TOOLS)) {
+    const opHeader = OP_HEADER_BY_TOOL[tool.slug];
+    if (!opHeader) continue;
+    const opPattern = new RegExp(`\\*\\*${escapeRegex(opHeader)}:\\*\\*\\s*([A-Za-z0-9_-]+)`, "i");
+    const opMatch = procedureMd.match(opPattern);
+    if (!opMatch) continue;
 
-  let sources: string[] | undefined;
-  if (op === "extract") {
-    // Grab the bulleted lines beneath a **Sources:** header until a blank
-    // line, the next bold header, or another markdown heading.
-    const block = procedureMd.match(/\*\*Sources:\*\*\s*\n([\s\S]*?)(?:\n\s*\n|\n\*\*|\n#|$)/i);
-    if (block) {
-      sources = block[1]
-        .split("\n")
-        .map((l) => l.replace(/^\s*[-*]\s+/, "").trim())
-        .filter((l) => /^https?:\/\//i.test(l));
+    const op = opMatch[1].toLowerCase();
+    const validOps = Object.keys(tool.operations).map((o) => o.toLowerCase());
+    if (!validOps.includes(op)) continue;
+
+    const params: Record<string, string> = {};
+    for (const h of tool.headers) {
+      if (h.key === opHeader) continue;
+      if (h.key === "Sources") continue;     // parsed specially below
+      const p = new RegExp(`\\*\\*${escapeRegex(h.key)}:\\*\\*\\s*(.+)`, "i");
+      const m = procedureMd.match(p);
+      if (m) params[h.key] = m[1].trim();
     }
+
+    let sources: string[] | undefined;
+    if (tool.slug === "tavily" && op === "extract") {
+      const block = procedureMd.match(
+        /\*\*Sources:\*\*\s*\n([\s\S]*?)(?:\n\s*\n|\n\*\*|\n#|$)/i,
+      );
+      if (block) {
+        sources = block[1]
+          .split("\n")
+          .map((l) => l.replace(/^\s*[-*]\s+/, "").trim())
+          .filter((l) => /^https?:\/\//i.test(l));
+      }
+    }
+
+    calls.push({ tool: tool.slug, op, params, sources });
   }
 
-  return { op, sources, topic, timeRange, depth };
+  // Default: no tool declared → single Tavily search (backwards-compat).
+  if (calls.length === 0) {
+    calls.push({ tool: "tavily", op: "search", params: {} });
+  }
+  return calls;
 }
 
-/** Step 2: gather evidence via Tavily. Either runs the LLM-planned queries
- *  through /search, or — if the skill declared **Tavily op:** extract with a
- *  Sources list — pulls those specific URLs through /extract. */
+/** Step 2: gather evidence by dispatching each tool call to its handler.
+ *  Each handler returns zero or more GatheredSource rows in the common
+ *  `{ title, url, content }` shape; typed tools flatten their structured
+ *  output to markdown so the writer LLM doesn't need to know the shape. */
 async function gatherSources(
   env: Env,
   queries: string[],
-  toolCfg: SkillToolConfig,
+  target: Target,
+  calls: SkillToolCall[],
 ): Promise<GatheredSource[]> {
   await checkBudget(env, "searches");
 
-  let gathered: GatheredSource[] = [];
-
-  if (toolCfg.op === "extract" && toolCfg.sources?.length) {
-    // Curated URL list — skip search entirely.
-    const extracted = await tavilyExtract(env.TAVILY_API_KEY, toolCfg.sources).catch(() => []);
-    gathered = extracted.map((r) => ({
-      title: r.url,
-      url: r.url,
-      content: r.raw_content,
-    }));
-    // Roughly one credit per 5 URLs (basic depth). Bill conservatively.
-    await bumpUsage(env, "searches", Math.max(1, Math.ceil(toolCfg.sources.length / 5)));
-  } else {
-    // Default: LLM-planned queries → Tavily /search.
-    const opts: TavilySearchOptions = {
-      topic: toolCfg.topic ?? "general",
-      time_range: toolCfg.timeRange,
-      search_depth: toolCfg.depth ?? "basic",
-    };
-    const results = await Promise.all(
-      queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts).catch(() => [])),
-    );
-    await bumpUsage(env, "searches", queries.length);
-
-    // Flatten + dedup by URL, keep first-seen order.
-    const seen = new Set<string>();
-    for (const list of results) {
-      for (const r of list) {
-        if (!r.url || seen.has(r.url)) continue;
-        seen.add(r.url);
-        gathered.push({ title: r.title, url: r.url, content: r.content });
+  const out: GatheredSource[] = [];
+  for (const c of calls) {
+    try {
+      switch (c.tool) {
+        case "tavily":
+          out.push(...(await gatherTavily(env, queries, c)));
+          break;
+        case "land_registry":
+          out.push(...(await gatherLandRegistry(c, target)));
+          break;
+        case "ons":
+          out.push(...(await gatherOns(c, target)));
+          break;
+        case "police":
+          out.push(...(await gatherPolice(c, target)));
+          break;
+        case "companies_house":
+          out.push(...(await gatherCompaniesHouse(env, c, target)));
+          break;
+        default:
+          console.warn(`gatherSources: unknown tool slug "${c.tool}"`);
       }
+    } catch (e) {
+      console.error(`gather ${c.tool} failed:`, e);
     }
   }
 
-  // Cap each source's content + cap total source count.
-  gathered = gathered.slice(0, 20).map((s) => ({
+  return out.slice(0, 20).map((s) => ({
     ...s,
     content: s.content.slice(0, MAX_CHARS_PER_SOURCE),
   }));
-  return gathered;
+}
+
+async function gatherTavily(
+  env: Env,
+  queries: string[],
+  c: SkillToolCall,
+): Promise<GatheredSource[]> {
+  if (c.op === "extract" && c.sources?.length) {
+    const extracted = await tavilyExtract(env.TAVILY_API_KEY, c.sources).catch(() => []);
+    await bumpUsage(env, "searches", Math.max(1, Math.ceil(c.sources.length / 5)));
+    return extracted.map((r) => ({ title: r.url, url: r.url, content: r.raw_content }));
+  }
+  const opts: TavilySearchOptions = {
+    topic: (c.params["Search topic"]?.toLowerCase() as TavilySearchOptions["topic"]) ?? "general",
+    time_range: c.params["Time range"]?.toLowerCase() as TavilySearchOptions["time_range"],
+    search_depth: (c.params["Depth"]?.toLowerCase() as TavilySearchOptions["search_depth"]) ?? "basic",
+  };
+  const results = await Promise.all(
+    queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts).catch(() => [])),
+  );
+  await bumpUsage(env, "searches", queries.length);
+
+  // Drop low-relevance results before they reach the writer. Tavily's
+  // `news` topic isn't perfectly strict — off-topic hits (Facebook posts,
+  // local feel-good stories, etc.) slip through with score < ~0.4. Reuters
+  // / AP / BBC primary reporting on the actual query typically scores 0.7+.
+  const MIN_SCORE = 0.4;
+
+  const seen = new Set<string>();
+  const flat: GatheredSource[] = [];
+  for (const list of results) {
+    for (const r of list) {
+      if (!r.url || seen.has(r.url)) continue;
+      if (r.score < MIN_SCORE) continue;
+      seen.add(r.url);
+      flat.push({ title: r.title, url: r.url, content: r.content });
+    }
+  }
+  return flat;
+}
+
+async function gatherLandRegistry(c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
+  const postcode = target.name;
+  const months = Math.max(1, Math.min(120, Number(c.params["Months"] ?? 12) || 12));
+  const limit = Math.max(1, Math.min(100, Number(c.params["Limit"] ?? 50) || 50));
+  const rows = await landRegSoldPrices(postcode, { months, limit });
+  if (rows.length === 0) return [];
+  const lines = [
+    `| Date | Address | Type | Paid |`,
+    `|---|---|---|---|`,
+    ...rows.map(
+      (r) =>
+        `| ${r.date} | ${[r.paon, r.saon, r.street, r.town].filter(Boolean).join(", ") || "—"} | ${r.type} | ${r.paid_display} |`,
+    ),
+  ];
+  return [
+    {
+      title: `HM Land Registry — sold prices in ${postcode} (last ${months} months, ${rows.length} transactions)`,
+      url: `https://landregistry.data.gov.uk/app/qonsole`,
+      content: lines.join("\n"),
+    },
+  ];
+}
+
+async function gatherOns(_c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
+  const postcode = target.name;
+  const ctx = await onsContext(postcode);
+  if (!ctx) return [];
+  const lines = [
+    `**Postcode:** ${ctx.postcode}`,
+    `**Country:** ${ctx.country}`,
+    ctx.region ? `**Region:** ${ctx.region}` : null,
+    ctx.admin_district ? `**Council district:** ${ctx.admin_district}` : null,
+    ctx.admin_ward ? `**Ward:** ${ctx.admin_ward}` : null,
+    ctx.parliamentary_constituency ? `**Constituency:** ${ctx.parliamentary_constituency}` : null,
+    ctx.lsoa ? `**LSOA:** ${ctx.lsoa}` : null,
+    ctx.msoa ? `**MSOA:** ${ctx.msoa}` : null,
+    ctx.parish ? `**Parish:** ${ctx.parish}` : null,
+  ].filter(Boolean);
+  return [
+    {
+      title: `ONS / postcodes.io context for ${ctx.postcode}`,
+      url: `https://api.postcodes.io/postcodes/${encodeURIComponent(ctx.postcode)}`,
+      content: lines.join("\n"),
+    },
+  ];
+}
+
+async function gatherPolice(c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
+  const postcode = target.name;
+  const months = Math.max(1, Math.min(12, Number(c.params["Months"] ?? 3) || 3));
+  const summary = await policeCrimes(postcode, { months });
+  if (!summary) return [];
+  const catLines = summary.by_category.map((row) => `| ${row.category} | ${row.count} |`);
+  const sampleLines = summary.sample.map(
+    (s) =>
+      `- ${s.month}: ${s.category}${s.street ? ` on ${s.street}` : ""}${s.outcome ? ` — ${s.outcome}` : ""}`,
+  );
+  const lines = [
+    `**Total incidents across ${summary.months_returned.join(", ")}:** ${summary.total}`,
+    ``,
+    `| Category | Count |`,
+    `|---|---|`,
+    ...catLines,
+    ``,
+    `**Recent incidents (sample):**`,
+    ...sampleLines,
+  ];
+  return [
+    {
+      title: `data.police.uk — crime stats near ${postcode} (${summary.months_returned.length} months)`,
+      url: `https://www.police.uk/pu/your-area/?q=${encodeURIComponent(postcode)}`,
+      content: lines.join("\n"),
+    },
+  ];
+}
+
+async function gatherCompaniesHouse(
+  env: Env,
+  c: SkillToolCall,
+  target: Target,
+): Promise<GatheredSource[]> {
+  const limit = Math.max(1, Math.min(50, Number(c.params["Limit"] ?? 10) || 10));
+  let query = target.name;
+  let postcode: string | undefined;
+  if (c.op === "by-postcode") {
+    postcode = (c.params["Postcode"] ?? target.name).trim();
+    query = postcode;
+  }
+  const hits = await companiesHouseSearch(env.CH_API_KEY, query, { limit, postcode });
+  if (hits.length === 0) return [];
+  const lines = [
+    `| Name | Number | Status | Type | Incorporated | Address |`,
+    `|---|---|---|---|---|---|`,
+    ...hits.map(
+      (h) =>
+        `| ${h.name} | ${h.number} | ${h.status} | ${h.type} | ${h.incorporated ?? "?"} | ${h.address} |`,
+    ),
+  ];
+  const opLabel =
+    c.op === "by-postcode" ? `companies at postcode ${postcode}` : `search "${query}"`;
+  const searchUrl =
+    c.op === "by-postcode"
+      ? `https://find-and-update.company-information.service.gov.uk/advanced-search/get-results?registeredOfficeAddress=${encodeURIComponent(postcode ?? "")}`
+      : `https://find-and-update.company-information.service.gov.uk/search/companies?q=${encodeURIComponent(query)}`;
+  return [
+    {
+      title: `Companies House — ${opLabel} (${hits.length} hits)`,
+      url: searchUrl,
+      content: lines.join("\n"),
+    },
+  ];
 }
 
 /** Step 4: recall similar past reports across the whole memory. Same-target
@@ -753,20 +1053,30 @@ ${sourceBlock}
 ${priorBlock}
 ${relatedBlock}
 
-Now write the report. Follow the output structure defined in the skill. End with a "Sources" section listing the URLs you actually used (cite by [n] in the body where you draw from a source). Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
+Now write the report. Follow the output structure defined in the skill. Cite sources inline by [n] (matching the numbered sources above) wherever you draw from a source. Do NOT write a "Sources" section at the end — the report page renders a canonical numbered source list automatically. Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
 
-  const res: any = await env.AI.run(model, {
+  const res = await runChat(env, model, {
     messages: [
       {
         role: "system",
-        content: `You are a research agent that writes precise, scannable markdown reports. Tone: editorial, calm, intellectually honest. No hype, no filler phrases ("rich history", "fascinating place", "in conclusion"). Cite sources by [number]. Sentence case headings. Aim for ~500 words.`,
+        content: `You are a research agent that writes precise, scannable markdown reports.
+
+Tone: editorial, calm, intellectually honest. No hype, no filler phrases ("rich history", "fascinating place", "in conclusion"). Aim for ~500 words.
+
+Markdown formatting rules (follow strictly — the rendering engine depends on them):
+- Do NOT write a top-level \`# Title\` heading at the start. The report title is rendered separately above the body. Start directly with your first section.
+- Each section heading from the skill's Output structure MUST be written as a level-2 markdown heading: \`## Section name\` on its own line, sentence case, no trailing colon, no bold markers around the heading text.
+- Within a section, individual stories/items can use a bold lead-in followed by the body in the same paragraph: \`**Lead-in sentence.** body sentence body sentence.\`
+- Use \`---\` on its own line ONLY between major sections you want visually separated. Don't sprinkle them.
+- Cite sources inline by [number] matching the gathered web sources. Citations like [3], [8,10], [3-5] are all fine.
+- Do NOT write your own "Sources" / "References" / "Citations" section — the page renders one automatically.`,
       },
       { role: "user", content: userMsg },
     ],
-    max_tokens: 1200,
+    max_tokens: 2200,
   });
 
-  const body = String(res.response ?? "").trim();
+  const body = res.response.trim();
   if (!body || body.length < 80) throw new Error("LLM returned empty or too-short report");
 
   // The title is the target name + skill name, dated. We don't ask the LLM
@@ -784,23 +1094,30 @@ export async function runResearch(
   skill: Skill,
   triggeredBy: "cron" | "manual",
 ): Promise<Report> {
-  await checkBudget(env, "reports");
-
+  // Generate runId BEFORE the try block so the catch can always write a row,
+  // even if pre-flight checks (budget / model resolution) throw.
   const runId = uid();
   const t0 = Date.now();
-
-  // Resolve the chat model ONCE at the start so every step of this run uses
-  // the same model and the persisted report records exactly that model.
-  const chatModel = await getChatModel(env);
+  let chatModel = "";
 
   try {
-    const toolCfg = parseSkillTools(skill.procedure_md);
-    // Skip query planning entirely in extract mode — sources are explicit.
-    const queries =
-      toolCfg.op === "extract" && toolCfg.sources?.length
-        ? []
-        : (await planResearch(env, skill, target, chatModel)).queries;
-    const sources = await gatherSources(env, queries, toolCfg);
+    await checkBudget(env, "reports");
+
+    // Resolve the chat model ONCE at the start so every step of this run uses
+    // the same model and the persisted report records exactly that model.
+    chatModel = await getChatModel(env);
+
+    const calls = parseSkillTools(skill.procedure_md);
+    // Only Tavily search needs LLM-planned queries. Tavily extract uses
+    // explicit URLs; typed tools (Land Registry, ONS, Police, Companies
+    // House) derive their inputs from the target.
+    const needsQueries = calls.some(
+      (c) => c.tool === "tavily" && c.op === "search",
+    );
+    const queries = needsQueries
+      ? (await planResearch(env, skill, target, chatModel)).queries
+      : [];
+    const sources = await gatherSources(env, queries, target, calls);
     const { priorOnTarget, relatedAcrossTargets } = await recallMemory(env, target, skill);
 
     const { title, body } = await writeReport(

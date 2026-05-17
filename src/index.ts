@@ -53,7 +53,7 @@ const SECURITY_HEADERS: Record<string, string> = {
     "img-src 'self' data:",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
-    "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com",
+    "script-src 'self' 'unsafe-inline'",
     "connect-src 'self'",
     "frame-ancestors 'none'",
     "base-uri 'self'",
@@ -184,6 +184,19 @@ export default {
     const path = url.pathname;
 
     try {
+      // ─── Static assets (served from R2 watchomacho-reports/static/) ──────
+      // Versioned filenames are immutable: bump the filename version to bust
+      // the edge cache.
+      if (path === "/static/tailwind.v1.css" && (req.method === "GET" || req.method === "HEAD")) {
+        const obj = await env.REPORTS.get("static/tailwind.v1.css");
+        if (!obj) return new Response("Not found", { status: 404 });
+        const headers = {
+          "content-type": "text/css; charset=utf-8",
+          "cache-control": "public, max-age=31536000, immutable",
+        };
+        return new Response(req.method === "HEAD" ? null : obj.body, { headers });
+      }
+
       // ─── Public ──────────────────────────────────────────────────────────
       if (path === "/" && req.method === "GET") {
         return html(await renderHome(env));
@@ -281,7 +294,8 @@ export default {
         if (!validSlug(slug)) {
           return new Response("Bad slug", withSecurityHeaders({ status: 400 }));
         }
-        return html(await renderAdminTargetEdit(env, slug));
+        const queued = url.searchParams.get("queued") === "1";
+        return html(await renderAdminTargetEdit(env, slug, queued));
       }
 
       // Targets: create / update / delete
@@ -432,6 +446,10 @@ export default {
           allowed_chat_models: ALLOWED_CHAT_MODELS,
           usage,
           tavily_api_key_set: !!env.TAVILY_API_KEY,
+          ch_api_key_set: !!env.CH_API_KEY,
+          anthropic_api_key_set: !!env.ANTHROPIC_API_KEY,
+          cf_aig_token_set: !!env.CF_AIG_TOKEN,
+          ai_gateway_configured: !!(env.AI_GATEWAY_ACCOUNT_ID && env.AI_GATEWAY_NAME),
         });
       }
 

@@ -325,6 +325,26 @@ footer p.tiny { font-size: 11px; color: rgba(107,107,107,0.7); margin-top: 6px; 
   margin: 16px 0;
   font-style: italic;
 }
+.prose .cite {
+  font-size: 11px;
+  color: var(--zee-muted);
+  font-weight: 500;
+  vertical-align: super;
+  line-height: 0;
+  margin: 0 1px;
+  letter-spacing: 0;
+}
+.prose .cite a {
+  color: inherit;
+  border-bottom: none;
+  text-decoration: none;
+}
+.prose .cite a:hover { color: var(--zee-primary); }
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--zee-border);
+  margin: 28px 0;
+}
 
 /* badge */
 .badge {
@@ -391,6 +411,24 @@ function timeUntil(ts: number): string {
 
 /** Minimal, safe markdown → HTML. Supports h1/h2/h3, paragraphs, links,
  *  bold, italic, inline code, lists. No HTML injection. */
+/** Collapse markdown source into plain text for snippets / list previews. */
+function stripMarkdown(s: string): string {
+  return s
+    .replace(/^#{1,6}\s+/gm, "")                     // heading hashes
+    .replace(/\*\*([^*]+)\*\*/g, "$1")               // bold
+    .replace(/__([^_]+)__/g, "$1")                   // alt bold
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1$2")       // italic
+    .replace(/(^|[^_])_([^_\n]+)_/g, "$1$2")         // alt italic
+    .replace(/`([^`]+)`/g, "$1")                     // inline code
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")         // markdown links → text
+    .replace(/\[\d+(?:[,\-–]\d+)*\]/g, "")           // citation markers [n] / [n,m] / [n-m]
+    .replace(/^[-*]\s+/gm, "")                       // list bullets
+    .replace(/^>\s?/gm, "")                          // blockquote
+    .replace(/^[-=]{3,}\s*$/gm, "")                  // horizontal rules
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function renderMarkdown(md: string): string {
   const lines = md.replace(/\r\n/g, "\n").split("\n");
   let html = "";
@@ -419,6 +457,14 @@ function renderMarkdown(md: string): string {
       const safe = /^(https?:\/\/|\/)/.test(url) ? url : "#";
       const ext = safe.startsWith("http") ? ' target="_blank" rel="noopener"' : "";
       return `<a href="${escapeHtml(safe)}"${ext}>${text}</a>`;
+    });
+    // Numeric citation markers like [1], [2], [8,10], [3-5] — render as
+    // small superscripts that link to the corresponding source in the
+    // canonical Sources footer (id="source-N"). aria-hidden makes screen
+    // readers and TTS skip them entirely.
+    r = r.replace(/\[(\d+(?:[,\-–]\d+)*)\]/g, (_m, group) => {
+      const first = String(group).split(/[,\-–]/)[0];
+      return `<sup class="cite" aria-hidden="true"><a href="#source-${first}">[${group}]</a></sup>`;
     });
     return r;
   };
@@ -478,30 +524,7 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  // Extend Tailwind with the same design tokens already used by the
-  // hand-rolled CSS in BASE_CSS, so utility classes like text-zee-primary
-  // resolve to identical pixel values. No design change.
-  tailwind.config = {
-    theme: {
-      extend: {
-        colors: {
-          'zee-bg':      '#FAF8F4',
-          'zee-cream':   '#FAF8F4',
-          'zee-text':    '#1A1A1A',
-          'zee-primary': '#1A6B62',
-          'zee-muted':   '#6B6B6B',
-          'zee-gold':    '#C49A1A',
-          'zee-border':  '#E8E4DE',
-        },
-        fontFamily: {
-          sans: ['"DM Sans"', 'system-ui', 'sans-serif'],
-        },
-      },
-    },
-  };
-</script>
+<link rel="stylesheet" href="/static/tailwind.v1.css">
 </head>
 <body>
 <header class="site-header">
@@ -569,7 +592,7 @@ export async function renderHome(env: Env): Promise<string> {
           <p class="label">Latest <span class="ml-1.5 font-normal normal-case tracking-normal text-[rgba(107,107,107,0.6)]">· ${escapeHtml(timeAgo(top.latest.created_at))}</span></p>
           <a href="/target/${escapeHtml(top.target.slug)}" class="block mt-3.5">
             <h1 class="headline">${escapeHtml(top.target.name)}</h1>
-            <p class="subhead">${escapeHtml(top.latest.snippet)}</p>
+            <p class="subhead">${escapeHtml(stripMarkdown(top.latest.snippet))}</p>
             <p class="mt-5 text-sm font-medium text-zee-primary">Open the target page <span aria-hidden="true">→</span></p>
           </a>
         </section>
@@ -669,7 +692,7 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
           <div class="piece-row">
             <div class="flex-1 min-w-0">
               <p class="piece-title">${escapeHtml(r.title)} <span class="piece-arrow" aria-hidden="true">→</span></p>
-              <p class="piece-meta">${escapeHtml(r.snippet)}</p>
+              <p class="piece-meta">${escapeHtml(stripMarkdown(r.snippet))}</p>
               ${r.chat_model ? `<p class="piece-meta mt-1.5 text-[11px]">model: <span class="text-zee-text">${escapeHtml(chatModelShortLabel(r.chat_model))}</span></p>` : ""}
             </div>
             <span class="piece-date tt">${escapeHtml(formatDate(r.created_at))}</span>
@@ -755,9 +778,13 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
     ? await env.DB.prepare("SELECT slug, name FROM skills WHERE id = ?").bind(report.skill_id).first<{ slug: string; name: string }>()
     : null;
 
-  // Strip leading H1 (we render title in our own header).
-  const bodyMd = md.replace(/^# .+\n+/, "");
+  // Strip leading H1 (we render title in our own header) AND any trailing
+  // Sources / References / Citations section the LLM may have written —
+  // we render the canonical numbered list ourselves from sources_json so
+  // anything the LLM wrote is duplicate at best, truncated at worst.
+  const bodyMd = stripTrailingSourcesSection(md.replace(/^# .+\n+/, ""));
   const html = renderMarkdown(bodyMd);
+  const sourcesHtml = renderSourcesSection(report.sources_json);
 
   const body = `
     <section class="pt-8 pb-4">
@@ -772,8 +799,68 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
     </section>
     <div class="divider"></div>
     <article class="prose py-8">${html}</article>
+    ${sourcesHtml}
   `;
   return shell(`${report.title} — WatchOMacho`, body);
+}
+
+/** Strip a trailing Sources / References / Citations section from the report
+ *  markdown. The canonical list is rendered from sources_json instead, so
+ *  anything the writer wrote is duplicate. Conservative — only matches a
+ *  Sources-style heading near the end of the document. */
+function stripTrailingSourcesSection(md: string): string {
+  return md
+    .replace(
+      /\n\s*(?:#{1,4}\s+|\*\*)?(?:Sources?|References|Citations)\s*:?\s*(?:\*\*)?\s*\n[\s\S]*$/i,
+      "",
+    )
+    .replace(/\n\s*-{3,}\s*$/, "")     // strip a trailing horizontal rule too
+    .trimEnd();
+}
+
+/** Render the gathered source list as a numbered, clickable footer.
+ *  Citation `[N]` in the body always maps to source `N` here, regardless of
+ *  whether the writer LLM ran out of tokens. */
+function renderSourcesSection(sourcesJson: string | null): string {
+  if (!sourcesJson) return "";
+  let sources: Array<{ title: string; url: string }> = [];
+  try {
+    const parsed = JSON.parse(sourcesJson);
+    if (Array.isArray(parsed)) {
+      sources = parsed.filter(
+        (s): s is { title: string; url: string } =>
+          s && typeof s.url === "string" && s.url.length > 0,
+      );
+    }
+  } catch {
+    return "";
+  }
+  if (sources.length === 0) return "";
+
+  const items = sources
+    .map((s, i) => {
+      const n = i + 1;
+      const title = String(s.title ?? "").trim() || s.url;
+      let host = "";
+      try {
+        host = new URL(s.url).hostname.replace(/^www\./, "");
+      } catch {
+        // Bad URL — skip the hostname line; the title link still works.
+      }
+      return `<li id="source-${n}" class="mb-3 leading-snug scroll-mt-20">
+        <span class="font-mono text-zee-muted mr-2 text-[13px]">[${n}]</span>
+        <a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" class="text-zee-primary hover:underline">${escapeHtml(title)}</a>
+        ${host ? `<span class="text-zee-muted text-[12px] ml-2">${escapeHtml(host)}</span>` : ""}
+      </li>`;
+    })
+    .join("");
+
+  return `
+    <section class="pt-6 pb-8 border-t border-zee-border">
+      <h2 class="text-[15px] uppercase tracking-wider text-zee-muted mb-4">Sources</h2>
+      <ol class="list-none p-0 m-0">${items}</ol>
+    </section>
+  `;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1046,7 +1133,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the procedure document for you, including optional <a href="/admin/tools" class="text-zee-primary">Tavily headers</a> (search topic, time range, depth, or extract URLs) when the brief implies them.</p>
+      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the procedure document for you and pick which <a href="/admin/tools" class="text-zee-primary">tools</a> to use (Tavily web search, HM Land Registry sold prices, ONS postcode context, data.police.uk crime stats, Companies House) based on what the brief implies.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="synthesize">
         <div class="field">
@@ -1063,7 +1150,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Write a skill by hand</h3></div>
-      <p class="field-help mb-3">Optional Tavily headers you can declare in the markdown (all defaults are sensible): <code>**Tavily op:** search|extract</code>, <code>**Search topic:** general|news|finance</code>, <code>**Time range:** day|week|month|year</code>, <code>**Depth:** basic|advanced</code>. Full catalog: <a href="/admin/tools" class="text-zee-primary">/admin/tools</a>.</p>
+      <p class="field-help mb-3">Optional tool headers you can declare in the markdown (all defaults are sensible). A skill may declare one or more tools (one of each): <code>**Tavily op:** search|extract</code>, <code>**Land Registry op:** sold-prices</code>, <code>**ONS op:** context</code>, <code>**Police op:** crimes</code>, <code>**Companies House op:** search|by-postcode</code>. Per-tool params (e.g. <code>**Months:** 6</code>, <code>**Search topic:** news</code>) live underneath. Full catalog with every header: <a href="/admin/tools" class="text-zee-primary">/admin/tools</a>.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="write">
         <div class="field">
@@ -1098,7 +1185,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 // Admin: target edit page
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function renderAdminTargetEdit(env: Env, slug: string): Promise<string> {
+export async function renderAdminTargetEdit(env: Env, slug: string, queued = false): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
     return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { adminFooter: true });
@@ -1159,9 +1246,17 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
       </div>
     </section>
 
+    ${queued ? `
+    <div class="card" style="border-color:#1A6B62;background:rgba(26,107,98,0.06);">
+      <p class="text-zee-primary text-sm m-0">
+        <strong>Run queued.</strong> Reports take ~20–30 seconds to complete. Refresh this page in 30 seconds to see the new entry in <em>Reports</em> and <em>Run history</em>. If nothing appears after a minute, check the Worker logs or the AI Gateway dashboard for errors.
+      </p>
+    </div>
+    ` : ""}
+
     <div class="card">
       <div class="h3-row"><h3>Configure</h3></div>
-      <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
+      <form id="update-target-form" method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
         <div class="field">
           <label>Kind</label>
           <input name="kind" value="${escapeHtml(target.kind ?? "")}">
@@ -1188,16 +1283,17 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
-        <div class="row gap-3 mt-4">
-          <button class="btn" type="submit">Save</button>
-          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/run" class="inline">
-            <button class="btn btn-secondary" type="submit"${target.primary_skill_id ? "" : " disabled"}>Run now</button>
-          </form>
-          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this target and all its reports?')">
-            <button class="btn btn-danger" type="submit">Delete target</button>
-          </form>
-        </div>
       </form>
+
+      <div class="row gap-3 mt-4 items-center">
+        <button class="btn" type="submit" form="update-target-form">Save</button>
+        <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/run" class="inline">
+          <button class="btn btn-secondary" type="submit"${target.primary_skill_id ? "" : " disabled"}>Run now</button>
+        </form>
+        <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this target and all its reports?')">
+          <button class="btn btn-danger" type="submit">Delete target</button>
+        </form>
+      </div>
     </div>
 
     <div class="card">
@@ -1220,19 +1316,32 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function renderAdminTools(): string {
-  const rows = Object.values(TOOLS).map((tool) => {
-    const opRows = Object.entries(tool.operations).map(([opName, opDesc]) => `
+  const cards = Object.values(TOOLS).map((tool) => {
+    const opRows = Object.entries(tool.operations).map(([opName, op]) => `
       <tr>
         <td class="whitespace-nowrap align-top pr-3 py-2 font-mono text-[13px] text-zee-primary">${escapeHtml(tool.slug)} (${escapeHtml(opName)})</td>
-        <td class="align-top py-2 text-sm text-zee-text">${escapeHtml(opDesc)}</td>
+        <td class="align-top py-2 text-sm text-zee-text">
+          <div>${escapeHtml(op.description)}</div>
+          <div class="field-help mt-1"><em>When to use:</em> ${escapeHtml(op.when_to_use)}</div>
+        </td>
       </tr>
     `).join("");
+
+    const headerRows = tool.headers.map((h) => `
+      <tr>
+        <td class="whitespace-nowrap align-top pr-3 py-1 font-mono text-[13px] text-zee-primary">**${escapeHtml(h.key)}:**</td>
+        <td class="align-top py-1 text-sm text-zee-text">${escapeHtml(h.values)}</td>
+      </tr>
+    `).join("");
+
     return `
       <div class="card">
         <div class="h3-row"><h3>${escapeHtml(tool.display)}</h3></div>
-        <p class="field-help mb-3"><strong>When to use search:</strong> ${escapeHtml(tool.when_to_use_search)}</p>
-        <p class="field-help mb-4"><strong>When to use extract:</strong> ${escapeHtml(tool.when_to_use_extract)}</p>
+        <p class="field-help mb-3">${escapeHtml(tool.summary)}</p>
+        <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-2 mb-1">Operations</h4>
         <table class="w-full border-collapse"><tbody>${opRows}</tbody></table>
+        <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-4 mb-1">Skill markdown headers</h4>
+        <table class="w-full border-collapse"><tbody>${headerRows}</tbody></table>
       </div>
     `;
   }).join("");
@@ -1241,26 +1350,10 @@ export function renderAdminTools(): string {
     <section class="pt-6 pb-2">
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Tools.</h1>
-      <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
+      <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. A skill may declare one or more tools (one of each) via headers in its procedure markdown. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
     </section>
 
-    ${rows}
-
-    <div class="card">
-      <div class="h3-row"><h3>Skill markdown headers</h3></div>
-      <p class="field-help mb-2">Any skill can declare these optional headers in its procedure markdown. Sensible defaults if omitted (search mode, basic depth, general topic, any time range).</p>
-      <pre class="px-3.5 py-3 rounded-md overflow-x-auto font-mono text-[13px] leading-relaxed text-zee-text bg-[rgba(232,228,222,0.4)]">**Tavily op:** search          (default)
-                OR
-               extract            (forces URL-based mode)
-
-**Sources:**                     (only used with extract op)
-- https://feeds.bbci.co.uk/news/world/rss.xml
-- https://rss.cnn.com/rss/edition_world.rss
-
-**Search topic:** general | news | finance     (default: general)
-**Time range:**   day | week | month | year     (default: any)
-**Depth:**        basic | advanced              (default: basic)</pre>
-    </div>
+    ${cards}
   `;
   return shell("Tools · WatchOMacho", body, { activeNav: "tools", adminFooter: true });
 }

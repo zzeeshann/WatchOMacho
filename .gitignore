@@ -5,3 +5,6 @@ dist/
 .DS_Store
 *.log
 .claude/
+
+# Built Tailwind bundle — lives in R2 (watchomacho-reports/static/tailwind.vN.css)
+tailwind.css
