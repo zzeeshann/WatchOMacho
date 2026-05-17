@@ -74,7 +74,7 @@ export const CHAT_MODEL_LABELS: Record<string, string> = {
   "anthropic/claude-haiku-4-5-20251001": "Claude Haiku 4.5 (AI Gateway) — paid, ~$0.01/report, no Workers AI quota",
 };
 
-export const DEFAULT_CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+export const DEFAULT_CHAT_MODEL = "anthropic/claude-haiku-4-5-20251001";
 
 export function isAllowedChatModel(m: string): boolean {
   return (ALLOWED_CHAT_MODELS as readonly string[]).includes(m);
@@ -846,11 +846,18 @@ async function gatherTavily(
   );
   await bumpUsage(env, "searches", queries.length);
 
+  // Drop low-relevance results before they reach the writer. Tavily's
+  // `news` topic isn't perfectly strict — off-topic hits (Facebook posts,
+  // local feel-good stories, etc.) slip through with score < ~0.4. Reuters
+  // / AP / BBC primary reporting on the actual query typically scores 0.7+.
+  const MIN_SCORE = 0.4;
+
   const seen = new Set<string>();
   const flat: GatheredSource[] = [];
   for (const list of results) {
     for (const r of list) {
       if (!r.url || seen.has(r.url)) continue;
+      if (r.score < MIN_SCORE) continue;
       seen.add(r.url);
       flat.push({ title: r.title, url: r.url, content: r.content });
     }
