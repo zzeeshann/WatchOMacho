@@ -1023,7 +1023,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the procedure document for you, including optional <a href="/admin/tools" class="text-zee-primary">Tavily headers</a> (search topic, time range, depth, or extract URLs) when the brief implies them.</p>
+      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the procedure document for you and pick which <a href="/admin/tools" class="text-zee-primary">tools</a> to use (Tavily web search, HM Land Registry sold prices, ONS postcode context, data.police.uk crime stats, Companies House) based on what the brief implies.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="synthesize">
         <div class="field">
@@ -1040,7 +1040,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Write a skill by hand</h3></div>
-      <p class="field-help mb-3">Optional Tavily headers you can declare in the markdown (all defaults are sensible): <code>**Tavily op:** search|extract</code>, <code>**Search topic:** general|news|finance</code>, <code>**Time range:** day|week|month|year</code>, <code>**Depth:** basic|advanced</code>. Full catalog: <a href="/admin/tools" class="text-zee-primary">/admin/tools</a>.</p>
+      <p class="field-help mb-3">Optional tool headers you can declare in the markdown (all defaults are sensible). A skill may declare one or more tools (one of each): <code>**Tavily op:** search|extract</code>, <code>**Land Registry op:** sold-prices</code>, <code>**ONS op:** context</code>, <code>**Police op:** crimes</code>, <code>**Companies House op:** search|by-postcode</code>. Per-tool params (e.g. <code>**Months:** 6</code>, <code>**Search topic:** news</code>) live underneath. Full catalog with every header: <a href="/admin/tools" class="text-zee-primary">/admin/tools</a>.</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="write">
         <div class="field">

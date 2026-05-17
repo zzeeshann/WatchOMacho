@@ -446,6 +446,9 @@ export default {
           usage,
           tavily_api_key_set: !!env.TAVILY_API_KEY,
           ch_api_key_set: !!env.CH_API_KEY,
+          anthropic_api_key_set: !!env.ANTHROPIC_API_KEY,
+          cf_aig_token_set: !!env.CF_AIG_TOKEN,
+          ai_gateway_configured: !!(env.AI_GATEWAY_ACCOUNT_ID && env.AI_GATEWAY_NAME),
         });
       }
 

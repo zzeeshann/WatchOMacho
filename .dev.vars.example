@@ -4,3 +4,25 @@ TAVILY_API_KEY=tvly-...
 # Optional — only needed if any skill calls the companies_house tool.
 # Register for a free key at developer.company-information.service.gov.uk.
 CH_API_KEY=
+
+# Optional — AI Gateway path for paid chat models (Claude Haiku 4.5 etc).
+# Lets you bypass the Workers AI 10k neurons/day pool entirely.
+# 1. Create a gateway in Cloudflare dashboard → AI → AI Gateway
+# 2. Account ID is the hex string visible in any wrangler dashboard URL
+AI_GATEWAY_ACCOUNT_ID=
+AI_GATEWAY_NAME=
+
+# Pick ONE of the two auth modes below.
+#
+# Mode A (RECOMMENDED) — Cloudflare Unified Billing.
+#   No Anthropic account needed. You load credits into your Cloudflare
+#   account (dashboard → AI Gateway → Billing) and Cloudflare bills you.
+#   Single invoice, all usage visible in the AI Gateway dashboard.
+#   Auth = a Cloudflare API token scoped with "AI Gateway: Run".
+#   Create at: dash.cloudflare.com/profile/api-tokens
+CF_AIG_TOKEN=
+
+# Mode B (alternative) — Bring Your Own Anthropic Key.
+#   You sign up at console.anthropic.com, get a key, pay Anthropic directly.
+#   Set this OR CF_AIG_TOKEN, not both.
+ANTHROPIC_API_KEY=

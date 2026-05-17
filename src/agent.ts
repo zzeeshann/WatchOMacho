@@ -27,7 +27,16 @@ export interface Env {
   MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
   TAVILY_API_KEY?: string;
-  CH_API_KEY?: string;          // Companies House developer API key (optional)
+  CH_API_KEY?: string;                 // Companies House developer API key (optional)
+  // ─── AI Gateway (optional; enables `anthropic/...` chat models) ──────────
+  AI_GATEWAY_ACCOUNT_ID?: string;      // Cloudflare account ID (visible in any dashboard URL)
+  AI_GATEWAY_NAME?: string;            // The gateway name you created in CF dashboard
+  // Auth: pick ONE of the two below.
+  // Preferred: CF_AIG_TOKEN  — Cloudflare API token, billed via Cloudflare
+  //                            (Unified Billing — single invoice, no Anthropic account)
+  // Fallback: ANTHROPIC_API_KEY — your own Anthropic console key, billed by Anthropic
+  CF_AIG_TOKEN?: string;
+  ANTHROPIC_API_KEY?: string;
 }
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -40,6 +49,7 @@ const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
 // production.
 
 export const ALLOWED_CHAT_MODELS = [
+  // ─── Cloudflare Workers AI (free 10k neurons/day, shared across all models) ─
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   "@cf/mistralai/mistral-small-3.1-24b-instruct",
   "@cf/qwen/qwen2.5-coder-32b-instruct",
@@ -48,17 +58,20 @@ export const ALLOWED_CHAT_MODELS = [
   "@cf/meta/llama-3.1-8b-instruct-fast",
   "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
   "@cf/qwen/qwq-32b",
+  // ─── AI Gateway → Anthropic (pay-per-token, bypasses Workers AI quota) ─────
+  "anthropic/claude-haiku-4-5-20251001",
 ] as const;
 
 export const CHAT_MODEL_LABELS: Record<string, string> = {
-  "@cf/meta/llama-3.3-70b-instruct-fp8-fast": "Llama 3.3 70B (fast) — strongest, tightest free cap",
-  "@cf/mistralai/mistral-small-3.1-24b-instruct": "Mistral Small 3.1 (24B) — strong, looser cap",
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast": "Llama 3.3 70B (fast) — ~28 reports/day on free pool",
+  "@cf/mistralai/mistral-small-3.1-24b-instruct": "Mistral Small 3.1 (24B) — ~43 reports/day on free pool",
   "@cf/qwen/qwen2.5-coder-32b-instruct": "Qwen 2.5 Coder (32B) — best for structured output",
-  "@cf/meta/llama-4-scout-17b-16e-instruct": "Llama 4 Scout (17B MoE) — newest, fast",
-  "@cf/google/gemma-3-12b-it": "Gemma 3 (12B) — Google's reliable mid-size",
-  "@cf/meta/llama-3.1-8b-instruct-fast": "Llama 3.1 8B (fast) — cheapest, most generous cap",
+  "@cf/meta/llama-4-scout-17b-16e-instruct": "Llama 4 Scout (17B MoE) — ~47 reports/day on free pool",
+  "@cf/google/gemma-3-12b-it": "Gemma 3 (12B) — ~44 reports/day on free pool",
+  "@cf/meta/llama-3.1-8b-instruct-fast": "Llama 3.1 8B (fast) — ~100 reports/day on free pool",
   "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b": "DeepSeek R1 Distill (32B) — reasoning",
   "@cf/qwen/qwq-32b": "Qwen QwQ (32B) — reasoning",
+  "anthropic/claude-haiku-4-5-20251001": "Claude Haiku 4.5 (AI Gateway) — paid, ~$0.01/report, no Workers AI quota",
 };
 
 export const DEFAULT_CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -72,6 +85,112 @@ export function isAllowedChatModel(m: string): boolean {
 export async function getChatModel(env: Env): Promise<string> {
   const val = await getSetting(env, "chat_model", DEFAULT_CHAT_MODEL);
   return isAllowedChatModel(val) ? val : DEFAULT_CHAT_MODEL;
+}
+
+// ─── chat dispatcher ──────────────────────────────────────────────────────
+//
+// Single chat entry point. Routes by model prefix:
+//   "@cf/..."         → Cloudflare Workers AI via env.AI.run
+//   "anthropic/..."   → Anthropic Messages API via Cloudflare AI Gateway
+//
+// Returns a uniform { response: string } so call sites stay identical
+// regardless of provider. Embedding calls (EMBED_MODEL) keep using
+// env.AI.run directly — they're not chat.
+
+interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+interface RunChatInput {
+  messages: ChatMessage[];
+  max_tokens?: number;
+}
+
+interface RunChatOutput {
+  response: string;
+}
+
+async function runChat(env: Env, model: string, input: RunChatInput): Promise<RunChatOutput> {
+  if (model.startsWith("@cf/")) {
+    const res: any = await env.AI.run(model, {
+      messages: input.messages,
+      max_tokens: input.max_tokens,
+    });
+    return { response: String(res.response ?? "") };
+  }
+
+  if (model.startsWith("anthropic/")) {
+    return runAnthropicChat(env, model.slice("anthropic/".length), input);
+  }
+
+  throw new Error(`Unknown chat model prefix: ${model}`);
+}
+
+async function runAnthropicChat(
+  env: Env,
+  anthropicModel: string,
+  input: RunChatInput,
+): Promise<RunChatOutput> {
+  if (!env.AI_GATEWAY_ACCOUNT_ID || !env.AI_GATEWAY_NAME) {
+    throw new Error(
+      "AI_GATEWAY_ACCOUNT_ID + AI_GATEWAY_NAME secrets required for anthropic/... models",
+    );
+  }
+  if (!env.CF_AIG_TOKEN && !env.ANTHROPIC_API_KEY) {
+    throw new Error(
+      "Set either CF_AIG_TOKEN (Unified Billing, recommended) or ANTHROPIC_API_KEY",
+    );
+  }
+
+  // Anthropic puts system messages in a separate `system` field, not in
+  // messages. Combine all system messages into one string.
+  const systemParts: string[] = [];
+  const otherMsgs: ChatMessage[] = [];
+  for (const m of input.messages) {
+    if (m.role === "system") systemParts.push(m.content);
+    else otherMsgs.push(m);
+  }
+
+  const url = `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_NAME}/anthropic/v1/messages`;
+
+  // Auth: Unified Billing if CF_AIG_TOKEN is set (Cloudflare bills via your
+  // CF account credits); otherwise BYOK with your Anthropic console key.
+  // With Unified Billing, the `x-api-key` header must be omitted entirely —
+  // an empty value triggers Anthropic's pre-validation 401.
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "anthropic-version": "2023-06-01",
+  };
+  if (env.CF_AIG_TOKEN) {
+    headers["cf-aig-authorization"] = `Bearer ${env.CF_AIG_TOKEN}`;
+  } else {
+    headers["x-api-key"] = env.ANTHROPIC_API_KEY!;
+  }
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: anthropicModel,
+      max_tokens: input.max_tokens ?? 1024,
+      system: systemParts.length ? systemParts.join("\n\n") : undefined,
+      messages: otherMsgs.map((m) => ({ role: m.role, content: m.content })),
+    }),
+  });
+
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    throw new Error(`Anthropic ${r.status}: ${body.slice(0, 400)}`);
+  }
+
+  const data: any = await r.json();
+  // Anthropic returns content as an array of typed blocks; we expect one text block.
+  const text = (data.content ?? [])
+    .filter((b: any) => b?.type === "text")
+    .map((b: any) => String(b.text ?? ""))
+    .join("");
+  return { response: text };
 }
 
 // ─── basics ────────────────────────────────────────────────────────────────
@@ -423,14 +542,14 @@ export async function synthesizeSkill(
   const brief = input.brief.trim();
   if (!brief) throw new Error("brief required");
   const model = await getChatModel(env);
-  const res: any = await env.AI.run(model, {
+  const res = await runChat(env, model, {
     messages: [
       { role: "system", content: buildSkillTemplate() },
       { role: "user", content: `Skill brief: "${brief}"\n\nWrite the procedure document now.` },
     ],
     max_tokens: 900,
   });
-  const procedure_md = String(res.response ?? "").trim();
+  const procedure_md = res.response.trim();
   if (procedure_md.length < 60) throw new Error("LLM returned an empty / too-short skill document");
 
   // Pull a name out of the first H1 if the brief didn't supply one.
@@ -536,7 +655,7 @@ interface SourceCitation {
 /** Step 1: ask the LLM what to search for. Returns an array of queries with
  *  {target} placeholders already expanded. */
 async function planResearch(env: Env, skill: Skill, target: Target, model: string): Promise<ResearchPlan> {
-  const res: any = await env.AI.run(model, {
+  const res = await runChat(env, model, {
     messages: [
       {
         role: "system",
@@ -554,7 +673,7 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
     ],
     max_tokens: 400,
   });
-  const raw = String(res.response ?? "");
+  const raw = res.response;
   const m = raw.match(/\{[\s\S]*\}/);
   if (m) {
     try {
@@ -929,7 +1048,7 @@ ${relatedBlock}
 
 Now write the report. Follow the output structure defined in the skill. End with a "Sources" section listing the URLs you actually used (cite by [n] in the body where you draw from a source). Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
 
-  const res: any = await env.AI.run(model, {
+  const res = await runChat(env, model, {
     messages: [
       {
         role: "system",
@@ -940,7 +1059,7 @@ Now write the report. Follow the output structure defined in the skill. End with
     max_tokens: 1200,
   });
 
-  const body = String(res.response ?? "").trim();
+  const body = res.response.trim();
   if (!body || body.length < 80) throw new Error("LLM returned empty or too-short report");
 
   // The title is the target name + skill name, dated. We don't ask the LLM
