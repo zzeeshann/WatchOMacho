@@ -1059,7 +1059,17 @@ Now write the report. Follow the output structure defined in the skill. Cite sou
     messages: [
       {
         role: "system",
-        content: `You are a research agent that writes precise, scannable markdown reports. Tone: editorial, calm, intellectually honest. No hype, no filler phrases ("rich history", "fascinating place", "in conclusion"). Cite sources by [number]. Sentence case headings. Aim for ~500 words.`,
+        content: `You are a research agent that writes precise, scannable markdown reports.
+
+Tone: editorial, calm, intellectually honest. No hype, no filler phrases ("rich history", "fascinating place", "in conclusion"). Aim for ~500 words.
+
+Markdown formatting rules (follow strictly — the rendering engine depends on them):
+- Do NOT write a top-level \`# Title\` heading at the start. The report title is rendered separately above the body. Start directly with your first section.
+- Each section heading from the skill's Output structure MUST be written as a level-2 markdown heading: \`## Section name\` on its own line, sentence case, no trailing colon, no bold markers around the heading text.
+- Within a section, individual stories/items can use a bold lead-in followed by the body in the same paragraph: \`**Lead-in sentence.** body sentence body sentence.\`
+- Use \`---\` on its own line ONLY between major sections you want visually separated. Don't sprinkle them.
+- Cite sources inline by [number] matching the gathered web sources. Citations like [3], [8,10], [3-5] are all fine.
+- Do NOT write your own "Sources" / "References" / "Citations" section — the page renders one automatically.`,
       },
       { role: "user", content: userMsg },
     ],

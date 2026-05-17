@@ -325,6 +325,26 @@ footer p.tiny { font-size: 11px; color: rgba(107,107,107,0.7); margin-top: 6px; 
   margin: 16px 0;
   font-style: italic;
 }
+.prose .cite {
+  font-size: 11px;
+  color: var(--zee-muted);
+  font-weight: 500;
+  vertical-align: super;
+  line-height: 0;
+  margin: 0 1px;
+  letter-spacing: 0;
+}
+.prose .cite a {
+  color: inherit;
+  border-bottom: none;
+  text-decoration: none;
+}
+.prose .cite a:hover { color: var(--zee-primary); }
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--zee-border);
+  margin: 28px 0;
+}
 
 /* badge */
 .badge {
@@ -391,6 +411,24 @@ function timeUntil(ts: number): string {
 
 /** Minimal, safe markdown → HTML. Supports h1/h2/h3, paragraphs, links,
  *  bold, italic, inline code, lists. No HTML injection. */
+/** Collapse markdown source into plain text for snippets / list previews. */
+function stripMarkdown(s: string): string {
+  return s
+    .replace(/^#{1,6}\s+/gm, "")                     // heading hashes
+    .replace(/\*\*([^*]+)\*\*/g, "$1")               // bold
+    .replace(/__([^_]+)__/g, "$1")                   // alt bold
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1$2")       // italic
+    .replace(/(^|[^_])_([^_\n]+)_/g, "$1$2")         // alt italic
+    .replace(/`([^`]+)`/g, "$1")                     // inline code
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")         // markdown links → text
+    .replace(/\[\d+(?:[,\-–]\d+)*\]/g, "")           // citation markers [n] / [n,m] / [n-m]
+    .replace(/^[-*]\s+/gm, "")                       // list bullets
+    .replace(/^>\s?/gm, "")                          // blockquote
+    .replace(/^[-=]{3,}\s*$/gm, "")                  // horizontal rules
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function renderMarkdown(md: string): string {
   const lines = md.replace(/\r\n/g, "\n").split("\n");
   let html = "";
@@ -419,6 +457,14 @@ function renderMarkdown(md: string): string {
       const safe = /^(https?:\/\/|\/)/.test(url) ? url : "#";
       const ext = safe.startsWith("http") ? ' target="_blank" rel="noopener"' : "";
       return `<a href="${escapeHtml(safe)}"${ext}>${text}</a>`;
+    });
+    // Numeric citation markers like [1], [2], [8,10], [3-5] — render as
+    // small superscripts that link to the corresponding source in the
+    // canonical Sources footer (id="source-N"). aria-hidden makes screen
+    // readers and TTS skip them entirely.
+    r = r.replace(/\[(\d+(?:[,\-–]\d+)*)\]/g, (_m, group) => {
+      const first = String(group).split(/[,\-–]/)[0];
+      return `<sup class="cite" aria-hidden="true"><a href="#source-${first}">[${group}]</a></sup>`;
     });
     return r;
   };
@@ -546,7 +592,7 @@ export async function renderHome(env: Env): Promise<string> {
           <p class="label">Latest <span class="ml-1.5 font-normal normal-case tracking-normal text-[rgba(107,107,107,0.6)]">· ${escapeHtml(timeAgo(top.latest.created_at))}</span></p>
           <a href="/target/${escapeHtml(top.target.slug)}" class="block mt-3.5">
             <h1 class="headline">${escapeHtml(top.target.name)}</h1>
-            <p class="subhead">${escapeHtml(top.latest.snippet)}</p>
+            <p class="subhead">${escapeHtml(stripMarkdown(top.latest.snippet))}</p>
             <p class="mt-5 text-sm font-medium text-zee-primary">Open the target page <span aria-hidden="true">→</span></p>
           </a>
         </section>
@@ -646,7 +692,7 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
           <div class="piece-row">
             <div class="flex-1 min-w-0">
               <p class="piece-title">${escapeHtml(r.title)} <span class="piece-arrow" aria-hidden="true">→</span></p>
-              <p class="piece-meta">${escapeHtml(r.snippet)}</p>
+              <p class="piece-meta">${escapeHtml(stripMarkdown(r.snippet))}</p>
               ${r.chat_model ? `<p class="piece-meta mt-1.5 text-[11px]">model: <span class="text-zee-text">${escapeHtml(chatModelShortLabel(r.chat_model))}</span></p>` : ""}
             </div>
             <span class="piece-date tt">${escapeHtml(formatDate(r.created_at))}</span>
@@ -801,7 +847,7 @@ function renderSourcesSection(sourcesJson: string | null): string {
       } catch {
         // Bad URL — skip the hostname line; the title link still works.
       }
-      return `<li class="mb-3 leading-snug">
+      return `<li id="source-${n}" class="mb-3 leading-snug scroll-mt-20">
         <span class="font-mono text-zee-muted mr-2 text-[13px]">[${n}]</span>
         <a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" class="text-zee-primary hover:underline">${escapeHtml(title)}</a>
         ${host ? `<span class="text-zee-muted text-[12px] ml-2">${escapeHtml(host)}</span>` : ""}
