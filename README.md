@@ -2,7 +2,7 @@
 
 A research agent you give jobs to. You hand it a **target** (a postcode, a person, a company, a topic) and a **skill** (a reusable research procedure) — the agent applies the skill, writes a report, and keeps the target's page fresh on a cadence you set.
 
-Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. Web research via [Tavily](https://tavily.com) — one tool, two operations (search + extract).
+Built end-to-end on Cloudflare: Workers, Workers AI, Vectorize, R2, D1, Cron Triggers. The agent has five tools available — web search/extraction via [Tavily](https://tavily.com), plus four typed UK public-data tools (HM Land Registry sold prices, ONS / postcodes.io geography, data.police.uk crime stats, Companies House). A skill can declare one or more tools.
 
 > **New to the project?** Read [BOOK.md](BOOK.md) — a guided tour from "what is Cloudflare?" to "how the agent's research loop works", in 14 short chapters. No prior experience assumed.
 >
@@ -29,13 +29,13 @@ A **report** is what comes out when the agent runs a skill against a target. The
 
 For each `(target, skill)` execution:
 
-1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries. (Skipped if the skill declares `**Tavily op:** extract` with explicit URLs.)
-2. **Gather** — Tavily runs every query in parallel; each result already includes the page's extracted full content. For extract-mode skills, Tavily reads the listed URLs in full.
+1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries. (Skipped if the skill doesn't declare a Tavily search op — e.g. extract-mode or pure typed-tool skills.)
+2. **Gather** — the agent dispatches over the skill's declared tools in order. Tavily search/extract for web work; Land Registry / ONS / Police / Companies House for typed UK data. Structured tool output is flattened to markdown so the writer sees one consistent source format.
 3. **Recall** — Vectorize returns the most relevant past reports (so the new one *builds on* prior ones rather than repeating).
 4. **Write** — the LLM writes a ~500-word markdown report following the skill's output structure, citing sources by number.
 5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs`.
 
-Two LLM calls + N Tavily calls per run. Predictable cost, predictable structure.
+Two LLM calls + N tool calls per run. Predictable cost, predictable structure.
 
 ## Setup — about 10 minutes
 
@@ -79,10 +79,15 @@ echo "$SECRET"  # save it
 
 # Tavily API key (free at app.tavily.com)
 npx wrangler secret put TAVILY_API_KEY
-# paste your key when prompted
+
+# Optional — Companies House developer key (free, register at
+# developer.company-information.service.gov.uk). Only needed if you want
+# skills that call the companies_house tool. Without it, that one tool
+# short-circuits to no results; everything else keeps working.
+npx wrangler secret put CH_API_KEY
 ```
 
-Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes).
+Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes). Without `CH_API_KEY` only the Companies House tool is unavailable.
 
 ### 4. Deploy
 
@@ -99,6 +104,22 @@ If you set a custom-domain route in `wrangler.toml`, wrangler handles DNS + SSL 
 3. Open **Admin** → add a target (e.g. `SW1A 1AA`), attach the skill, tick *Run once immediately*.
 4. ~30 seconds later, the target's public page (`/target/sw1a-1aa`) shows the first report.
 5. Every cron tick after that, the agent re-runs the skill and appends an update.
+
+## The toolbox
+
+Five tools are wired in [src/apis.ts](src/apis.ts) and registered in the `TOOLS` const. The catalog is rendered live at `/admin/tools`. A skill declares which tools it uses via markdown headers in its `procedure_md`:
+
+| Tool | Operations | Inputs | Key needed? |
+| --- | --- | --- | --- |
+| **Tavily** | `search`, `extract` | keyword query / URL list | yes (free 1000/mo) |
+| **HM Land Registry** | `sold-prices` | UK postcode | no |
+| **ONS / postcodes.io** | `context` | UK postcode | no |
+| **data.police.uk** | `crimes` | UK postcode (England/Wales/NI) | no |
+| **Companies House** | `search`, `by-postcode` | name / UK postcode | yes (free) |
+
+A skill declares a tool with a header like `**Tavily op:** search` or `**Land Registry op:** sold-prices`. Per-tool optional headers (e.g. `**Months:** 6`, `**Search topic:** news`) live underneath. Multi-tool skills are normal — a "postcode dossier" skill might declare all five.
+
+Adding a new tool means: add a fetch function to `apis.ts`, add a `TOOLS` entry, add a dispatch case in `gatherSources` (in [src/agent.ts](src/agent.ts)). The synthesis prompt and `/admin/tools` page pick up the new entry automatically.
 
 ## Customising
 

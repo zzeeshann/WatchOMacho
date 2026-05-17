@@ -1,2 +1,6 @@
 ADMIN_SECRET=change-me-to-something-long-and-random
 TAVILY_API_KEY=tvly-...
+
+# Optional — only needed if any skill calls the companies_house tool.
+# Register for a free key at developer.company-information.service.gov.uk.
+CH_API_KEY=

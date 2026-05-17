@@ -179,7 +179,9 @@ One tool, two operations:
 
 We dedupe by URL, keep up to 20 results across all queries in a run, cap each page's content at 4000 chars, and feed them to the LLM as numbered citations. The LLM cites them as `[1]`, `[2]`, etc. in the body.
 
-**This is the only part of the agent that reaches outside Cloudflare.** One HTTP call per planned query (search mode) or one per batch of up to 20 URLs (extract mode). Everything else stays in-platform.
+**Tavily is the agent's general-purpose eyes.** One HTTP call per planned query (search mode) or one per batch of up to 20 URLs (extract mode). For most research targets this is enough — Tavily can find anything addressable from the open web.
+
+> **Sidebar: typed UK tools (post-Level-3 addition, 2026-05-17).** Tavily isn't the *only* outside-world tool any more. Four UK public-data tools sit alongside it: HM Land Registry sold prices (postcode → property transactions), ONS / postcodes.io (postcode → administrative geography), data.police.uk (postcode → crime stats), and Companies House (name or postcode → companies). They're free, mostly keyless, and each returns structured rows that we flatten to a markdown table for the writer LLM. A skill declares which it wants via headers (`**Land Registry op:** sold-prices` etc.) and `gatherSources` dispatches over the list. See Chapter 9 for the full tool catalog.
 
 ---
 
@@ -337,28 +339,32 @@ The target accumulates reports over time. After a month you have ~30 reports tra
 
 Four source files, all in [src/](src/).
 
-### `src/apis.ts` — external sources (~130 lines)
+### `src/apis.ts` — external sources (~540 lines)
 
-The agent's only external dependency. Two functions plus a tools registry:
+The agent's outside-world layer. Five tool integrations plus a generalised `TOOLS` registry:
 
-- **`tavilySearch(apiKey, query, options)`** — the workhorse. Single web search via Tavily's `/search`. Each result already includes the page's extracted full content. Optional `topic` / `time_range` / `search_depth` / `max_results`. Gracefully no-ops if the API key isn't configured.
-- **`tavilyExtract(apiKey, urls, depth)`** — read a list of specific URLs in full via Tavily's `/extract`. Up to 20 URLs per call. Used by skills that declare `**Tavily op:** extract` with a curated source list.
-- **`TOOLS`** — a const object describing every tool the agent can call. `synthesizeSkill` reads it when authoring a skill from a brief, and `/admin/tools` renders it as a read-only catalog. Code + metadata live in the same file so they can't drift apart.
+- **`tavilySearch(apiKey, query, options)`** — single web search via Tavily's `/search`. Each result already includes the page's extracted full content. Optional `topic` / `time_range` / `search_depth` / `max_results`. Gracefully no-ops if the API key isn't configured.
+- **`tavilyExtract(apiKey, urls, depth)`** — read a list of specific URLs in full via Tavily's `/extract`. Up to 20 URLs per call. Used by skills that declare `**Tavily op:** extract`.
+- **`landRegSoldPrices(postcode, { months, limit })`** — query HM Land Registry's open-data SPARQL endpoint for sold-price transactions in a postcode. Free, keyless. Returns rows with date, address, type, price.
+- **`onsContext(postcode)`** — postcodes.io lookup (built on ONS classifications). Returns country, region, council, ward, parliamentary constituency, LSOA, MSOA, parish for a UK postcode. Free, keyless.
+- **`policeCrimes(postcode, { months })`** — data.police.uk street-level crime around a postcode, aggregated by category. Free, keyless. England/Wales/NI only.
+- **`companiesHouseSearch(apiKey, query, { limit, postcode })`** — search Companies House by name; if `postcode` is set, post-filter to matching registered offices. Requires the free `CH_API_KEY`.
+- **`TOOLS`** — `Record<slug, ToolEntry>`. Each entry has a `summary`, an `operations` map (per-op `description` + `when_to_use`), and a `headers` list documenting the skill-markdown headers the tool reads. `synthesizeSkill` renders this catalog into its system prompt; `/admin/tools` renders it as a read-only page. Code + metadata live together so they can't drift apart.
 
-These two functions are everything the agent needs to reach the open web. Adding typed tools (Land Registry, ONS, Companies House, etc.) is on the roadmap, not here.
+Every function returns `[]` (or `null`) instead of throwing — a tool that fails is just a missing source row, not a broken run.
 
-### `src/agent.ts` — the brain (~550 lines)
+### `src/agent.ts` — the brain (~1140 lines)
 
 Where every business decision lives. Six sections:
 
 1. **Basics + budgets + settings.** `uid()`, `slugify()`, the `BudgetExceeded` error, daily usage tracking, settings get/set.
 2. **Targets.** `createTarget`, `getTargetBySlug`, `listTargets`, `updateTarget`, `deleteTarget`. CRUD plus a unique-slug helper that handles collisions.
-3. **Skills.** `createSkillFromMarkdown` (user-written), `synthesizeSkill` (LLM writes the procedure), `listSkills`, `updateSkill`, `deleteSkill`. The skill schema is *the procedure_md is the source of truth* — when running, we pass it as the system prompt's "skill" section.
+3. **Skills.** `createSkillFromMarkdown` (user-written), `synthesizeSkill` (LLM writes the procedure, using `buildSkillTemplate()` to render the TOOLS catalog dynamically), `listSkills`, `updateSkill`, `deleteSkill`. The skill schema is *the procedure_md is the source of truth* — when running, we pass it as the system prompt's "skill" section.
 4. **Reports.** `listReportsForTarget`, `getReportById`. (No `createReport` — reports are only created by `runResearch`.)
 5. **The research loop.** Functions chained inside `runResearch`:
-   - `parseSkillTools(procedure_md)` → optional `**Tavily op:**` / `**Sources:**` / topic / time / depth headers a skill may declare
-   - `planResearch(skill, target)` → JSON list of queries (skipped in extract mode)
-   - `gatherSources(queries, toolCfg)` → Tavily `/search` per query, OR `/extract` against the curated URL list; dedup; cap each source's content at 4000 chars
+   - `parseSkillTools(procedure_md)` → `SkillToolCall[]`. Scans for every registered tool's op header (e.g. `**Tavily op:**`, `**Land Registry op:**`) and builds a list of tool calls with per-tool params. Defaults to one Tavily search if no tool is declared.
+   - `planResearch(skill, target)` → JSON list of queries (only called if at least one tool call is Tavily search)
+   - `gatherSources(queries, target, calls)` → dispatches over `calls`. `gatherTavily` runs `/search` or `/extract`; `gatherLandRegistry`, `gatherOns`, `gatherPolice`, `gatherCompaniesHouse` call their typed function and flatten the structured result to a markdown table or labelled block. Output is one uniform `GatheredSource[]` regardless of tool.
    - `recallMemory(target, skill)` → past reports for this target + related from elsewhere
    - `writeReport(...)` → the report markdown
 6. **Cron.** `cronTick` walks due targets and runs each via `runResearch`.

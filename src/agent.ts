@@ -10,8 +10,12 @@
 //              re-runs the Skill on its configured cadence.
 
 import {
-  tavilySearch,
+  companiesHouseSearch,
+  landRegSoldPrices,
+  onsContext,
+  policeCrimes,
   tavilyExtract,
+  tavilySearch,
   TOOLS,
   type TavilySearchOptions,
 } from "./apis";
@@ -23,6 +27,7 @@ export interface Env {
   MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
   TAVILY_API_KEY?: string;
+  CH_API_KEY?: string;          // Companies House developer API key (optional)
 }
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -307,22 +312,30 @@ export interface Skill {
   updated_at: number;
 }
 
-const SKILL_TEMPLATE = `You are designing a reusable research skill for an AI agent that produces markdown reports.
+/** Build the synthesis prompt by rendering the TOOLS catalog dynamically.
+ *  Called once per synthesizeSkill invocation. When a new tool is added to
+ *  apis.ts it shows up here automatically — no manual prompt update needed. */
+function buildSkillTemplate(): string {
+  const toolBlocks = Object.values(TOOLS).map((tool) => {
+    const ops = Object.entries(tool.operations)
+      .map(
+        ([opName, op]) =>
+          `  - ${opName}: ${op.description}\n      When to use: ${op.when_to_use}`,
+      )
+      .join("\n");
+    const headers = tool.headers
+      .map((h) => `    **${h.key}:** ${h.values}`)
+      .join("\n");
+    return `${tool.display} — ${tool.summary}\n  Operations:\n${ops}\n  Headers:\n${headers}`;
+  }).join("\n\n");
+
+  return `You are designing a reusable research skill for an AI agent that produces markdown reports.
 
 Available tools you can call from a skill:
 
-tavily (search):  Search the web by keyword. Returns top results with
-                  extracted full-page content. Add **Tavily op:** search
-                  to declare. Default if no Tavily op header.
+${toolBlocks}
 
-tavily (extract): Read a list of specific URLs in full. Add
-                  **Tavily op:** extract to declare, plus **Sources:**
-                  list with one URL per bullet.
-
-Optional headers for search mode:
-  **Search topic:** general | news | finance
-  **Time range:**   day | week | month | year
-  **Depth:**        basic | advanced
+A skill can declare ONE OR MORE tools (one of each). Each tool is declared by its op header (e.g. **Tavily op:** search or **Land Registry op:** sold-prices). Headers are case-sensitive. Only add tool headers the brief actually justifies — don't over-declare.
 
 Given the skill brief below, write a procedure document with these sections, in plain markdown:
 
@@ -332,16 +345,21 @@ Given the skill brief below, write a procedure document with these sections, in 
 
 **When to use:** the kind of target this works on (postcodes, companies, people, topics, places).
 
-(Optional Tavily headers here, only if the brief implies them — e.g. "hourly news on X" → **Tavily op:** search + **Search topic:** news + **Time range:** day. Don't add headers you don't need.)
+(Optional tool headers here — see catalog above. Examples:
+  • "hourly news on X" → **Tavily op:** search + **Search topic:** news + **Time range:** day
+  • "UK postcode dossier" → **Tavily op:** search + **Land Registry op:** sold-prices + **ONS op:** context + **Police op:** crimes
+  • "specific RSS feeds" → **Tavily op:** extract + **Sources:** bulleted URL list
+Don't add headers you don't need.)
 
-**Approach:** 3–6 sentences of approach. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
+**Approach:** 3–6 sentences. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
 
-**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each query goes on its own bulleted line. (Skip this section if **Tavily op:** is extract — list URLs under **Sources:** instead.)
+**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each on its own bulleted line. Skip this section if no Tavily search op is declared (extract uses **Sources:** instead, and pure typed-tool skills don't need search queries).
 
 **Output structure:** the headings the final report should use, with one sentence each describing what goes under each heading. End with a "Sources" section.
 
 Be specific. The agent will execute this procedure literally. Do not include any preamble or commentary outside the document.
 `;
+}
 
 export async function listSkills(env: Env): Promise<Skill[]> {
   const rows = await env.DB.prepare(
@@ -407,7 +425,7 @@ export async function synthesizeSkill(
   const model = await getChatModel(env);
   const res: any = await env.AI.run(model, {
     messages: [
-      { role: "system", content: SKILL_TEMPLATE },
+      { role: "system", content: buildSkillTemplate() },
       { role: "user", content: `Skill brief: "${brief}"\n\nWrite the procedure document now.` },
     ],
     max_tokens: 900,
@@ -569,113 +587,269 @@ interface GatheredSource {
 // chat model in ALLOWED_CHAT_MODELS.
 const MAX_CHARS_PER_SOURCE = 4000;
 
-/** Parse the optional Tavily-related markdown headers a skill may declare.
- *  Every header is optional — a skill with none gets search mode + sensible
- *  defaults. Conventions:
- *
- *    **Tavily op:** search | extract
- *    **Sources:**                       (only used with extract op)
- *      - https://...
- *      - https://...
- *    **Search topic:** general | news | finance
- *    **Time range:** day | week | month | year
- *    **Depth:** basic | advanced
- */
-export interface SkillToolConfig {
-  op: "search" | "extract";
-  sources?: string[];
-  topic?: "general" | "news" | "finance";
-  timeRange?: "day" | "week" | "month" | "year";
-  depth?: "basic" | "advanced";
+// A skill can declare ONE OR MORE tool calls. Each call records which tool
+// slug, which op, and the per-tool parameters parsed from the skill's
+// markdown headers (e.g. "Months" → "6"). `sources` is Tavily-extract-only.
+export interface SkillToolCall {
+  tool: string;                       // TOOLS slug, e.g. "tavily"
+  op: string;                         // op name, e.g. "search" | "sold-prices"
+  params: Record<string, string>;     // header key → raw value
+  sources?: string[];                 // Tavily extract URL list
 }
 
-export function parseSkillTools(procedureMd: string): SkillToolConfig {
-  const opMatch = procedureMd.match(/\*\*Tavily op:\*\*\s*(search|extract)/i);
-  const op: "search" | "extract" =
-    opMatch && opMatch[1].toLowerCase() === "extract" ? "extract" : "search";
+// Each tool's op header key. Convention: "<display> op", but a few diverge
+// (e.g. "Tavily op" not "Tavily op"). Source of truth lives here so the
+// parser doesn't have to guess from `display`.
+const OP_HEADER_BY_TOOL: Record<string, string> = {
+  tavily: "Tavily op",
+  land_registry: "Land Registry op",
+  ons: "ONS op",
+  police: "Police op",
+  companies_house: "Companies House op",
+};
 
-  const topicMatch = procedureMd.match(/\*\*Search topic:\*\*\s*(general|news|finance)/i);
-  const topic = topicMatch
-    ? (topicMatch[1].toLowerCase() as "general" | "news" | "finance")
-    : undefined;
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
-  const timeMatch = procedureMd.match(/\*\*Time range:\*\*\s*(day|week|month|year)/i);
-  const timeRange = timeMatch
-    ? (timeMatch[1].toLowerCase() as "day" | "week" | "month" | "year")
-    : undefined;
+/** Parse all tool declarations in a skill's procedure markdown. A skill may
+ *  declare any subset of the registered tools (one of each). Returns a list
+ *  of tool calls; an empty list of declarations defaults to a single Tavily
+ *  search call so existing skills keep working unchanged. */
+export function parseSkillTools(procedureMd: string): SkillToolCall[] {
+  const calls: SkillToolCall[] = [];
 
-  const depthMatch = procedureMd.match(/\*\*Depth:\*\*\s*(basic|advanced)/i);
-  const depth = depthMatch
-    ? (depthMatch[1].toLowerCase() as "basic" | "advanced")
-    : undefined;
+  for (const tool of Object.values(TOOLS)) {
+    const opHeader = OP_HEADER_BY_TOOL[tool.slug];
+    if (!opHeader) continue;
+    const opPattern = new RegExp(`\\*\\*${escapeRegex(opHeader)}:\\*\\*\\s*([A-Za-z0-9_-]+)`, "i");
+    const opMatch = procedureMd.match(opPattern);
+    if (!opMatch) continue;
 
-  let sources: string[] | undefined;
-  if (op === "extract") {
-    // Grab the bulleted lines beneath a **Sources:** header until a blank
-    // line, the next bold header, or another markdown heading.
-    const block = procedureMd.match(/\*\*Sources:\*\*\s*\n([\s\S]*?)(?:\n\s*\n|\n\*\*|\n#|$)/i);
-    if (block) {
-      sources = block[1]
-        .split("\n")
-        .map((l) => l.replace(/^\s*[-*]\s+/, "").trim())
-        .filter((l) => /^https?:\/\//i.test(l));
+    const op = opMatch[1].toLowerCase();
+    const validOps = Object.keys(tool.operations).map((o) => o.toLowerCase());
+    if (!validOps.includes(op)) continue;
+
+    const params: Record<string, string> = {};
+    for (const h of tool.headers) {
+      if (h.key === opHeader) continue;
+      if (h.key === "Sources") continue;     // parsed specially below
+      const p = new RegExp(`\\*\\*${escapeRegex(h.key)}:\\*\\*\\s*(.+)`, "i");
+      const m = procedureMd.match(p);
+      if (m) params[h.key] = m[1].trim();
     }
+
+    let sources: string[] | undefined;
+    if (tool.slug === "tavily" && op === "extract") {
+      const block = procedureMd.match(
+        /\*\*Sources:\*\*\s*\n([\s\S]*?)(?:\n\s*\n|\n\*\*|\n#|$)/i,
+      );
+      if (block) {
+        sources = block[1]
+          .split("\n")
+          .map((l) => l.replace(/^\s*[-*]\s+/, "").trim())
+          .filter((l) => /^https?:\/\//i.test(l));
+      }
+    }
+
+    calls.push({ tool: tool.slug, op, params, sources });
   }
 
-  return { op, sources, topic, timeRange, depth };
+  // Default: no tool declared → single Tavily search (backwards-compat).
+  if (calls.length === 0) {
+    calls.push({ tool: "tavily", op: "search", params: {} });
+  }
+  return calls;
 }
 
-/** Step 2: gather evidence via Tavily. Either runs the LLM-planned queries
- *  through /search, or — if the skill declared **Tavily op:** extract with a
- *  Sources list — pulls those specific URLs through /extract. */
+/** Step 2: gather evidence by dispatching each tool call to its handler.
+ *  Each handler returns zero or more GatheredSource rows in the common
+ *  `{ title, url, content }` shape; typed tools flatten their structured
+ *  output to markdown so the writer LLM doesn't need to know the shape. */
 async function gatherSources(
   env: Env,
   queries: string[],
-  toolCfg: SkillToolConfig,
+  target: Target,
+  calls: SkillToolCall[],
 ): Promise<GatheredSource[]> {
   await checkBudget(env, "searches");
 
-  let gathered: GatheredSource[] = [];
-
-  if (toolCfg.op === "extract" && toolCfg.sources?.length) {
-    // Curated URL list — skip search entirely.
-    const extracted = await tavilyExtract(env.TAVILY_API_KEY, toolCfg.sources).catch(() => []);
-    gathered = extracted.map((r) => ({
-      title: r.url,
-      url: r.url,
-      content: r.raw_content,
-    }));
-    // Roughly one credit per 5 URLs (basic depth). Bill conservatively.
-    await bumpUsage(env, "searches", Math.max(1, Math.ceil(toolCfg.sources.length / 5)));
-  } else {
-    // Default: LLM-planned queries → Tavily /search.
-    const opts: TavilySearchOptions = {
-      topic: toolCfg.topic ?? "general",
-      time_range: toolCfg.timeRange,
-      search_depth: toolCfg.depth ?? "basic",
-    };
-    const results = await Promise.all(
-      queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts).catch(() => [])),
-    );
-    await bumpUsage(env, "searches", queries.length);
-
-    // Flatten + dedup by URL, keep first-seen order.
-    const seen = new Set<string>();
-    for (const list of results) {
-      for (const r of list) {
-        if (!r.url || seen.has(r.url)) continue;
-        seen.add(r.url);
-        gathered.push({ title: r.title, url: r.url, content: r.content });
+  const out: GatheredSource[] = [];
+  for (const c of calls) {
+    try {
+      switch (c.tool) {
+        case "tavily":
+          out.push(...(await gatherTavily(env, queries, c)));
+          break;
+        case "land_registry":
+          out.push(...(await gatherLandRegistry(c, target)));
+          break;
+        case "ons":
+          out.push(...(await gatherOns(c, target)));
+          break;
+        case "police":
+          out.push(...(await gatherPolice(c, target)));
+          break;
+        case "companies_house":
+          out.push(...(await gatherCompaniesHouse(env, c, target)));
+          break;
+        default:
+          console.warn(`gatherSources: unknown tool slug "${c.tool}"`);
       }
+    } catch (e) {
+      console.error(`gather ${c.tool} failed:`, e);
     }
   }
 
-  // Cap each source's content + cap total source count.
-  gathered = gathered.slice(0, 20).map((s) => ({
+  return out.slice(0, 20).map((s) => ({
     ...s,
     content: s.content.slice(0, MAX_CHARS_PER_SOURCE),
   }));
-  return gathered;
+}
+
+async function gatherTavily(
+  env: Env,
+  queries: string[],
+  c: SkillToolCall,
+): Promise<GatheredSource[]> {
+  if (c.op === "extract" && c.sources?.length) {
+    const extracted = await tavilyExtract(env.TAVILY_API_KEY, c.sources).catch(() => []);
+    await bumpUsage(env, "searches", Math.max(1, Math.ceil(c.sources.length / 5)));
+    return extracted.map((r) => ({ title: r.url, url: r.url, content: r.raw_content }));
+  }
+  const opts: TavilySearchOptions = {
+    topic: (c.params["Search topic"]?.toLowerCase() as TavilySearchOptions["topic"]) ?? "general",
+    time_range: c.params["Time range"]?.toLowerCase() as TavilySearchOptions["time_range"],
+    search_depth: (c.params["Depth"]?.toLowerCase() as TavilySearchOptions["search_depth"]) ?? "basic",
+  };
+  const results = await Promise.all(
+    queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts).catch(() => [])),
+  );
+  await bumpUsage(env, "searches", queries.length);
+
+  const seen = new Set<string>();
+  const flat: GatheredSource[] = [];
+  for (const list of results) {
+    for (const r of list) {
+      if (!r.url || seen.has(r.url)) continue;
+      seen.add(r.url);
+      flat.push({ title: r.title, url: r.url, content: r.content });
+    }
+  }
+  return flat;
+}
+
+async function gatherLandRegistry(c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
+  const postcode = target.name;
+  const months = Math.max(1, Math.min(120, Number(c.params["Months"] ?? 12) || 12));
+  const limit = Math.max(1, Math.min(100, Number(c.params["Limit"] ?? 50) || 50));
+  const rows = await landRegSoldPrices(postcode, { months, limit });
+  if (rows.length === 0) return [];
+  const lines = [
+    `| Date | Address | Type | Paid |`,
+    `|---|---|---|---|`,
+    ...rows.map(
+      (r) =>
+        `| ${r.date} | ${[r.paon, r.saon, r.street, r.town].filter(Boolean).join(", ") || "—"} | ${r.type} | ${r.paid_display} |`,
+    ),
+  ];
+  return [
+    {
+      title: `HM Land Registry — sold prices in ${postcode} (last ${months} months, ${rows.length} transactions)`,
+      url: `https://landregistry.data.gov.uk/app/qonsole`,
+      content: lines.join("\n"),
+    },
+  ];
+}
+
+async function gatherOns(_c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
+  const postcode = target.name;
+  const ctx = await onsContext(postcode);
+  if (!ctx) return [];
+  const lines = [
+    `**Postcode:** ${ctx.postcode}`,
+    `**Country:** ${ctx.country}`,
+    ctx.region ? `**Region:** ${ctx.region}` : null,
+    ctx.admin_district ? `**Council district:** ${ctx.admin_district}` : null,
+    ctx.admin_ward ? `**Ward:** ${ctx.admin_ward}` : null,
+    ctx.parliamentary_constituency ? `**Constituency:** ${ctx.parliamentary_constituency}` : null,
+    ctx.lsoa ? `**LSOA:** ${ctx.lsoa}` : null,
+    ctx.msoa ? `**MSOA:** ${ctx.msoa}` : null,
+    ctx.parish ? `**Parish:** ${ctx.parish}` : null,
+  ].filter(Boolean);
+  return [
+    {
+      title: `ONS / postcodes.io context for ${ctx.postcode}`,
+      url: `https://api.postcodes.io/postcodes/${encodeURIComponent(ctx.postcode)}`,
+      content: lines.join("\n"),
+    },
+  ];
+}
+
+async function gatherPolice(c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
+  const postcode = target.name;
+  const months = Math.max(1, Math.min(12, Number(c.params["Months"] ?? 3) || 3));
+  const summary = await policeCrimes(postcode, { months });
+  if (!summary) return [];
+  const catLines = summary.by_category.map((row) => `| ${row.category} | ${row.count} |`);
+  const sampleLines = summary.sample.map(
+    (s) =>
+      `- ${s.month}: ${s.category}${s.street ? ` on ${s.street}` : ""}${s.outcome ? ` — ${s.outcome}` : ""}`,
+  );
+  const lines = [
+    `**Total incidents across ${summary.months_returned.join(", ")}:** ${summary.total}`,
+    ``,
+    `| Category | Count |`,
+    `|---|---|`,
+    ...catLines,
+    ``,
+    `**Recent incidents (sample):**`,
+    ...sampleLines,
+  ];
+  return [
+    {
+      title: `data.police.uk — crime stats near ${postcode} (${summary.months_returned.length} months)`,
+      url: `https://www.police.uk/pu/your-area/?q=${encodeURIComponent(postcode)}`,
+      content: lines.join("\n"),
+    },
+  ];
+}
+
+async function gatherCompaniesHouse(
+  env: Env,
+  c: SkillToolCall,
+  target: Target,
+): Promise<GatheredSource[]> {
+  const limit = Math.max(1, Math.min(50, Number(c.params["Limit"] ?? 10) || 10));
+  let query = target.name;
+  let postcode: string | undefined;
+  if (c.op === "by-postcode") {
+    postcode = (c.params["Postcode"] ?? target.name).trim();
+    query = postcode;
+  }
+  const hits = await companiesHouseSearch(env.CH_API_KEY, query, { limit, postcode });
+  if (hits.length === 0) return [];
+  const lines = [
+    `| Name | Number | Status | Type | Incorporated | Address |`,
+    `|---|---|---|---|---|---|`,
+    ...hits.map(
+      (h) =>
+        `| ${h.name} | ${h.number} | ${h.status} | ${h.type} | ${h.incorporated ?? "?"} | ${h.address} |`,
+    ),
+  ];
+  const opLabel =
+    c.op === "by-postcode" ? `companies at postcode ${postcode}` : `search "${query}"`;
+  const searchUrl =
+    c.op === "by-postcode"
+      ? `https://find-and-update.company-information.service.gov.uk/advanced-search/get-results?registeredOfficeAddress=${encodeURIComponent(postcode ?? "")}`
+      : `https://find-and-update.company-information.service.gov.uk/search/companies?q=${encodeURIComponent(query)}`;
+  return [
+    {
+      title: `Companies House — ${opLabel} (${hits.length} hits)`,
+      url: searchUrl,
+      content: lines.join("\n"),
+    },
+  ];
 }
 
 /** Step 4: recall similar past reports across the whole memory. Same-target
@@ -794,13 +968,17 @@ export async function runResearch(
   const chatModel = await getChatModel(env);
 
   try {
-    const toolCfg = parseSkillTools(skill.procedure_md);
-    // Skip query planning entirely in extract mode — sources are explicit.
-    const queries =
-      toolCfg.op === "extract" && toolCfg.sources?.length
-        ? []
-        : (await planResearch(env, skill, target, chatModel)).queries;
-    const sources = await gatherSources(env, queries, toolCfg);
+    const calls = parseSkillTools(skill.procedure_md);
+    // Only Tavily search needs LLM-planned queries. Tavily extract uses
+    // explicit URLs; typed tools (Land Registry, ONS, Police, Companies
+    // House) derive their inputs from the target.
+    const needsQueries = calls.some(
+      (c) => c.tool === "tavily" && c.op === "search",
+    );
+    const queries = needsQueries
+      ? (await planResearch(env, skill, target, chatModel)).queries
+      : [];
+    const sources = await gatherSources(env, queries, target, calls);
     const { priorOnTarget, relatedAcrossTargets } = await recallMemory(env, target, skill);
 
     const { title, body } = await writeReport(

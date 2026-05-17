@@ -30,20 +30,22 @@ Fast reference. For narrative explanation, read [BOOK.md](BOOK.md). For setup, [
                                │
           ┌───────────────┬───────────┬──────────────┐
           ▼               ▼           ▼              ▼
-      ┌────────┐     ┌─────────┐  ┌──────┐  ┌──────────────┐
-      │ Tavily │     │ Workers │  │ D1   │  │ Vectorize    │
-      │ search │     │   AI    │  │      │  │   (memory)   │
-      │ + ext  │     │ Llama+  │  │      │  │              │
-      │        │     │ bge-base│  │      │  │              │
-      └────────┘     └─────────┘  └──────┘  └──────────────┘
+      ┌──────────────┐ ┌─────────┐  ┌──────┐  ┌──────────────┐
+      │ TOOLS:       │ │ Workers │  │ D1   │  │ Vectorize    │
+      │  tavily      │ │   AI    │  │      │  │   (memory)   │
+      │  land_reg    │ │ Llama+  │  │      │  │              │
+      │  ons         │ │ bge-base│  │      │  │              │
+      │  police      │ │         │  │      │  │              │
+      │  companies   │ │         │  │      │  │              │
+      └──────────────┘ └─────────┘  └──────┘  └──────────────┘
           │                          │
           │                          ▼
           │                      ┌──────┐
-          └──────────────────────►  R2  │ (full markdown of each report)
-                                 └──────┘
+          └──────────────────────►  R2  │ (full markdown of each report
+                                 └──────┘   + /static/tailwind.v1.css)
 ```
 
-External: Tavily (search + extract).
+External: Tavily (web search + extract), HM Land Registry SPARQL, postcodes.io (ONS area data), data.police.uk, Companies House.
 Internal: Workers AI (chat + embeddings), D1, R2, Vectorize.
 
 ---
@@ -55,14 +57,14 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | # | Step | Calls | Cost |
 | --- | --- | --- | --- |
 | 1 | **Budget check** | D1 read | ~free |
-| 2 | **Parse skill** — extract optional `**Tavily op:**` / `**Sources:**` / topic / time range / depth headers | local | free |
-| 3 | **Plan** — LLM picks 3–6 search queries (skipped in extract mode) | 1 chat call | ~150–300 neurons |
-| 4 | **Gather** — Tavily `/search` for each planned query, OR `/extract` for an explicit URL list. Each result includes the page's extracted full content. | N HTTP calls | N Tavily credits (1 per basic search; 1 per 5 URLs extracted) |
+| 2 | **Parse skill** — scan procedure_md for any registered tool's `**<Tool> op:**` header; collect each tool's per-tool params into a `SkillToolCall[]`. Default to one Tavily search if none declared. | local | free |
+| 3 | **Plan** — LLM picks 3–6 search queries (only if at least one tool call is Tavily search) | 1 chat call | ~150–300 neurons |
+| 4 | **Gather** — dispatch over the `SkillToolCall[]`. Each tool's handler fetches and flattens to markdown `{ title, url, content }`. Typed-tool output (Land Registry rows, ONS context, police crimes, Companies House hits) is rendered as a markdown table or labelled block so the writer sees a uniform source format. | N HTTP calls across the tools | Tavily: N credits; everything else: free |
 | 5 | **Recall** — Vectorize for related past reports + D1 for same-target history | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
-| 6 | **Write** — LLM produces the markdown report from extracted page content + recalled context | 1 chat call | ~300–700 neurons (richer input than v4's snippet-only) |
+| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context | 1 chat call | ~300–700 neurons |
 | 7 | **Persist** — R2 put + D1 insert + embed + Vectorize upsert + update target.next_run_at + audit row | 1 R2 put + 4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
 
-**Total per run:** ~2 chat calls + 1 embedding + 3–6 Tavily calls → roughly **600–1200 neurons + 3–6 Tavily credits**.
+**Total per run:** ~2 chat calls + 1 embedding + (3–6 Tavily calls if used) + (0–N typed-tool HTTP calls) → roughly **600–1200 neurons + 0–6 Tavily credits**. Typed-tool calls are upstream-rate-limited but cost nothing.
 
 ---
 
@@ -190,12 +192,12 @@ The full markdown of every report. `text/markdown; charset=utf-8`. Never queried
 
 | File | Lines | What's in it |
 | --- | --- | --- |
-| [src/apis.ts](src/apis.ts) | ~130 | `tavilySearch`, `tavilyExtract`, `TOOLS` registry |
-| [src/agent.ts](src/agent.ts) | ~570 | Targets / skills / reports CRUD, `parseSkillTools`, `runResearch` loop, `cronTick`, budget gates |
-| [src/index.ts](src/index.ts) | ~400 | HTTP routing, auth/cookie, `readForm`, `scheduled` handler, security headers |
-| [src/dashboard.ts](src/dashboard.ts) | ~1240 | All HTML rendering: public pages + admin pages (incl. `/admin/tools`) + safe markdown renderer |
+| [src/apis.ts](src/apis.ts) | ~540 | Five tool integrations (Tavily search/extract, Land Registry SPARQL, ONS via postcodes.io, data.police.uk, Companies House) + `TOOLS` registry |
+| [src/agent.ts](src/agent.ts) | ~1140 | Targets / skills / reports CRUD, `parseSkillTools` (multi-tool), `gatherSources` dispatch, per-tool gatherers, `runResearch` loop, `cronTick`, budget gates |
+| [src/index.ts](src/index.ts) | ~520 | HTTP routing (incl. `/static/tailwind.v1.css` from R2), auth/cookie, `readForm`, `scheduled` handler, security headers |
+| [src/dashboard.ts](src/dashboard.ts) | ~1240 | All HTML rendering: public pages + admin pages (incl. `/admin/tools` rendering any registered tool) + safe markdown renderer |
 
-Total: ~2300 lines of TypeScript.
+Total: ~3440 lines of TypeScript. Tailwind CSS is built locally via `npm run build:css` and served from R2 (not bundled into the Worker).
 
 ---
 
@@ -221,7 +223,7 @@ Total: ~2300 lines of TypeScript.
 | POST | `/admin/logout` | Clear cookie |
 | GET | `/admin` | Overview |
 | GET | `/admin/skills` | Skill library |
-| GET | `/admin/tools` | Read-only catalog of tools (Tavily search/extract) skills can call |
+| GET | `/admin/tools` | Read-only catalog of all five tools and their skill-markdown headers |
 | POST | `/admin/skills` | Create skill — `mode=synthesize&brief=…` OR `mode=write&name&procedure_md` |
 | POST | `/admin/skills/:slug/update` | Edit skill |
 | POST | `/admin/skills/:slug/delete` | Delete skill |
@@ -273,9 +275,10 @@ Daily budget gates stop early on `BudgetExceeded`.
 | Secret | Required? | Purpose |
 | --- | --- | --- |
 | `ADMIN_SECRET` | yes | Admin panel password. Generate with `openssl rand -hex 32`. |
-| `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search is skipped — reports become LLM-knowledge-only. |
+| `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search/extract is skipped — reports rely on LLM general knowledge + whichever typed tools the skill declares. |
+| `CH_API_KEY` | optional | Companies House developer API key (free, register at developer.company-information.service.gov.uk). Only needed if a skill calls the `companies_house` tool. Without it that one tool short-circuits to no results; everything else keeps working. |
 
-Set both via `npx wrangler secret put …`. Never commit.
+Set all via `npx wrangler secret put …`. Never commit.
 
 ---
 

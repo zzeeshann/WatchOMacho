@@ -478,30 +478,7 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  // Extend Tailwind with the same design tokens already used by the
-  // hand-rolled CSS in BASE_CSS, so utility classes like text-zee-primary
-  // resolve to identical pixel values. No design change.
-  tailwind.config = {
-    theme: {
-      extend: {
-        colors: {
-          'zee-bg':      '#FAF8F4',
-          'zee-cream':   '#FAF8F4',
-          'zee-text':    '#1A1A1A',
-          'zee-primary': '#1A6B62',
-          'zee-muted':   '#6B6B6B',
-          'zee-gold':    '#C49A1A',
-          'zee-border':  '#E8E4DE',
-        },
-        fontFamily: {
-          sans: ['"DM Sans"', 'system-ui', 'sans-serif'],
-        },
-      },
-    },
-  };
-</script>
+<link rel="stylesheet" href="/static/tailwind.v1.css">
 </head>
 <body>
 <header class="site-header">
@@ -1220,19 +1197,32 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function renderAdminTools(): string {
-  const rows = Object.values(TOOLS).map((tool) => {
-    const opRows = Object.entries(tool.operations).map(([opName, opDesc]) => `
+  const cards = Object.values(TOOLS).map((tool) => {
+    const opRows = Object.entries(tool.operations).map(([opName, op]) => `
       <tr>
         <td class="whitespace-nowrap align-top pr-3 py-2 font-mono text-[13px] text-zee-primary">${escapeHtml(tool.slug)} (${escapeHtml(opName)})</td>
-        <td class="align-top py-2 text-sm text-zee-text">${escapeHtml(opDesc)}</td>
+        <td class="align-top py-2 text-sm text-zee-text">
+          <div>${escapeHtml(op.description)}</div>
+          <div class="field-help mt-1"><em>When to use:</em> ${escapeHtml(op.when_to_use)}</div>
+        </td>
       </tr>
     `).join("");
+
+    const headerRows = tool.headers.map((h) => `
+      <tr>
+        <td class="whitespace-nowrap align-top pr-3 py-1 font-mono text-[13px] text-zee-primary">**${escapeHtml(h.key)}:**</td>
+        <td class="align-top py-1 text-sm text-zee-text">${escapeHtml(h.values)}</td>
+      </tr>
+    `).join("");
+
     return `
       <div class="card">
         <div class="h3-row"><h3>${escapeHtml(tool.display)}</h3></div>
-        <p class="field-help mb-3"><strong>When to use search:</strong> ${escapeHtml(tool.when_to_use_search)}</p>
-        <p class="field-help mb-4"><strong>When to use extract:</strong> ${escapeHtml(tool.when_to_use_extract)}</p>
+        <p class="field-help mb-3">${escapeHtml(tool.summary)}</p>
+        <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-2 mb-1">Operations</h4>
         <table class="w-full border-collapse"><tbody>${opRows}</tbody></table>
+        <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-4 mb-1">Skill markdown headers</h4>
+        <table class="w-full border-collapse"><tbody>${headerRows}</tbody></table>
       </div>
     `;
   }).join("");
@@ -1241,26 +1231,10 @@ export function renderAdminTools(): string {
     <section class="pt-6 pb-2">
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Tools.</h1>
-      <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
+      <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. A skill may declare one or more tools (one of each) via headers in its procedure markdown. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
     </section>
 
-    ${rows}
-
-    <div class="card">
-      <div class="h3-row"><h3>Skill markdown headers</h3></div>
-      <p class="field-help mb-2">Any skill can declare these optional headers in its procedure markdown. Sensible defaults if omitted (search mode, basic depth, general topic, any time range).</p>
-      <pre class="px-3.5 py-3 rounded-md overflow-x-auto font-mono text-[13px] leading-relaxed text-zee-text bg-[rgba(232,228,222,0.4)]">**Tavily op:** search          (default)
-                OR
-               extract            (forces URL-based mode)
-
-**Sources:**                     (only used with extract op)
-- https://feeds.bbci.co.uk/news/world/rss.xml
-- https://rss.cnn.com/rss/edition_world.rss
-
-**Search topic:** general | news | finance     (default: general)
-**Time range:**   day | week | month | year     (default: any)
-**Depth:**        basic | advanced              (default: basic)</pre>
-    </div>
+    ${cards}
   `;
   return shell("Tools · WatchOMacho", body, { activeNav: "tools", adminFooter: true });
 }

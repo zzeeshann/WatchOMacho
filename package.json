@@ -10,10 +10,12 @@
     "db:init": "wrangler d1 execute watchomacho-db --remote --file=schema.sql",
     "bucket:create": "wrangler r2 bucket create watchomacho-reports",
     "vector:create": "wrangler vectorize create watchomacho-memory --dimensions=768 --metric=cosine",
-    "secret": "wrangler secret put ADMIN_SECRET"
+    "secret": "wrangler secret put ADMIN_SECRET",
+    "build:css": "tailwindcss -i tailwind.input.css -o tailwind.css --minify"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250101.0",
+    "tailwindcss": "^3.4.19",
     "typescript": "^5.6.0",
     "wrangler": "^3.95.0"
   }
