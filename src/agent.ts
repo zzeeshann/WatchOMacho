@@ -1046,7 +1046,7 @@ ${sourceBlock}
 ${priorBlock}
 ${relatedBlock}
 
-Now write the report. Follow the output structure defined in the skill. End with a "Sources" section listing the URLs you actually used (cite by [n] in the body where you draw from a source). Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
+Now write the report. Follow the output structure defined in the skill. Cite sources inline by [n] (matching the numbered sources above) wherever you draw from a source. Do NOT write a "Sources" section at the end — the report page renders a canonical numbered source list automatically. Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
 
   const res = await runChat(env, model, {
     messages: [
@@ -1056,7 +1056,7 @@ Now write the report. Follow the output structure defined in the skill. End with
       },
       { role: "user", content: userMsg },
     ],
-    max_tokens: 1200,
+    max_tokens: 2200,
   });
 
   const body = res.response.trim();
@@ -1077,16 +1077,19 @@ export async function runResearch(
   skill: Skill,
   triggeredBy: "cron" | "manual",
 ): Promise<Report> {
-  await checkBudget(env, "reports");
-
+  // Generate runId BEFORE the try block so the catch can always write a row,
+  // even if pre-flight checks (budget / model resolution) throw.
   const runId = uid();
   const t0 = Date.now();
-
-  // Resolve the chat model ONCE at the start so every step of this run uses
-  // the same model and the persisted report records exactly that model.
-  const chatModel = await getChatModel(env);
+  let chatModel = "";
 
   try {
+    await checkBudget(env, "reports");
+
+    // Resolve the chat model ONCE at the start so every step of this run uses
+    // the same model and the persisted report records exactly that model.
+    chatModel = await getChatModel(env);
+
     const calls = parseSkillTools(skill.procedure_md);
     // Only Tavily search needs LLM-planned queries. Tavily extract uses
     // explicit URLs; typed tools (Land Registry, ONS, Police, Companies

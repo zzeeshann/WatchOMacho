@@ -732,9 +732,13 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
     ? await env.DB.prepare("SELECT slug, name FROM skills WHERE id = ?").bind(report.skill_id).first<{ slug: string; name: string }>()
     : null;
 
-  // Strip leading H1 (we render title in our own header).
-  const bodyMd = md.replace(/^# .+\n+/, "");
+  // Strip leading H1 (we render title in our own header) AND any trailing
+  // Sources / References / Citations section the LLM may have written —
+  // we render the canonical numbered list ourselves from sources_json so
+  // anything the LLM wrote is duplicate at best, truncated at worst.
+  const bodyMd = stripTrailingSourcesSection(md.replace(/^# .+\n+/, ""));
   const html = renderMarkdown(bodyMd);
+  const sourcesHtml = renderSourcesSection(report.sources_json);
 
   const body = `
     <section class="pt-8 pb-4">
@@ -749,8 +753,68 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
     </section>
     <div class="divider"></div>
     <article class="prose py-8">${html}</article>
+    ${sourcesHtml}
   `;
   return shell(`${report.title} — WatchOMacho`, body);
+}
+
+/** Strip a trailing Sources / References / Citations section from the report
+ *  markdown. The canonical list is rendered from sources_json instead, so
+ *  anything the writer wrote is duplicate. Conservative — only matches a
+ *  Sources-style heading near the end of the document. */
+function stripTrailingSourcesSection(md: string): string {
+  return md
+    .replace(
+      /\n\s*(?:#{1,4}\s+|\*\*)?(?:Sources?|References|Citations)\s*:?\s*(?:\*\*)?\s*\n[\s\S]*$/i,
+      "",
+    )
+    .replace(/\n\s*-{3,}\s*$/, "")     // strip a trailing horizontal rule too
+    .trimEnd();
+}
+
+/** Render the gathered source list as a numbered, clickable footer.
+ *  Citation `[N]` in the body always maps to source `N` here, regardless of
+ *  whether the writer LLM ran out of tokens. */
+function renderSourcesSection(sourcesJson: string | null): string {
+  if (!sourcesJson) return "";
+  let sources: Array<{ title: string; url: string }> = [];
+  try {
+    const parsed = JSON.parse(sourcesJson);
+    if (Array.isArray(parsed)) {
+      sources = parsed.filter(
+        (s): s is { title: string; url: string } =>
+          s && typeof s.url === "string" && s.url.length > 0,
+      );
+    }
+  } catch {
+    return "";
+  }
+  if (sources.length === 0) return "";
+
+  const items = sources
+    .map((s, i) => {
+      const n = i + 1;
+      const title = String(s.title ?? "").trim() || s.url;
+      let host = "";
+      try {
+        host = new URL(s.url).hostname.replace(/^www\./, "");
+      } catch {
+        // Bad URL — skip the hostname line; the title link still works.
+      }
+      return `<li class="mb-3 leading-snug">
+        <span class="font-mono text-zee-muted mr-2 text-[13px]">[${n}]</span>
+        <a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" class="text-zee-primary hover:underline">${escapeHtml(title)}</a>
+        ${host ? `<span class="text-zee-muted text-[12px] ml-2">${escapeHtml(host)}</span>` : ""}
+      </li>`;
+    })
+    .join("");
+
+  return `
+    <section class="pt-6 pb-8 border-t border-zee-border">
+      <h2 class="text-[15px] uppercase tracking-wider text-zee-muted mb-4">Sources</h2>
+      <ol class="list-none p-0 m-0">${items}</ol>
+    </section>
+  `;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1075,7 +1139,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 // Admin: target edit page
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function renderAdminTargetEdit(env: Env, slug: string): Promise<string> {
+export async function renderAdminTargetEdit(env: Env, slug: string, queued = false): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
     return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { adminFooter: true });
@@ -1136,9 +1200,17 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
       </div>
     </section>
 
+    ${queued ? `
+    <div class="card" style="border-color:#1A6B62;background:rgba(26,107,98,0.06);">
+      <p class="text-zee-primary text-sm m-0">
+        <strong>Run queued.</strong> Reports take ~20–30 seconds to complete. Refresh this page in 30 seconds to see the new entry in <em>Reports</em> and <em>Run history</em>. If nothing appears after a minute, check the Worker logs or the AI Gateway dashboard for errors.
+      </p>
+    </div>
+    ` : ""}
+
     <div class="card">
       <div class="h3-row"><h3>Configure</h3></div>
-      <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
+      <form id="update-target-form" method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
         <div class="field">
           <label>Kind</label>
           <input name="kind" value="${escapeHtml(target.kind ?? "")}">
@@ -1165,16 +1237,17 @@ export async function renderAdminTargetEdit(env: Env, slug: string): Promise<str
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
-        <div class="row gap-3 mt-4">
-          <button class="btn" type="submit">Save</button>
-          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/run" class="inline">
-            <button class="btn btn-secondary" type="submit"${target.primary_skill_id ? "" : " disabled"}>Run now</button>
-          </form>
-          <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this target and all its reports?')">
-            <button class="btn btn-danger" type="submit">Delete target</button>
-          </form>
-        </div>
       </form>
+
+      <div class="row gap-3 mt-4 items-center">
+        <button class="btn" type="submit" form="update-target-form">Save</button>
+        <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/run" class="inline">
+          <button class="btn btn-secondary" type="submit"${target.primary_skill_id ? "" : " disabled"}>Run now</button>
+        </form>
+        <form method="post" action="/admin/targets/${escapeHtml(target.slug)}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this target and all its reports?')">
+          <button class="btn btn-danger" type="submit">Delete target</button>
+        </form>
+      </div>
     </div>
 
     <div class="card">

@@ -294,7 +294,8 @@ export default {
         if (!validSlug(slug)) {
           return new Response("Bad slug", withSecurityHeaders({ status: 400 }));
         }
-        return html(await renderAdminTargetEdit(env, slug));
+        const queued = url.searchParams.get("queued") === "1";
+        return html(await renderAdminTargetEdit(env, slug, queued));
       }
 
       // Targets: create / update / delete
