@@ -85,9 +85,17 @@ npx wrangler secret put TAVILY_API_KEY
 # skills that call the companies_house tool. Without it, that one tool
 # short-circuits to no results; everything else keeps working.
 npx wrangler secret put CH_API_KEY
+
+# Optional — AI Gateway (paid Anthropic / Google chat models, bypasses
+# Workers AI's shared 10k neurons/day pool). See "Chat models" below.
+npx wrangler secret put AI_GATEWAY_ACCOUNT_ID    # Cloudflare account ID (hex string in dashboard URL)
+npx wrangler secret put AI_GATEWAY_NAME          # Gateway name you created in CF dashboard
+npx wrangler secret put CF_AIG_TOKEN             # CF API token with "AI Gateway: Run" scope (Unified Billing — recommended)
+# ─ OR ─ if you'd rather bring your own Anthropic key + pay Anthropic directly:
+npx wrangler secret put ANTHROPIC_API_KEY        # console.anthropic.com key
 ```
 
-Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes). Without `CH_API_KEY` only the Companies House tool is unavailable.
+Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only — fine for famous topics, useless for postcodes). Without `CH_API_KEY` only the Companies House tool is unavailable. Without the AI Gateway secrets the dropdown's Haiku option errors when selected; Workers AI models keep working.
 
 ### 4. Deploy
 
@@ -141,19 +149,40 @@ Set from `/admin`:
 
 Counters reset at 00:00 UTC.
 
-### Models
+### Chat models
 
-[src/agent.ts](src/agent.ts) uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` for chat and `@cf/baai/bge-base-en-v1.5` for embeddings. If your account doesn't have access to Llama 3.3 70B, swap to `@cf/meta/llama-3.1-8b-instruct-fast` — same API, smaller, still fine.
+The chat model is editable live from `/admin`. Dropdown options:
+
+**Cloudflare Workers AI** (free 10k neurons/day, shared across all models on your account):
+- `@cf/meta/llama-3.3-70b-instruct-fp8-fast` — ~28 reports/day
+- `@cf/meta/llama-3.1-8b-instruct-fast` — ~100 reports/day, weaker writing
+- Mistral Small 3.1, Llama 4 Scout, Gemma 3, QwQ, DeepSeek R1 etc. (see allow-list in `agent.ts`)
+
+**Anthropic via AI Gateway** (paid, bypasses Workers AI quota):
+- `anthropic/claude-haiku-4-5-20251001` — **default**. ~$0.01 per WatchOMacho report. Best writing quality among the cheap tier. Routed through your `watchomacho` AI Gateway.
+
+The dispatcher (`runChat()` in `agent.ts`) routes by model-id prefix: `@cf/...` → `env.AI.run`; `anthropic/...` → `https://gateway.ai.cloudflare.com/.../anthropic/v1/messages` with either `cf-aig-authorization` (Unified Billing — Cloudflare pays Anthropic on your behalf via prepaid credits) or `x-api-key` (BYOK — you pay Anthropic directly).
+
+Every report records which model wrote it (`reports.chat_model` column), displayed on the report page and in the report list. Useful for comparing model quality over time.
+
+Embeddings still go to Workers AI's `@cf/baai/bge-base-en-v1.5` — they're tiny (~3 neurons each) and easy to keep on the free pool.
 
 ## Cost
 
-On the free tier, with 20 reports/day and ~5 searches per report:
+Hobby use (~5 reports/day on Haiku 4.5):
 
-- Workers requests: free under 100k/day
-- Workers AI: 10k neurons/day free. Two chat calls + one embedding per report ≈ ~250 neurons. 20 reports/day ≈ 5k neurons — under the cap.
-- Tavily: 1000 credits/month free on the Researcher plan = ~33/day. At 1 credit per basic search and 5 searches per report, that's ~6 reports/day before paying. Lower `daily_report_limit` (or `daily_search_limit`) to stay zero-cost, or upgrade Tavily's plan.
-- Vectorize: 30M queried dimensions/month free
-- R2: 10GB free, no egress
+- **Cloudflare AI Gateway credits: ~$1.60/month** (Haiku, ~$0.01 per report)
+- Tavily: free (1000 credits/mo cap; ~25 credits/day at 5 basic searches each)
+- Workers requests: free (under 100k/day)
+- Workers AI (embeddings only): free (under 10k neurons/day)
+- Vectorize: free (under 30M queried dimensions/month)
+- R2: free (under 10GB; one Tailwind CSS bundle + reports)
+- D1: free (under 5GB)
+- Cron Triggers: free
+
+At 20 reports/day on Haiku: ~$6/month.
+
+**To stay 100% free**, switch the dropdown to a Workers AI model (Llama 3.1 8B fast gives ~100 reports/day on the shared neurons pool) and don't bother with AI Gateway / Anthropic. Reports look thinner but the loop still works.
 - D1: 5GB free
 - Cron Triggers: free
 

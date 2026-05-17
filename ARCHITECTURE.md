@@ -193,11 +193,11 @@ The full markdown of every report. `text/markdown; charset=utf-8`. Never queried
 | File | Lines | What's in it |
 | --- | --- | --- |
 | [src/apis.ts](src/apis.ts) | ~540 | Five tool integrations (Tavily search/extract, Land Registry SPARQL, ONS via postcodes.io, data.police.uk, Companies House) + `TOOLS` registry |
-| [src/agent.ts](src/agent.ts) | ~1140 | Targets / skills / reports CRUD, `parseSkillTools` (multi-tool), `gatherSources` dispatch, per-tool gatherers, `runResearch` loop, `cronTick`, budget gates |
-| [src/index.ts](src/index.ts) | ~520 | HTTP routing (incl. `/static/tailwind.v1.css` from R2), auth/cookie, `readForm`, `scheduled` handler, security headers |
-| [src/dashboard.ts](src/dashboard.ts) | ~1240 | All HTML rendering: public pages + admin pages (incl. `/admin/tools` rendering any registered tool) + safe markdown renderer |
+| [src/agent.ts](src/agent.ts) | ~1280 | Targets / skills / reports CRUD, `runChat()` dispatcher (Workers AI + Anthropic via AI Gateway), `parseSkillTools` (multi-tool), `gatherSources` dispatch + per-tool gatherers (with Tavily score filter), `runResearch` loop, `cronTick`, budget gates |
+| [src/index.ts](src/index.ts) | ~530 | HTTP routing (incl. `/static/tailwind.v1.css` from R2 + `/admin/targets/:slug/run` background invocation via `ctx.waitUntil`), auth/cookie, `readForm`, `scheduled` handler, security headers |
+| [src/dashboard.ts](src/dashboard.ts) | ~1360 | All HTML rendering: public pages + admin pages (incl. `/admin/tools` rendering any registered tool), markdown renderer with `<sup class="cite">` citation rewriter, canonical Sources footer from D1, `stripMarkdown()` helper for snippets |
 
-Total: ~3440 lines of TypeScript. Tailwind CSS is built locally via `npm run build:css` and served from R2 (not bundled into the Worker).
+Total: ~3700 lines of TypeScript. Tailwind CSS is built locally via `npm run build:css` and served from R2 (not bundled into the Worker).
 
 ---
 
@@ -277,6 +277,10 @@ Daily budget gates stop early on `BudgetExceeded`.
 | `ADMIN_SECRET` | yes | Admin panel password. Generate with `openssl rand -hex 32`. |
 | `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search/extract is skipped — reports rely on LLM general knowledge + whichever typed tools the skill declares. |
 | `CH_API_KEY` | optional | Companies House developer API key (free, register at developer.company-information.service.gov.uk). Only needed if a skill calls the `companies_house` tool. Without it that one tool short-circuits to no results; everything else keeps working. |
+| `AI_GATEWAY_ACCOUNT_ID` | optional | Cloudflare account ID (hex string in any dashboard URL). Required if you use `anthropic/...` chat models via AI Gateway. |
+| `AI_GATEWAY_NAME` | optional | The gateway name you created in CF dashboard → AI → AI Gateway (e.g. `watchomacho`). Same requirement as `AI_GATEWAY_ACCOUNT_ID`. |
+| `CF_AIG_TOKEN` | one of these two | Cloudflare API token with `AI Gateway: Run` scope. Enables Unified Billing — Cloudflare pays Anthropic on your behalf via prepaid credits loaded into your CF account. Single invoice. |
+| `ANTHROPIC_API_KEY` | one of these two | Anthropic console API key. BYOK alternative to `CF_AIG_TOKEN` — you pay Anthropic directly. Use one OR the other, not both. |
 
 Set all via `npx wrangler secret put …`. Never commit.
 
@@ -284,11 +288,16 @@ Set all via `npx wrangler secret put …`. Never commit.
 
 ## Models
 
-| Use | Model |
-| --- | --- |
-| Chat (planning + report writing + skill synthesis) | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` |
-| Embeddings (memory) | `@cf/baai/bge-base-en-v1.5` |
+The chat model is editable live from `/admin`. The dispatcher (`runChat()` in `agent.ts`) routes by model-id prefix:
 
-Configured as constants in [src/agent.ts](src/agent.ts:26-27). Swap by editing those two lines and redeploying.
+| Prefix | Path | Auth | Billing |
+| --- | --- | --- | --- |
+| `@cf/...` | `env.AI.run(model, input)` (Workers AI binding) | none | Cloudflare neurons pool (10k/day free) |
+| `anthropic/...` | `https://gateway.ai.cloudflare.com/v1/{ACCOUNT_ID}/{GATEWAY_NAME}/anthropic/v1/messages` | `cf-aig-authorization: Bearer {CF_AIG_TOKEN}` OR `x-api-key: {ANTHROPIC_API_KEY}` | Cloudflare credits (Unified Billing) OR Anthropic directly (BYOK) |
 
-To downgrade chat to a smaller, cheaper, more generous-quota model: `@cf/meta/llama-3.1-8b-instruct-fast`.
+| Use | Default | Notes |
+| --- | --- | --- |
+| Chat (planning + report writing + skill synthesis) | `anthropic/claude-haiku-4-5-20251001` | ~$0.01/report via Unified Billing. Allow-listed via `ALLOWED_CHAT_MODELS` in `agent.ts` (8 Workers AI options + 1 AI Gateway option as of writing). |
+| Embeddings (memory) | `@cf/baai/bge-base-en-v1.5` | Always Workers AI. Tiny — fits comfortably in free pool. |
+
+`DEFAULT_CHAT_MODEL` in `agent.ts` is what the cron tick + new installs use when the `chat_model` setting is missing. Adding a new model: append to `ALLOWED_CHAT_MODELS`, add a human-readable label to `CHAT_MODEL_LABELS`, and (if it's a new provider prefix) extend `runAnthropicChat`-style handler. Reports record their model in the `chat_model` column so you can A/B retrospectively.

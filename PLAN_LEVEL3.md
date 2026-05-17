@@ -1,5 +1,7 @@
 # WatchOMacho Level 3 — multi-tool refactor + four UK typed tools + Tailwind R2
 
+> **✅ Shipped 2026-05-17.** Phases A–F all live at watchomacho.daylila.com. Merged via [PR #8](https://github.com/zzeeshann/WatchOMacho/pull/8). Bonus work done in the same session (not in original plan): Claude Haiku 4.5 via AI Gateway with Unified Billing, canonical Sources footer rendered from D1 instead of LLM output, superscript citation anchors with TTS-friendly aria-hidden, nested-form bug fix, queued-run UI feedback, Tavily score filter, prompt-driven markdown heading discipline. File kept as history.
+
 > **Goals for this session:**
 > 1. Phase A — finish Phase 12 of `PLAN.md`: replace Tailwind CDN with a built CSS bundle served from R2.
 > 2. Phases B–F — Level 3 from `ROADMAP.md`: make the agent multi-tool aware, then wire four UK public-data tools (Land Registry, ONS, data.police.uk, Companies House) alongside Tavily.

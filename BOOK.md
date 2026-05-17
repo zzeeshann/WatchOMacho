@@ -353,21 +353,23 @@ The agent's outside-world layer. Five tool integrations plus a generalised `TOOL
 
 Every function returns `[]` (or `null`) instead of throwing — a tool that fails is just a missing source row, not a broken run.
 
-### `src/agent.ts` — the brain (~1140 lines)
+### `src/agent.ts` — the brain (~1280 lines)
 
-Where every business decision lives. Six sections:
+Where every business decision lives. Seven sections:
 
 1. **Basics + budgets + settings.** `uid()`, `slugify()`, the `BudgetExceeded` error, daily usage tracking, settings get/set.
-2. **Targets.** `createTarget`, `getTargetBySlug`, `listTargets`, `updateTarget`, `deleteTarget`. CRUD plus a unique-slug helper that handles collisions.
-3. **Skills.** `createSkillFromMarkdown` (user-written), `synthesizeSkill` (LLM writes the procedure, using `buildSkillTemplate()` to render the TOOLS catalog dynamically), `listSkills`, `updateSkill`, `deleteSkill`. The skill schema is *the procedure_md is the source of truth* — when running, we pass it as the system prompt's "skill" section.
-4. **Reports.** `listReportsForTarget`, `getReportById`. (No `createReport` — reports are only created by `runResearch`.)
-5. **The research loop.** Functions chained inside `runResearch`:
+2. **Chat dispatcher.** `runChat(env, model, input)` routes by model-id prefix: `@cf/...` → `env.AI.run` (Workers AI); `anthropic/...` → POST to `https://gateway.ai.cloudflare.com/.../anthropic/v1/messages` via AI Gateway. The three chat call sites (`synthesizeSkill`, `planResearch`, `writeReport`) all go through this — embeddings stay on `env.AI.run` directly. Two auth modes for Anthropic: `cf-aig-authorization: Bearer {CF_AIG_TOKEN}` (Unified Billing — Cloudflare pays Anthropic) or `x-api-key: {ANTHROPIC_API_KEY}` (BYOK).
+3. **Targets.** `createTarget`, `getTargetBySlug`, `listTargets`, `updateTarget`, `deleteTarget`. CRUD plus a unique-slug helper that handles collisions.
+4. **Skills.** `createSkillFromMarkdown` (user-written), `synthesizeSkill` (LLM writes the procedure, using `buildSkillTemplate()` to render the TOOLS catalog dynamically), `listSkills`, `updateSkill`, `deleteSkill`. The skill schema is *the procedure_md is the source of truth* — when running, we pass it as the system prompt's "skill" section.
+5. **Reports.** `listReportsForTarget`, `getReportById`. (No `createReport` — reports are only created by `runResearch`.)
+6. **The research loop.** Functions chained inside `runResearch`:
    - `parseSkillTools(procedure_md)` → `SkillToolCall[]`. Scans for every registered tool's op header (e.g. `**Tavily op:**`, `**Land Registry op:**`) and builds a list of tool calls with per-tool params. Defaults to one Tavily search if no tool is declared.
    - `planResearch(skill, target)` → JSON list of queries (only called if at least one tool call is Tavily search)
-   - `gatherSources(queries, target, calls)` → dispatches over `calls`. `gatherTavily` runs `/search` or `/extract`; `gatherLandRegistry`, `gatherOns`, `gatherPolice`, `gatherCompaniesHouse` call their typed function and flatten the structured result to a markdown table or labelled block. Output is one uniform `GatheredSource[]` regardless of tool.
+   - `gatherSources(queries, target, calls)` → dispatches over `calls`. `gatherTavily` runs `/search` (dropping results below 0.4 relevance score) or `/extract`; `gatherLandRegistry`, `gatherOns`, `gatherPolice`, `gatherCompaniesHouse` call their typed function and flatten the structured result to a markdown table or labelled block. Output is one uniform `GatheredSource[]` regardless of tool.
    - `recallMemory(target, skill)` → past reports for this target + related from elsewhere
-   - `writeReport(...)` → the report markdown
-6. **Cron.** `cronTick` walks due targets and runs each via `runResearch`.
+   - `writeReport(...)` → the report markdown. System prompt requires `## Section name` markdown for headings and explicitly forbids writing a Sources section (the page renders the canonical one from `sources_json`).
+   - Pre-flight `checkBudget` + `getChatModel` are inside the `try/catch` so any failure (including budget exhaustion or auth errors) gets logged to the `runs` table with `status='error'` and the exception message.
+7. **Cron.** `cronTick` walks due targets and runs each via `runResearch`.
 
 ### `src/index.ts` — routes (~400 lines)
 

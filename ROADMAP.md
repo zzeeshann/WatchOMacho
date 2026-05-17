@@ -73,21 +73,21 @@ Each is in `src/apis.ts` with a typed return shape, an entry in the `TOOLS` regi
 ### Level 4 — True agentic tool-use loop
 The LLM iteratively calls tools, sees results, decides next steps, calls more tools, then writes. Requires real function-calling support — Claude and GPT do this cleanly; Workers AI Llama is more limited.
 
-Only do this when (a) skills are too rigid to express what you need, or (b) you've moved chat to Anthropic via AI Gateway and want to use Sonnet/Opus's tool-use directly.
+**Partially enabled (2026-05-17)** by the AI Gateway + Anthropic Haiku 4.5 integration. The dispatcher (`runChat()`) now routes `anthropic/...` model IDs through Cloudflare AI Gateway, with Unified Billing so Cloudflare bills you for Anthropic usage on a single invoice (no separate Anthropic account needed). That's the infrastructure piece. The agentic loop itself (LLM-driven tool selection, multi-turn) is still deferred — current pipeline is rigid plan-gather-write. Switch to Claude's native tool-use API only when skills become too constraining.
 
 ---
 
 ## Cost trajectory
 
-| Phase | Tavily/mo | Workers AI | Anthropic | Approx total |
+| Phase | Tavily/mo | Workers AI | Anthropic (via Unified Billing) | Approx total |
 |---|---|---|---|---|
-| v4 + Tavily (now) | 1k free | 10k/day free | 0 | £0 |
-| + Workers Paid | 1k free | 10M/mo included | 0 | $5/mo |
-| + Tavily paid (Bootstrap) | $30 | included | 0 | $35/mo |
-| Level 3 (typed tools) + Paid | similar | similar | 0 | $35/mo |
-| Level 4 (Anthropic) | + Tavily | embeddings only | $10–30 | $45–65/mo |
+| v4 + Tavily, Workers AI chat (free path) | 1k free | 10k/day free | 0 | £0 (~6 reports/day cap from Tavily) |
+| + Tavily paid (Bootstrap) | $30 | 10k/day free | 0 | $30/mo |
+| **v4 + Haiku 4.5 chat (current default)** | 1k free | embeddings only | ~$0.01/report | **~$2/mo at 5 reports/day, ~$6/mo at 20 reports/day** |
+| + Tavily paid + Haiku at 20 reports/day | $30 | embeddings only | $6 | ~$36/mo |
+| Full agentic Level 4 (Sonnet tool-use loop) | + Tavily | embeddings only | $10–30 | $40–60/mo |
 
-Hobby usage stays at £0 until Tavily's free credits are exhausted (~6 reports/day). Anthropic gets serious only at Level 4.
+Hobby use on Haiku stays well under $10/month. The Workers AI free path remains available — switch the dropdown to `@cf/meta/llama-3.1-8b-instruct-fast` for ~100 free reports/day in the shared neurons pool.
 
 ---
 
