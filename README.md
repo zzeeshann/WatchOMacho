@@ -29,13 +29,13 @@ A **report** is what comes out when the agent runs a skill against a target. The
 
 For each `(target, skill)` execution:
 
-1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns 3–6 web search queries. (Skipped if the skill doesn't declare a Tavily search op — e.g. extract-mode or pure typed-tool skills.)
-2. **Gather** — the agent dispatches over the skill's declared tools in order. Tavily search/extract for web work; Land Registry / ONS / Police / Companies House for typed UK data. Structured tool output is flattened to markdown so the writer sees one consistent source format.
-3. **Recall** — Vectorize returns the most relevant past reports (so the new one *builds on* prior ones rather than repeating).
-4. **Write** — the LLM writes a ~500-word markdown report following the skill's output structure, citing sources by number.
-5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs`.
+1. **Plan** — the LLM, given the skill's procedure and the target's identity, returns up to 10 web search queries. (Skipped if the skill doesn't declare a Tavily search op — e.g. extract-mode or pure typed-tool skills.)
+2. **Gather** — the agent dispatches over the skill's declared tools in order. Tavily search/extract for web work; Land Registry / ONS / Police / Companies House for typed UK data. Results pass through score / URL / title-similarity filters; structured tool output is flattened to markdown so the writer sees one consistent source format.
+3. **Recall** — Vectorize returns the most relevant past reports + last 2 same-target reports via D1. They become `[N]` archive citations (📚) alongside web sources in the same numbered footer — so the new report *builds on* prior ones rather than repeating, and the archive becomes a navigable graph.
+4. **Write** — the LLM writes a markdown report following the skill's output structure, citing every source (web + archive) inline by number.
+5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs`, step-level heartbeat in `settings` so the admin Maintenance card can show *exactly* what just happened (Tavily funnel, last step, last error) without ever opening a log file.
 
-Two LLM calls + N tool calls per run. Predictable cost, predictable structure.
+Two LLM calls + N tool calls per run. Predictable cost (~$0.01–0.02 on Claude Haiku 4.5, free on Workers AI Llama), predictable structure, fully observable.
 
 ## Setup — about 10 minutes
 
