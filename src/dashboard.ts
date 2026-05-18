@@ -9,6 +9,7 @@ import {
   ALLOWED_CHAT_MODELS,
   CHAT_MODEL_LABELS,
   DEFAULT_CHAT_MODEL,
+  findOrphanedR2,
   getChatModel,
   getDailyUsage,
   getReportById,
@@ -32,6 +33,16 @@ function chatModelShortLabel(id: string | null | undefined): string {
   const full = CHAT_MODEL_LABELS[id] ?? id;
   const dashIdx = full.indexOf("—");
   return (dashIdx === -1 ? full : full.slice(0, dashIdx)).trim();
+}
+
+/** Human-readable duration. 18041 → "18.0s", 73210 → "1m 13s". */
+function fmtDuration(ms: number | null | undefined): string {
+  if (!ms || ms <= 0) return "";
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +239,13 @@ footer p.tiny { font-size: 11px; color: rgba(107,107,107,0.7); margin-top: 6px; 
   cursor: pointer;
 }
 .btn:hover { opacity: 0.9; }
+.btn:disabled, .btn:disabled:hover {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: white;
+  color: var(--zee-muted);
+  border: 1px solid var(--zee-border);
+}
 .btn-secondary {
   background: white;
   color: var(--zee-text);
@@ -236,6 +254,7 @@ footer p.tiny { font-size: 11px; color: rgba(107,107,107,0.7); margin-top: 6px; 
 .btn-secondary:hover { border-color: var(--zee-primary); color: var(--zee-primary); }
 .btn-danger { background: white; color: rgb(180, 60, 60); border: 1px solid rgb(220, 180, 180); }
 .btn-danger:hover { background: rgb(180, 60, 60); color: white; }
+.btn-sm { padding: 4px 10px; font-size: 11px; font-weight: 500; }
 .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
 
 /* cards (admin overview tiles) */
@@ -255,6 +274,51 @@ footer p.tiny { font-size: 11px; color: rgba(107,107,107,0.7); margin-top: 6px; 
 .card .h3-row {
   display: flex; justify-content: space-between; align-items: baseline;
   margin-bottom: 12px;
+}
+
+/* collapsible cards: <details class="card"> with a summary that renders
+ * the same h3-row layout plus a chevron that rotates on open. The summary
+ * IS the clickable header; everything after it is the collapsible body. */
+details.card > summary {
+  list-style: none;
+  cursor: pointer;
+  margin-bottom: 0;
+}
+details.card > summary::-webkit-details-marker { display: none; }
+details.card > summary .h3-row { margin-bottom: 0; }
+details.card[open] > summary .h3-row { margin-bottom: 12px; }
+details.card .chev {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--zee-muted);
+  margin-left: 10px;
+  transition: transform 0.15s ease;
+  transform: rotate(-90deg);
+}
+details.card[open] > summary .chev { transform: rotate(0deg); }
+details.card > summary:hover .chev { color: var(--zee-primary); }
+
+/* activity feed status dot: small circle with a ✓ or ✕ glyph */
+.activity-dot {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  margin-top: 1px;
+  line-height: 1;
+}
+.activity-dot--ok {
+  background: rgba(26, 107, 98, 0.12);
+  color: var(--zee-primary);
+}
+.activity-dot--err {
+  background: rgba(180, 60, 60, 0.12);
+  color: rgb(180, 60, 60);
 }
 
 /* stats strip */
@@ -344,6 +408,57 @@ footer p.tiny { font-size: 11px; color: rgba(107,107,107,0.7); margin-top: 6px; 
   border: 0;
   border-top: 1px solid var(--zee-border);
   margin: 28px 0;
+}
+
+/* Editorial section cards used on the report page. Each ## heading +
+ * its body becomes a card with a left teal accent stripe + sharp title
+ * rule. Cards sit on the warm page background, white inside, so the
+ * eye groups each section as its own "story". */
+.report-card {
+  background: white;
+  border: 1px solid var(--zee-border);
+  border-left: 3px solid var(--zee-primary);
+  border-radius: 4px;
+  padding: 28px 32px;
+  margin: 0 0 20px;
+  transition: box-shadow 0.18s ease, transform 0.18s ease;
+}
+.report-card:hover {
+  box-shadow: 0 2px 10px rgba(26, 26, 26, 0.04);
+}
+.report-card:first-child { margin-top: 0; }
+.prose .report-card > h2:first-child {
+  margin: 0 0 18px;
+  padding-bottom: 12px;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  border-bottom: 1px solid var(--zee-border);
+  color: var(--zee-text);
+}
+.prose .report-card > p {
+  margin: 14px 0;
+  line-height: 1.7;
+}
+.prose .report-card > p:last-child { margin-bottom: 0; }
+.prose .report-card > p:first-of-type { margin-top: 0; }
+/* Story lead-in: the bold first sentence of each paragraph (e.g.
+ * "**Tensions escalate in the Middle East.**") gets a slight tone shift
+ * so it functions as a mini-headline within the section card. */
+.prose .report-card > p > strong:first-child {
+  color: var(--zee-text);
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+
+/* Sources card mirrors the report card style — white surface, same
+ * border treatment, no teal stripe (it's reference, not editorial). */
+.sources-card {
+  background: white;
+  border: 1px solid var(--zee-border);
+  border-radius: 4px;
+  padding: 24px 32px 28px;
+  margin-top: 32px;
 }
 
 /* badge */
@@ -778,12 +893,19 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
     ? await env.DB.prepare("SELECT slug, name FROM skills WHERE id = ?").bind(report.skill_id).first<{ slug: string; name: string }>()
     : null;
 
-  // Strip leading H1 (we render title in our own header) AND any trailing
-  // Sources / References / Citations section the LLM may have written —
-  // we render the canonical numbered list ourselves from sources_json so
-  // anything the LLM wrote is duplicate at best, truncated at worst.
-  const bodyMd = stripTrailingSourcesSection(md.replace(/^# .+\n+/, ""));
-  const html = renderMarkdown(bodyMd);
+  // Strip everything that would visually duplicate the page header:
+  //  - leading H1 (title sits in our own header above)
+  //  - italic "Target / Generated" frontmatter lines (now redundant with
+  //    the page header's date / skill / model row)
+  //  - trailing "Sources" / "References" section the LLM may have written
+  //    (we render the canonical numbered list ourselves)
+  const bodyMd = stripTrailingSourcesSection(
+    md
+      .replace(/^# .+\n+/, "")
+      .replace(/^(?:\*(?:Target|Generated):[^\n]*\*\s*\n+)+/g, "")
+      .trimStart(),
+  );
+  const html = wrapSectionsInCards(renderMarkdown(bodyMd));
   const sourcesHtml = renderSourcesSection(report.sources_json);
 
   const body = `
@@ -797,9 +919,9 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
         ${report.chat_model ? `<span class="label-muted" title="${escapeHtml(report.chat_model)}">written by <strong class="text-zee-text font-medium">${escapeHtml(chatModelShortLabel(report.chat_model))}</strong></span>` : ""}
       </div>
     </section>
-    <div class="divider"></div>
-    <article class="prose py-8">${html}</article>
+    <article class="prose pt-6 pb-2">${html}</article>
     ${sourcesHtml}
+    <div class="pb-12"></div>
   `;
   return shell(`${report.title} — WatchOMacho`, body);
 }
@@ -818,46 +940,96 @@ function stripTrailingSourcesSection(md: string): string {
     .trimEnd();
 }
 
+/** Wrap each ## section's worth of rendered HTML in its own card so the
+ *  page reads as a stack of editorial blocks instead of one long column.
+ *  Operates on the post-render HTML (vs. inside renderMarkdown) so the
+ *  markdown parser stays single-purpose. Any content before the first
+ *  ## stays outside cards (intro / target-skill line). */
+function wrapSectionsInCards(html: string): string {
+  const parts = html.split(/(?=<h2[\s>])/);
+  return parts
+    .map((part, i) => {
+      if (i === 0 && !part.startsWith("<h2")) return part;
+      return `<section class="report-card">${part}</section>`;
+    })
+    .join("");
+}
+
 /** Render the gathered source list as a numbered, clickable footer.
  *  Citation `[N]` in the body always maps to source `N` here, regardless of
- *  whether the writer LLM ran out of tokens. */
+ *  whether the writer LLM ran out of tokens. Archive entries (prior reports
+ *  pulled in by the recall layer) get a 📚 marker and link to /report/:id
+ *  instead of an external URL — making the archive a navigable graph. */
 function renderSourcesSection(sourcesJson: string | null): string {
   if (!sourcesJson) return "";
-  let sources: Array<{ title: string; url: string }> = [];
+  type Source = { title: string; url: string; kind: "web" | "archive" };
+  let sources: Source[] = [];
   try {
     const parsed = JSON.parse(sourcesJson);
     if (Array.isArray(parsed)) {
-      sources = parsed.filter(
-        (s): s is { title: string; url: string } =>
-          s && typeof s.url === "string" && s.url.length > 0,
-      );
+      sources = parsed
+        .filter(
+          (s): s is { title: string; url: string; kind?: string } =>
+            s && typeof s.url === "string" && s.url.length > 0,
+        )
+        .map((s) => ({
+          title: String(s.title ?? ""),
+          url: s.url,
+          // Old rows without `kind` are treated as web (back-compat with
+          // reports written before the unified citation work).
+          kind: s.kind === "archive" ? "archive" : "web",
+        }));
     }
   } catch {
     return "";
   }
   if (sources.length === 0) return "";
 
+  // Citation numbering preserves global position (the LLM cited [N] referring
+  // to that exact index), so we render in original order but visually mark
+  // each item by kind. We do NOT sort or split into two ordered lists —
+  // that would break [N] → list-position mapping.
   const items = sources
     .map((s, i) => {
       const n = i + 1;
-      const title = String(s.title ?? "").trim() || s.url;
+      const title = s.title.trim() || s.url;
+      const isArchive = s.kind === "archive";
       let host = "";
-      try {
-        host = new URL(s.url).hostname.replace(/^www\./, "");
-      } catch {
-        // Bad URL — skip the hostname line; the title link still works.
+      if (!isArchive) {
+        try {
+          host = new URL(s.url).hostname.replace(/^www\./, "");
+        } catch {
+          // Bad URL — skip hostname; the title link still works.
+        }
       }
+      const linkAttrs = isArchive
+        ? ``
+        : ` target="_blank" rel="noopener noreferrer"`;
+      const marker = isArchive
+        ? `<span class="text-zee-muted mr-1.5" title="From your archive" aria-label="archive source">📚</span>`
+        : ``;
+      const subtle = isArchive
+        ? `<span class="text-zee-muted text-[12px] ml-2">archive</span>`
+        : host
+          ? `<span class="text-zee-muted text-[12px] ml-2">${escapeHtml(host)}</span>`
+          : ``;
       return `<li id="source-${n}" class="mb-3 leading-snug scroll-mt-20">
         <span class="font-mono text-zee-muted mr-2 text-[13px]">[${n}]</span>
-        <a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" class="text-zee-primary hover:underline">${escapeHtml(title)}</a>
-        ${host ? `<span class="text-zee-muted text-[12px] ml-2">${escapeHtml(host)}</span>` : ""}
+        ${marker}<a href="${escapeHtml(s.url)}"${linkAttrs} class="text-zee-primary hover:underline">${escapeHtml(title)}</a>
+        ${subtle}
       </li>`;
     })
     .join("");
 
+  const archiveCount = sources.filter((s) => s.kind === "archive").length;
+  const subhead = archiveCount > 0
+    ? `<p class="text-[12px] text-zee-muted mb-4">${sources.length - archiveCount} web · ${archiveCount} from archive (📚)</p>`
+    : "";
+
   return `
-    <section class="pt-6 pb-8 border-t border-zee-border">
-      <h2 class="text-[15px] uppercase tracking-wider text-zee-muted mb-4">Sources</h2>
+    <section class="sources-card">
+      <h2 class="text-[13px] uppercase tracking-wider text-zee-muted mb-2 font-semibold">Sources</h2>
+      ${subhead}
       <ol class="list-none p-0 m-0">${items}</ol>
     </section>
   `;
@@ -891,7 +1063,7 @@ export function renderAdminLogin(error?: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminPanel(env: Env): Promise<string> {
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, lastCompletedRun, tavilyMinScoreStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -899,7 +1071,32 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     getSetting(env, "daily_search_limit", "500"),
     getSetting(env, "cron_max_per_tick", "2"),
     getChatModel(env),
+    findOrphanedR2(env).catch((e) => {
+      console.error("renderAdminPanel: findOrphanedR2 failed", e);
+      return null;
+    }),
+    getSetting(env, "embed_last_ok_at", "0"),
+    getSetting(env, "embed_last_error", ""),
+    env.DB.prepare("SELECT COUNT(*) AS n FROM reports").first<{ n: number }>(),
+    getSetting(env, "last_cron_run", "0"),
+    getSetting(env, "last_run_attempt", ""),
+    env.DB.prepare("SELECT status, error, duration_ms, created_at FROM runs ORDER BY created_at DESC LIMIT 1").first<{ status: string; error: string | null; duration_ms: number | null; created_at: number }>(),
+    getSetting(env, "tavily_min_score", "0.4"),
   ]);
+  const tavilyMinScore = (() => {
+    const f = parseFloat(tavilyMinScoreStr);
+    return Number.isFinite(f) && f >= 0 && f <= 1 ? f : 0.4;
+  })();
+  const embedLastOkAt = parseInt(embedLastOkStr, 10) || 0;
+  const embedLastError: { message: string; at: number; report_id?: string } | null =
+    embedLastErrorRaw ? (() => { try { return JSON.parse(embedLastErrorRaw); } catch { return null; } })() : null;
+  const totalReports = totalReportsRow?.n ?? 0;
+  const lastCronRun = parseInt(lastCronRunStr, 10) || 0;
+  type GatherStats = { tavily_queries: number; tavily_raw: number; after_score_filter: number; after_url_dedupe: number; after_title_dedupe: number; final_kept: number };
+  type LastRunAttempt = { run_id: string; target_slug: string; triggered_by: "cron" | "manual"; started_at: number; last_step: string; completed_at: number | null; outcome: "in_flight" | "success" | "error"; error?: string; gather_stats?: GatherStats };
+  const lastRunAttempt: LastRunAttempt | null = lastRunAttemptRaw
+    ? (() => { try { return JSON.parse(lastRunAttemptRaw); } catch { return null; } })()
+    : null;
 
   const modelOptions = ALLOWED_CHAT_MODELS.map((m) =>
     `<option value="${escapeHtml(m)}"${m === currentChatModel ? " selected" : ""}>${escapeHtml(CHAT_MODEL_LABELS[m] ?? m)}</option>`,
@@ -934,16 +1131,30 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           </div>
         </li>`).join("")}</ul>`;
 
-  const runsHtml = (runRows.results ?? []).map((r: any) => `
+  const targetById = new Map(targets.map((t) => [t.id, t]));
+  const runsHtml = (runRows.results ?? []).map((r: any) => {
+    const t = targetById.get(r.target_id);
+    const targetCell = t
+      ? `<a href="/admin/targets/${escapeHtml(t.slug)}" class="text-zee-primary">${escapeHtml(t.name)}</a>`
+      : `<span class="label-muted">(deleted)</span>`;
+    const reportCell = r.report_id && r.status === "success"
+      ? `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary">view →</a>`
+      : `<span class="label-muted">—</span>`;
+    const errFull = r.error ?? "";
+    const errShort = errFull.length > 60 ? errFull.slice(0, 60) + "…" : errFull;
+    return `
     <tr>
       <td class="tt">${escapeHtml(timeAgo(r.created_at))}</td>
+      <td>${targetCell}</td>
       <td>${escapeHtml(r.triggered_by)}</td>
       <td>${r.status === "success"
             ? `<span class="badge badge-active">success</span>`
-            : `<span class="badge badge-error">${escapeHtml(r.error ?? "error").slice(0, 80)}</span>`}</td>
-      <td class="tt">${r.duration_ms ? `${r.duration_ms}ms` : ""}</td>
+            : `<span class="badge badge-error" title="${escapeHtml(errFull)}">${escapeHtml(errShort || "error")}</span>`}</td>
+      <td>${reportCell}</td>
+      <td class="tt">${escapeHtml(fmtDuration(r.duration_ms))}</td>
     </tr>
-  `).join("");
+  `;
+  }).join("");
 
   const body = `
     <section class="pt-6 pb-3">
@@ -952,8 +1163,16 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       <p class="subhead"><strong class="text-zee-text">${active.length}</strong> ${active.length === 1 ? "target" : "targets"}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <strong class="text-zee-text">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
     </section>
 
-    <div class="card">
-      <div class="h3-row"><h3>Add a target</h3><a href="/admin/skills" class="text-xs text-zee-primary">Manage skills →</a></div>
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Add a target</h3>
+          <span class="text-xs">
+            <a href="/admin/skills" class="text-zee-primary" onclick="event.stopPropagation()">Manage skills →</a>
+            <span class="chev">▾</span>
+          </span>
+        </div>
+      </summary>
       <form method="post" action="/admin/targets">
         <div class="field">
           <label>Name</label>
@@ -989,15 +1208,25 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         </label>
         <button class="btn" type="submit">Add target</button>
       </form>
-    </div>
+    </details>
 
-    <div class="card">
-      <div class="h3-row"><h3>Active targets</h3><span class="label-muted">${active.length} total</span></div>
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Active targets</h3>
+          <span class="label-muted">${active.length} total<span class="chev">▾</span></span>
+        </div>
+      </summary>
       ${targetRows}
-    </div>
+    </details>
 
-    <div class="card">
-      <div class="h3-row"><h3>Budgets & settings</h3></div>
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Budgets &amp; settings</h3>
+          <span class="chev">▾</span>
+        </div>
+      </summary>
       <form id="settings-form">
         <div class="field mb-4">
           <label>Chat model</label>
@@ -1027,14 +1256,185 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <span id="cron-result" class="text-xs text-zee-muted"></span>
         </div>
       </form>
-    </div>
+    </details>
 
-    <div class="card">
-      <div class="h3-row"><h3>Recent runs</h3></div>
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Search tuning</h3>
+          <span class="label-muted">min score ${tavilyMinScore.toFixed(2)}<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      <form id="search-tuning-form">
+        <div class="field mb-3.5">
+          <label>Tavily minimum score</label>
+          <input type="number" name="tavily_min_score" min="0" max="1" step="0.05" value="${tavilyMinScore.toFixed(2)}" style="max-width: 140px;">
+          <div class="field-help mt-1.5" style="max-width: 64ch;">
+            Drops Tavily hits below this score. 0 = keep everything (noisy). 1 = only perfect matches (very few). Tavily-recommended sweet spot: <strong>0.4</strong>. Lower = more candidates reach the writer (richer + noisier). Higher = stricter (cleaner but sparser). Watch the gather funnel in Maintenance after each run to see the effect.
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn" type="submit">Save</button>
+          <span id="search-tuning-result" class="text-xs text-zee-muted"></span>
+        </div>
+      </form>
+    </details>
+
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Recent runs</h3>
+          <span class="label-muted">${(runRows.results ?? []).length} shown<span class="chev">▾</span></span>
+        </div>
+      </summary>
       ${runsHtml
-        ? `<table class="runs"><thead><tr><th>When</th><th>Trigger</th><th>Status</th><th>Duration</th></tr></thead><tbody>${runsHtml}</tbody></table>`
+        ? `<table class="runs"><thead><tr><th>When</th><th>Target</th><th>Trigger</th><th>Status</th><th>Report</th><th>Duration</th></tr></thead><tbody>${runsHtml}</tbody></table>`
         : `<div class="empty">No runs yet.</div>`}
-    </div>
+    </details>
+
+    <details class="card">
+      <summary>
+        <div class="h3-row">
+          <h3>Maintenance</h3>
+          <span class="label-muted">
+            ${r2Stats
+              ? `${r2Stats.scanned} R2 file${r2Stats.scanned === 1 ? "" : "s"} · `
+                + (r2Stats.orphans.length === 0
+                    ? `<span class="text-zee-primary">no orphans</span>`
+                    : `<strong class="font-medium">${r2Stats.orphans.length} unaccounted</strong>`)
+              : `storage &amp; cleanup`}
+            <span class="chev">▾</span>
+          </span>
+        </div>
+      </summary>
+      <div class="field-help mt-3.5" style="max-width: 64ch;">
+        Each report is a markdown file in Cloudflare R2 (object storage, separate from the D1 database). Deleting a target should remove its R2 files too — if that fails the row disappears but the file lingers, an <em>orphan</em>. This panel shows the live count and lets you sweep by hand. Sweeps also run automatically after every target deletion and once an hour from cron, so you shouldn't normally need to touch it.
+      </div>
+      <div class="label-muted mt-5 mb-2">Stored report files (R2)</div>
+      <div class="row items-baseline">
+        <div class="flex-1 text-sm">
+          ${r2Stats
+            ? `<strong class="font-medium">${r2Stats.scanned}</strong> file${r2Stats.scanned === 1 ? "" : "s"} · `
+              + (r2Stats.orphans.length === 0
+                  ? `<span class="text-zee-primary">no orphans</span>`
+                  : `<strong class="font-medium">${r2Stats.orphans.length}</strong> unaccounted`)
+            : `<span class="text-zee-muted">count unavailable</span>`}
+        </div>
+        <div>
+          <button id="gc-r2-btn" type="button" class="btn btn-danger"${r2Stats && r2Stats.orphans.length === 0 ? " disabled" : ""}>Sweep orphans now</button>
+          <div id="gc-r2-result" class="field-help mt-1"></div>
+        </div>
+      </div>
+
+      <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
+
+      <div class="label-muted mb-2">Activity heartbeat</div>
+      <div class="field-help" style="max-width: 64ch;">
+        Three timestamps that tell you whether the agent is actually running. <em>Cron last ran</em> should be under an hour. <em>Last attempt</em> is the most-recent <code>Run now</code> or cron-triggered run (overwritten on each new run, even if the run later crashes — so a click always leaves a fingerprint). <em>Last completed run</em> is the most recent row in the runs table that finished (success or error).
+      </div>
+      <div class="row mt-4 items-baseline">
+        <div class="flex-1 text-sm">
+          ${(() => {
+            const now = Date.now();
+            const cronAgeMin = lastCronRun > 0 ? Math.floor((now - lastCronRun) / 60_000) : null;
+            const cronColor = cronAgeMin == null
+              ? "text-zee-muted"
+              : cronAgeMin < 75 ? "text-zee-primary"
+              : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
+              : "text-[rgb(180,60,60)]";
+            const cronLine = cronAgeMin == null
+              ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
+              : `<span class="${cronColor}">${cronAgeMin} min ago</span>`;
+
+            let attemptLine = `<span class="text-zee-muted">no attempts recorded yet</span>`;
+            if (lastRunAttempt) {
+              const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
+              const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : `${Math.floor(startedAgo / 60)} min ago`;
+              if (lastRunAttempt.outcome === "in_flight") {
+                const stalled = startedAgo > 180; // 3 min — runs normally finish in 12-25s
+                const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
+                const label = stalled ? "stalled" : "in flight";
+                attemptLine = `<span class="${tone}">${label}</span> at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
+              } else if (lastRunAttempt.outcome === "success") {
+                attemptLine = `<span class="text-zee-primary">success</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
+              } else {
+                attemptLine = `<span class="text-[rgb(180,60,60)]">failed @ ${escapeHtml(lastRunAttempt.last_step)}</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel}</span>`;
+              }
+            }
+
+            let completedLine = `<span class="text-zee-muted">no completed runs yet</span>`;
+            if (lastCompletedRun) {
+              const ago = Math.floor((now - lastCompletedRun.created_at) / 60_000);
+              const agoLabel = ago < 1 ? "just now" : `${ago} min ago`;
+              const dur = lastCompletedRun.duration_ms ? fmtDuration(lastCompletedRun.duration_ms) : "";
+              const status = lastCompletedRun.status === "success"
+                ? `<span class="text-zee-primary">success</span>`
+                : `<span class="text-[rgb(180,60,60)]">error: ${escapeHtml((lastCompletedRun.error ?? "unknown").slice(0, 60))}</span>`;
+              completedLine = `${status} · <span class="label-muted">${agoLabel}${dur ? ` · ${dur}` : ""}</span>`;
+            }
+
+            // Tavily gather funnel from the most recent run. Shows the
+            // shape of "what we asked for → what survived each filter →
+            // what reached the writer", so a thin section in a report is
+            // diagnosable at a glance.
+            let gatherLine = `<span class="text-zee-muted">no gather data yet</span>`;
+            if (lastRunAttempt?.gather_stats) {
+              const g = lastRunAttempt.gather_stats;
+              if (g.tavily_queries > 0) {
+                gatherLine = `Tavily <strong class="font-medium">${g.tavily_queries}q</strong> · <span class="tt">${g.tavily_raw}</span> raw → <span class="tt">${g.after_score_filter}</span> (score) → <span class="tt">${g.after_url_dedupe}</span> (URL) → <span class="tt">${g.after_title_dedupe}</span> (story) → <strong class="font-medium tt">${g.final_kept}</strong> final`;
+              } else if (g.final_kept > 0) {
+                gatherLine = `<span class="text-zee-muted">no Tavily this run · ${g.final_kept} sources from typed tools</span>`;
+              }
+            }
+
+            return `
+              <div class="grid gap-y-3" style="grid-template-columns: 170px 1fr;">
+                <div class="label-muted">Cron last ran</div>
+                <div>${cronLine}</div>
+                <div class="label-muted">Last attempt</div>
+                <div>${attemptLine}</div>
+                <div class="label-muted">Last completed run</div>
+                <div>${completedLine}</div>
+                <div class="label-muted">Last run gather</div>
+                <div class="text-sm">${gatherLine}</div>
+              </div>`;
+          })()}
+        </div>
+      </div>
+
+      <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
+
+      <div class="label-muted mb-2">Recall memory (Vectorize)</div>
+      <div class="field-help" style="max-width: 64ch;">
+        Each report is turned into a 768-number "fingerprint" by an embedding model and stored in a Vectorize index. When the agent writes a new report it asks Vectorize <em>"what past reports are most similar?"</em> and uses the answer as "you've already covered…" context, so future reports build on past ones instead of repeating them. Embedding is best-effort — a failure here never blocks a report from being written, it just means that report won't be recall-able. The recalled reports also become inline [N] citations in the new report's body, marked with 📚 in the Sources footer.
+      </div>
+      <div class="field-help mt-2" style="max-width: 64ch;">
+        <span class="label-muted">Guardrails:</span>
+        layer last 2 same-target reports for continuity · query top 10 semantic hits ·
+        keep only similarity ≥ 0.65 · same-target first, cross-target as fallback ·
+        cap at 5 recalled per run.
+      </div>
+      <div class="label-muted mt-5 mb-2">Embedding status</div>
+      <div class="row items-baseline">
+        <div class="flex-1">
+          <div class="text-sm">
+            ${embedLastError
+              ? `<span class="text-[rgb(180,60,60)]">Last error: ${escapeHtml(embedLastError.message.slice(0, 90))}${embedLastError.message.length > 90 ? "…" : ""}</span>
+                 <span class="label-muted ml-2">${escapeHtml(timeAgo(embedLastError.at))}</span>`
+              : embedLastOkAt > 0
+                ? `<span class="text-zee-primary">Last successful embed</span> <span class="label-muted">${escapeHtml(timeAgo(embedLastOkAt))}</span>`
+                : `<span class="text-zee-muted">No embed attempted yet on this version.</span>`}
+          </div>
+          <div class="field-help mt-1">
+            ${totalReports} report${totalReports === 1 ? "" : "s"} in D1. Backfill re-embeds every report (idempotent) — safe to click anytime.
+          </div>
+        </div>
+        <div>
+          <button id="backfill-memory-btn" type="button" class="btn btn-secondary"${totalReports === 0 ? " disabled" : ""}>Backfill memory</button>
+          <div id="backfill-memory-result" class="field-help mt-1"></div>
+        </div>
+      </div>
+    </details>
 
     <script>
       const $ = (id) => document.getElementById(id);
@@ -1072,6 +1472,76 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           }
           result.textContent = 'Processed ' + d.processed + ' · skipped ' + d.skipped + ' · errors ' + d.errors;
           setTimeout(() => location.reload(), 1200);
+        } catch (err) {
+          result.textContent = 'Failed: ' + (err && err.message || err);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      $('search-tuning-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = e.target.querySelector('button[type=submit]');
+        const result = $('search-tuning-result');
+        const orig = btn.textContent;
+        btn.disabled = true;
+        result.textContent = '';
+        try {
+          const res = await fetch('/admin/settings', { method: 'POST', body: new FormData(e.target) });
+          const d = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            btn.textContent = 'Error';
+            result.textContent = d.error || ('HTTP ' + res.status);
+            return;
+          }
+          btn.textContent = 'Saved ✓';
+          result.textContent = 'tavily_min_score = ' + (d.updated?.tavily_min_score ?? '?');
+          setTimeout(() => location.reload(), 800);
+        } catch (err) {
+          btn.textContent = 'Error';
+          result.textContent = String(err && err.message || err);
+        } finally {
+          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+        }
+      });
+
+      $('backfill-memory-btn')?.addEventListener('click', async () => {
+        const btn = $('backfill-memory-btn');
+        const result = $('backfill-memory-result');
+        btn.disabled = true;
+        result.textContent = 'Embedding…';
+        try {
+          const res = await fetch('/admin/memory/backfill', { method: 'POST' });
+          const d = await res.json();
+          if (!res.ok) {
+            result.textContent = d.error || ('HTTP ' + res.status);
+            return;
+          }
+          const failTail = d.failed ? ' · ' + d.failed + ' failed' : '';
+          result.textContent = 'Scanned ' + d.scanned + ' · embedded ' + d.embedded + failTail;
+          setTimeout(() => location.reload(), 1500);
+        } catch (err) {
+          result.textContent = 'Failed: ' + (err && err.message || err);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      $('gc-r2-btn').addEventListener('click', async () => {
+        const btn = $('gc-r2-btn');
+        const result = $('gc-r2-result');
+        btn.disabled = true;
+        result.textContent = 'Sweeping…';
+        try {
+          const res = await fetch('/admin/storage/gc', { method: 'POST' });
+          const d = await res.json();
+          if (!res.ok) {
+            result.textContent = d.error || ('HTTP ' + res.status);
+            return;
+          }
+          const fails = d.failures && d.failures.length ? ' · ' + d.failures.length + ' failed' : '';
+          result.textContent = 'Scanned ' + d.scanned + ' · ' + d.orphans + ' orphans · deleted ' + d.deleted + fails;
+          if (d.deleted > 0 || (d.failures && d.failures.length)) setTimeout(() => location.reload(), 1200);
         } catch (err) {
           result.textContent = 'Failed: ' + (err && err.message || err);
         } finally {
@@ -1191,9 +1661,20 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { adminFooter: true });
   }
   const skills = await listSkills(env);
-  const reports = await listReportsForTarget(env, target.id, 10);
-  const runRows = await env.DB.prepare(
-    "SELECT * FROM runs WHERE target_id = ? ORDER BY created_at DESC LIMIT 10",
+  const activityRows = await env.DB.prepare(
+    `SELECT runs.*,
+            reports.title         AS report_title,
+            reports.word_count    AS report_word_count,
+            reports.chat_model    AS report_chat_model,
+            reports.sources_json  AS report_sources_json,
+            skills.name           AS skill_name,
+            skills.slug           AS skill_slug
+       FROM runs
+       LEFT JOIN reports ON runs.report_id = reports.id
+       LEFT JOIN skills  ON runs.skill_id  = skills.id
+       WHERE runs.target_id = ?
+       ORDER BY runs.created_at DESC
+       LIMIT 20`,
   )
     .bind(target.id)
     .all<any>();
@@ -1210,27 +1691,99 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     `<option value="${h}"${target.cadence_hours === h ? " selected" : ""}>${h === 1 ? "every hour" : h < 24 ? `every ${h} hours` : h === 24 ? "every 24 hours" : h === 72 ? "every 3 days" : "every week"}</option>`,
   ).join("");
 
-  const reportsList = reports.length === 0
-    ? `<div class="empty">No reports yet.</div>`
-    : `<ul class="list-none">${reports.map((r) => `
-        <li class="py-2 border-b border-[rgba(232,228,222,0.6)]">
-          <a href="/report/${escapeHtml(r.id)}" class="text-sm">
-            <span class="text-zee-text">${escapeHtml(r.title)}</span>
-            <span class="label-muted ml-2">${escapeHtml(timeAgo(r.created_at))}</span>
-          </a>
-        </li>
-      `).join("")}</ul>`;
+  /** Wraps a meta item as a proper flex child so gap-x spacing applies.
+   *  Each entry becomes a <span>; the joiner is a faint "·" with its own
+   *  margin so adjacent items don't visually glue together. */
+  const metaSep = `<span class="text-zee-border" aria-hidden="true">·</span>`;
+  const wrapMeta = (inner: string, extraClass = "") =>
+    `<span class="${extraClass}">${inner}</span>`;
 
-  const runRowsHtml = (runRows.results ?? []).map((r: any) => `
-    <tr>
-      <td class="tt">${escapeHtml(timeAgo(r.created_at))}</td>
-      <td>${escapeHtml(r.triggered_by)}</td>
-      <td>${r.status === "success"
-            ? `<span class="badge badge-active">success</span>`
-            : `<span class="badge badge-error">${escapeHtml(r.error ?? "error").slice(0, 80)}</span>`}</td>
-      <td class="tt">${r.duration_ms ? `${r.duration_ms}ms` : ""}</td>
-    </tr>
-  `).join("");
+  const activityList = (activityRows.results ?? []).length === 0
+    ? `<div class="empty">No activity yet.</div>`
+    : `<ul class="list-none divide-y divide-[rgba(232,228,222,0.6)]">${(activityRows.results ?? []).map((r: any) => {
+        const isSuccess = r.status === "success" && r.report_id;
+        const skillLabel = r.skill_name
+          ? `<a href="/skill/${escapeHtml(r.skill_slug)}" class="text-zee-primary hover:underline" onclick="event.stopPropagation()">${escapeHtml(r.skill_name)}</a>`
+          : `<span class="label-muted">(deleted skill)</span>`;
+
+        const metaParts: string[] = [
+          wrapMeta(escapeHtml(timeAgo(r.created_at)), "tt"),
+          wrapMeta(skillLabel),
+          wrapMeta(escapeHtml(r.triggered_by)),
+        ];
+        if (isSuccess) {
+          if (r.report_word_count != null) {
+            metaParts.push(wrapMeta(`${r.report_word_count.toLocaleString()} words`));
+          }
+          if (r.report_chat_model) {
+            metaParts.push(wrapMeta(escapeHtml(chatModelShortLabel(r.report_chat_model))));
+          }
+          // Visibility into what context the writer had: count web sources
+          // vs archive (prior-report) sources from the persisted citations.
+          if (r.report_sources_json) {
+            try {
+              const cites = JSON.parse(r.report_sources_json) as Array<{ kind?: string }>;
+              if (Array.isArray(cites) && cites.length > 0) {
+                const archive = cites.filter((c) => c?.kind === "archive").length;
+                const web = cites.length - archive;
+                const parts: string[] = [];
+                if (web > 0) parts.push(`${web} web`);
+                if (archive > 0) parts.push(`${archive} 📚`);
+                if (parts.length) metaParts.push(wrapMeta(parts.join(" + ") + " sources"));
+              }
+            } catch { /* malformed JSON — just skip */ }
+          }
+        }
+        if (r.duration_ms) metaParts.push(wrapMeta(escapeHtml(fmtDuration(r.duration_ms)), "tt"));
+        if (isSuccess) {
+          metaParts.push(
+            `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary hover:underline">view report →</a>`,
+          );
+        }
+
+        const metaLine = `
+          <div class="field-help mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1">
+            ${metaParts.join(metaSep)}
+          </div>`;
+
+        if (isSuccess) {
+          return `
+            <li class="py-4 flex items-start gap-3.5">
+              <span class="activity-dot activity-dot--ok" aria-hidden="true">✓</span>
+              <div class="flex-1 min-w-0">
+                <a href="/report/${escapeHtml(r.report_id)}" class="text-sm font-medium text-zee-text hover:text-zee-primary block leading-snug">
+                  ${escapeHtml(r.report_title ?? "Untitled report")}
+                </a>
+                ${metaLine}
+              </div>
+              <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline shrink-0" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
+                <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+              </form>
+            </li>`;
+        }
+        // Failure path: no report, no view, no delete. The error message is
+        // tagged with the step it failed at (e.g. "gather: Tavily timeout"),
+        // so we split that off and render it as a small badge.
+        const errFull = r.error ?? "Unknown error";
+        const stepMatch = errFull.match(/^(init|plan|gather|recall|write|persist|done):\s*(.*)$/s);
+        const failedStep = stepMatch?.[1];
+        const errBody = stepMatch ? stepMatch[2] : errFull;
+        const errShort = errBody.length > 120 ? errBody.slice(0, 120) + "…" : errBody;
+        const titleLine = failedStep
+          ? `Run failed at <code class="tt font-mono text-[rgb(180,60,60)]">${failedStep}</code>`
+          : `Run failed`;
+        return `
+          <li class="py-4 flex items-start gap-3.5">
+            <span class="activity-dot activity-dot--err" aria-hidden="true">✕</span>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium text-zee-text leading-snug">${titleLine}</div>
+              ${metaLine}
+              <div class="field-help mt-2 text-[rgb(180,60,60)] break-words leading-relaxed" title="${escapeHtml(errFull)}">
+                ${escapeHtml(errShort)}
+              </div>
+            </div>
+          </li>`;
+      }).join("")}</ul>`;
 
   const body = `
     <section class="pt-6 pb-2">
@@ -1254,8 +1807,13 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     </div>
     ` : ""}
 
-    <div class="card">
-      <div class="h3-row"><h3>Configure</h3></div>
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Configure</h3>
+          <span class="chev">▾</span>
+        </div>
+      </summary>
       <form id="update-target-form" method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
         <div class="field">
           <label>Kind</label>
@@ -1294,19 +1852,21 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <button class="btn btn-danger" type="submit">Delete target</button>
         </form>
       </div>
-    </div>
+    </details>
 
-    <div class="card">
-      <div class="h3-row"><h3>Reports</h3><a href="/target/${escapeHtml(target.slug)}" class="text-xs text-zee-primary">all →</a></div>
-      ${reportsList}
-    </div>
-
-    <div class="card">
-      <div class="h3-row"><h3>Run history</h3></div>
-      ${runRowsHtml
-        ? `<table class="runs"><thead><tr><th>When</th><th>Trigger</th><th>Status</th><th>Duration</th></tr></thead><tbody>${runRowsHtml}</tbody></table>`
-        : `<div class="empty">No runs yet.</div>`}
-    </div>
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Activity</h3>
+          <span class="text-xs">
+            <a href="/target/${escapeHtml(target.slug)}" class="text-zee-primary" onclick="event.stopPropagation()">all reports →</a>
+            <span class="label-muted ml-2">${(activityRows.results ?? []).length} shown</span>
+            <span class="chev">▾</span>
+          </span>
+        </div>
+      </summary>
+      ${activityList}
+    </details>
   `;
   return shell(`${target.name} · Admin`, body, { activeNav: "admin", adminFooter: true });
 }

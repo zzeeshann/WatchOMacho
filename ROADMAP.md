@@ -2,10 +2,14 @@
 
 Forward plan for WatchOMacho. Where v4 is, where it's going, and what's deliberately out of scope right now.
 
-> **Status (2026-05-17):**
+> **Status (2026-05-18):**
 > - Level 1+2 shipped via Tavily ([PLAN.md](PLAN.md))
 > - Level 3 partially shipped — first four UK typed tools (Land Registry, ONS, data.police.uk, Companies House) + multi-tool refactor ([PLAN_LEVEL3.md](PLAN_LEVEL3.md))
-> - Level 4 (true agentic tool-use loop) still deferred
+> - **Memory loop shipped** — embed every report, recall similar prior reports as `[N]` archive citations alongside web sources, navigable graph via 📚 markers ([BOOK.md Ch 15](BOOK.md))
+> - **Observability shipped** — step-level heartbeat + per-run Tavily gather funnel visible in admin Maintenance card ([BOOK.md Ch 16](BOOK.md))
+> - **Gather tuning shipped** — Tavily max_results=20, planner cap 10, title-Jaccard dedupe, dynamic skill structure, MAX_CHARS_PER_SOURCE=4000 on Haiku ([BOOK.md Ch 17](BOOK.md))
+> - **Admin Search-tuning card shipped** — `tavily_min_score` editable from `/admin` ([BOOK.md Ch 18](BOOK.md))
+> - Level 4 (true agentic tool-use loop) still deferred — current pipeline is fully sufficient
 
 ## Where we are — v4 + Tavily (current)
 

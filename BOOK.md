@@ -540,3 +540,88 @@ Things considered and rejected (or deferred):
 ---
 
 That's the book. The shortest way to understand this project is to add a target, attach a skill, and watch a report appear. The shortest way to make it yours is to write the skill *you'd* use and apply it to *your* targets.
+
+---
+
+## Chapter 15 — Making the agent intelligent (memory)
+
+Up to this point, every report was an island. The agent searched the web, wrote a report, persisted it, and forgot. Tomorrow's report on the same target had no memory of yesterday's coverage.
+
+The fix was a two-step recall loop:
+
+1. **Each report, when written, gets embedded** into a 768-number vector (Cloudflare Workers AI's `@cf/baai/bge-base-en-v1.5`) and upserted into a Vectorize index. Free, runs in milliseconds, one row per report.
+2. **Each new report, before writing, queries Vectorize** for the most similar past reports, layered with the most recent same-target ones (via D1 for guaranteed chronological continuity).
+
+What the writer prompt then sees: alongside today's fresh web sources, a numbered list of prior reports — each marked as a "PRIOR REPORT", each citeable as `[N]` like any other source. The system prompt explicitly says *"build on them, surface what's changed, don't repeat verbatim"*.
+
+The footer renders all citations side by side. Web entries open externally; archive (📚) entries link to `/report/:id` internally. Click the superscript `[4]` in a body paragraph and you land on the prior report it builds on. The archive becomes a *graph*, not a stream.
+
+Side benefit none of us predicted: when you delete a report, the cascade now has *three* artefacts to clean (R2 blob, D1 row, Vectorize entry, runs row). That forced us to build proper cleanup machinery — silent failures replaced with logged ones, self-healing R2 sweep, hourly cron sweep, live orphan count in the admin. Memory and good housekeeping turned out to be the same project.
+
+---
+
+## Chapter 16 — Making the agent visible (observability)
+
+The previous chapter made the agent smarter. This one made it *legible*.
+
+The problem we hit: a manual "Run now" click could disappear into the worker and leave zero trace. No row in the runs table, no error in the log, no signal at all. We learned this the hard way — clicked "Run now", got nothing, had to reverse-engineer our own admin pages to figure out *something happened but where did it go?*
+
+The fix is a single setting row, `last_run_attempt`, written at the start of `runResearch` and updated at every step boundary:
+
+```
+init → plan → gather → recall → write → persist → done
+```
+
+Every Run now click writes this row before doing anything else. The worker dies mid-flight? The row still exists, frozen at whatever step it reached. The error path tags `runs.error` with the failing step (`gather: Tavily timeout`, `write: 5021: exceeded context window`). The Activity row badge becomes `failed @ gather` instead of an opaque red blob.
+
+Then we extended the row with a `gather_stats` object — six counters tracking the candidate flow through every Tavily filter:
+
+```
+Tavily 10q · 166 raw → 10 (score) → 10 (URL) → 10 (story) → 10 final
+```
+
+That single line, displayed in the Maintenance card on each admin load, answers: *"is the agent actually searching? are sources making it through? where is the funnel choking?"* — without ever opening a log file.
+
+The principle here is older than agents: **you can't operate what you can't see**. A pipeline with five stages and no inter-stage observability is a black box that occasionally produces output. Once we surfaced the funnel, every subsequent tuning question ("does lowering min_score help?") had an answer in real time — visible the moment we ran the next report.
+
+---
+
+## Chapter 17 — Making the sources good (gather tuning)
+
+With memory in and observability live, the next question became obvious: *why are some reports thin?* The funnel told us. Tavily defaults are conservative (5 results per query), our planner was capped low (6 queries), and our score filter was strict (0.4). That meant 6 × 5 = 30 candidates max, ~10 surviving filter, a thin set reaching the writer.
+
+Three changes, all visible in one funnel line:
+
+- **Tavily `max_results: 5 → 20`** — its hard maximum. Same 1-credit cost per query (Tavily charges per request, not per result). 4× the candidate pool for $0.
+- **Planner cap `6 → 10`** with a "exactly 10, always 10, never fewer" prompt — this exposed a quirk: Llama 3.3 70B (FP8-quantised on Workers AI) cheerfully ignores `"exactly N"` instructions and produces whatever feels right (sometimes 2). Haiku 4.5 follows it exactly. We did the A/B and switched the default chat model to Haiku.
+- **Title-Jaccard dedupe**: same story from BBC + Reuters + AP used to eat 3 slots. Now they cluster (≥70% word overlap on normalised titles), the top 2 by Tavily score survive — preserves "where outlets disagree" cross-references without crowding diverse coverage out.
+
+Then the third lever: stop forcing the report's *shape*. The original skill listed 7 fixed sections ("Wars and military", "Politics and policy", "Money and markets", …). Quiet news days produced "## Science and tech — Not enough source material yet." every single time. Cards filled with apology text.
+
+The rewrite: tell the writer *the day's news decides the sections*. Group by what's shared. A quiet day might be 3 sections, a busy day 8. Always end with "Where outlets disagree" + "The story nobody's covering". Suddenly reports started leading with whatever the news actually was — Ukraine drone strike, Ebola declaration, India rupee — instead of repeating a template.
+
+Both ends — search input AND output structure — became dynamic. The skill is now a *guidance document for the planner*, not a literal list of queries.
+
+---
+
+## Chapter 18 — Making the agent tunable (admin knobs)
+
+The principle we settled on for surfacing knobs to admin: **one knob = one card position**.
+
+Today there's one knob worth tuning by hand: `tavily_min_score`. So there's one admin field for it, in a card called "Search tuning". Stored in the existing `settings` table (no schema change). Read once per Tavily call. Validated 0–1 server-side. Default 0.4, the Tavily-documented bottom rail.
+
+The card is *designed* to grow — if a third or fourth knob ever justifies admin exposure, the slot is there. But the discipline is "earn the UI" — most tuning is fine in code where it can't accidentally produce a state the user has to explain to themselves later.
+
+Other things stayed code-side:
+- Recall topK / similarity threshold / cap (set-and-forget guardrails)
+- Title-Jaccard threshold + keep-per-cluster (algorithmic, not editorial)
+- `MAX_CHARS_PER_SOURCE` (driven by model context window, not editorial choice)
+- Planner cap (one number that should rarely change)
+
+The line we drew: **editorial knobs in the skill markdown, system knobs in admin settings, algorithmic knobs in code**. Three layers, increasing surface area, decreasing editability — which exactly matches who should be allowed to change what.
+
+---
+
+That's the second half of the book — chapters 15–18 cover memory, observability, gather tuning, and admin knobs. Together with chapters 1–14 (the original v4 + Tavily + Level 3 typed tools narrative), it's the full picture of what WatchOMacho is now.
+
+The shortest way to understand this project is still: add a target, attach a skill, watch a report appear. The shortest way to *trust* it is: open the Maintenance card and watch the funnel.
