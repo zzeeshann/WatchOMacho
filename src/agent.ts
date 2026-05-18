@@ -396,25 +396,231 @@ export async function updateTarget(
     .run();
 }
 
-export async function deleteTarget(env: Env, id: string): Promise<void> {
-  // Best-effort cleanup of associated reports' R2 blobs first.
-  const rows = await env.DB.prepare("SELECT r2_key FROM reports WHERE target_id = ?")
-    .bind(id)
-    .all<{ r2_key: string }>();
-  for (const r of rows.results ?? []) {
-    await env.REPORTS.delete(r.r2_key).catch(() => {});
+/** R2 keys that aren't reports and must never be considered orphans. Bump
+ *  this set when adding new static assets. */
+const R2_STATIC_KEEP: ReadonlySet<string> = new Set(["static/tailwind.v1.css"]);
+
+/** Scan R2 once, returning total object count and the keys not referenced by
+ *  any `reports.r2_key`. Shared by the count-only admin display and the
+ *  delete-and-sweep `gcOrphanedR2`. */
+export async function findOrphanedR2(
+  env: Env,
+): Promise<{ scanned: number; orphans: string[] }> {
+  const known = new Set<string>(R2_STATIC_KEEP);
+  const rows = await env.DB.prepare("SELECT r2_key FROM reports").all<{ r2_key: string }>();
+  for (const r of rows.results ?? []) known.add(r.r2_key);
+
+  let scanned = 0;
+  const orphans: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page: R2Objects = await env.REPORTS.list({ cursor, limit: 1000 });
+    for (const o of page.objects) {
+      scanned++;
+      if (!known.has(o.key)) orphans.push(o.key);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  return { scanned, orphans };
+}
+
+/** Sweep R2 for blobs not referenced by any `reports.r2_key`. Used as the
+ *  self-heal step at the end of `deleteTarget`, the cron-tick periodic
+ *  sweeper, and the manual admin one-shot via `/admin/storage/gc`. Failures
+ *  are logged, not swallowed. */
+export async function gcOrphanedR2(
+  env: Env,
+): Promise<{ scanned: number; orphans: number; deleted: number; failures: string[] }> {
+  const { scanned, orphans } = await findOrphanedR2(env);
+
+  let deleted = 0;
+  const failures: string[] = [];
+  for (const key of orphans) {
+    try {
+      await env.REPORTS.delete(key);
+      deleted++;
+    } catch (e) {
+      console.error("gcOrphanedR2: delete failed", key, e);
+      failures.push(key);
+    }
   }
-  // Pull any report ids so we can drop their Vectorize entries.
-  const rps = await env.DB.prepare("SELECT id FROM reports WHERE target_id = ?")
+  return { scanned, orphans: orphans.length, deleted, failures };
+}
+
+// ─── recall memory (Vectorize) ─────────────────────────────────────────────
+
+/** Shape required by `embedReport`. Keeps the helper agnostic to whether
+ *  the report was just written (runResearch) or backfilled (from D1+R2). */
+export interface ReportForEmbed {
+  id: string;
+  target_id: string;
+  target_name: string;
+  target_slug: string;
+  skill_id: string | null;
+  skill_slug: string;
+  skill_name: string;
+  title: string;
+  snippet: string;
+  body: string;
+  created_at: number;
+}
+
+/** Embed a report and upsert it into Vectorize. Outcome is recorded to the
+ *  settings table (`embed_last_ok_at` / `embed_last_error`) so the admin
+ *  page can surface failures without anyone reading wrangler logs. Never
+ *  throws — by design embedding is best-effort, so the caller can ignore
+ *  the return value if it wants to. */
+export async function embedReport(
+  env: Env,
+  r: ReportForEmbed,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const text = `${r.target_name}. ${r.skill_name}. ${r.body}`.slice(0, 2000);
+    const emb: any = await env.AI.run(EMBED_MODEL, { text: [text] });
+    const vec = emb?.data?.[0];
+    if (!vec || !Array.isArray(vec)) {
+      throw new Error("embedding model returned no vector");
+    }
+    await env.MEMORY.upsert([
+      {
+        id: r.id,
+        values: vec,
+        metadata: {
+          target_id: r.target_id,
+          target_name: r.target_name,
+          target_slug: r.target_slug,
+          skill_slug: r.skill_slug,
+          title: r.title,
+          snippet: r.snippet,
+          created_at: r.created_at,
+        },
+      },
+    ]);
+    await setSetting(env, "embed_last_ok_at", String(Date.now()));
+    await setSetting(env, "embed_last_error", "");
+    return { ok: true };
+  } catch (e: any) {
+    const msg = String(e?.message ?? e).slice(0, 500);
+    console.error("embedReport failed", r.id, msg);
+    await setSetting(
+      env,
+      "embed_last_error",
+      JSON.stringify({ message: msg, at: Date.now(), report_id: r.id }),
+    ).catch(() => {});
+    return { ok: false, error: msg };
+  }
+}
+
+/** Walk every report in D1, fetch the markdown from R2, and re-embed via
+ *  `embedReport`. Idempotent — Vectorize upsert overwrites by id, so
+ *  running this twice is harmless. Reports whose R2 blob is missing are
+ *  counted as failures (the body is the embed input, so without it we
+ *  can't produce a meaningful vector). */
+export async function backfillMemory(
+  env: Env,
+): Promise<{ scanned: number; embedded: number; failed: number; errors: string[] }> {
+  const rows = await env.DB.prepare(
+    `SELECT r.id, r.target_id, r.skill_id, r.title, r.snippet, r.r2_key, r.created_at,
+            t.name AS target_name, t.slug AS target_slug,
+            s.slug AS skill_slug, s.name AS skill_name
+       FROM reports r
+       LEFT JOIN targets t ON r.target_id = t.id
+       LEFT JOIN skills  s ON r.skill_id  = s.id
+       ORDER BY r.created_at DESC`,
+  ).all<any>();
+
+  let embedded = 0;
+  let failed = 0;
+  const errors: string[] = [];
+  const scanned = rows.results?.length ?? 0;
+
+  for (const r of rows.results ?? []) {
+    const obj = await env.REPORTS.get(r.r2_key);
+    if (!obj) {
+      failed++;
+      errors.push(`${r.id}: R2 blob missing`);
+      continue;
+    }
+    const body = await obj.text();
+    const res = await embedReport(env, {
+      id: r.id,
+      target_id: r.target_id,
+      target_name: r.target_name ?? "",
+      target_slug: r.target_slug ?? "",
+      skill_id: r.skill_id,
+      skill_slug: r.skill_slug ?? "",
+      skill_name: r.skill_name ?? "",
+      title: r.title,
+      snippet: r.snippet,
+      body,
+      created_at: r.created_at,
+    });
+    if (res.ok) embedded++;
+    else {
+      failed++;
+      errors.push(`${r.id}: ${res.error.slice(0, 120)}`);
+    }
+  }
+
+  return { scanned, embedded, failed, errors };
+}
+
+/** Delete a single report and everything attached to it: R2 blob, Vectorize
+ *  entry, the reports row, and the matching runs row. The run row goes too
+ *  because once the report is gone the run is just an unmoored "something
+ *  ran" record with no payload to link to. */
+export async function deleteReport(env: Env, id: string): Promise<void> {
+  const row = await env.DB.prepare("SELECT r2_key FROM reports WHERE id = ?")
     .bind(id)
-    .all<{ id: string }>();
-  const ids = (rps.results ?? []).map((r) => r.id);
+    .first<{ r2_key: string }>();
+  if (!row) return;
+  try {
+    await env.REPORTS.delete(row.r2_key);
+  } catch (e) {
+    console.error("deleteReport: R2 delete failed", row.r2_key, e);
+  }
+  try {
+    await env.MEMORY.deleteByIds([id]);
+  } catch (e) {
+    console.error("deleteReport: Vectorize deleteByIds failed", e);
+  }
+  await env.DB.prepare("DELETE FROM reports WHERE id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM runs WHERE report_id = ?").bind(id).run();
+}
+
+export async function deleteTarget(env: Env, id: string): Promise<void> {
+  const rows = await env.DB.prepare("SELECT id, r2_key FROM reports WHERE target_id = ?")
+    .bind(id)
+    .all<{ id: string; r2_key: string }>();
+  const reportRows = rows.results ?? [];
+  const ids: string[] = [];
+  for (const r of reportRows) {
+    ids.push(r.id);
+    try {
+      await env.REPORTS.delete(r.r2_key);
+    } catch (e) {
+      // Don't abort — gcOrphanedR2 below will retry the leak and surface it
+      // in the log. Aborting would leave D1 rows pointing at a half-deleted
+      // bucket, which is worse than a transient orphan.
+      console.error("deleteTarget: R2 delete failed", r.r2_key, e);
+    }
+  }
   if (ids.length > 0) {
-    await env.MEMORY.deleteByIds(ids).catch(() => {});
+    try {
+      await env.MEMORY.deleteByIds(ids);
+    } catch (e) {
+      console.error("deleteTarget: Vectorize deleteByIds failed", e);
+    }
   }
   await env.DB.prepare("DELETE FROM reports WHERE target_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM runs WHERE target_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM targets WHERE id = ?").bind(id).run();
+
+  const gc = await gcOrphanedR2(env);
+  if (gc.orphans > 0 || gc.failures.length > 0) {
+    console.log("deleteTarget: gcOrphanedR2", gc);
+  }
 }
 
 // ─── skills ────────────────────────────────────────────────────────────────
@@ -663,7 +869,8 @@ async function planResearch(env: Env, skill: Skill, target: Target, model: strin
           `You are the planning step of a research agent.
 You are given a SKILL (a procedure document) and a TARGET (the thing being researched).
 Return ONLY a JSON object: { "queries": [string, ...] }
-with 3–6 concrete web search queries that, executed and synthesised, will produce a good report.
+with EXACTLY 10 concrete web search queries — always 10, never fewer.
+If you can't think of 10 obviously distinct angles, broaden the net: cover different regions, different outlets (Reuters, AP, BBC, Al Jazeera, Le Monde, Deutsche Welle, Nikkei Asia, etc.), different sectors (politics, conflicts, markets, science, society, climate, sports). It is far better to produce 10 queries of varying angle than to under-plan.
 Replace any "{target}" placeholder in the skill with the target's name. Use specific, narrow queries — not "everything about X". No extra text outside the JSON.`,
       },
       {
@@ -671,7 +878,7 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
         content: `SKILL\n=====\n${skill.procedure_md}\n\nTARGET\n======\nName: ${target.name}\nKind: ${target.kind ?? "(unspecified)"}\nDescription: ${target.description ?? "(none)"}\n\nReturn the JSON plan now.`,
       },
     ],
-    max_tokens: 400,
+    max_tokens: 600,
   });
   const raw = res.response;
   const m = raw.match(/\{[\s\S]*\}/);
@@ -682,7 +889,7 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
         const queries = parsed.queries
           .map((q: any) => String(q).trim())
           .filter((q: string) => q && q.length <= 250)
-          .slice(0, 6);
+          .slice(0, 10);
         if (queries.length > 0) return { queries };
       }
     } catch {
@@ -704,6 +911,12 @@ interface GatheredSource {
 // Cap each source's text so the writer prompt stays bounded. With 20 sources
 // at 4000 chars each, worst-case input is ~80kB — comfortably within every
 // chat model in ALLOWED_CHAT_MODELS.
+// Per-source content cap (chars). Multiplied by the kept-source count this
+// is the dominant slice of the writer's prompt. 4000 chars ≈ 1000 tokens
+// per source. At ~30 sources, ~30k tokens of source content fits easily
+// in Haiku 4.5's 200k context window. Note: if you switch the chat model
+// back to Workers AI Llama 3.3 70B (24k context), runs may fail at ~15+
+// sources — drop this to 2000 in that case (or add model-aware scaling).
 const MAX_CHARS_PER_SOURCE = 4000;
 
 // A skill can declare ONE OR MORE tool calls. Each call records which tool
@@ -781,25 +994,88 @@ export function parseSkillTools(procedureMd: string): SkillToolCall[] {
   return calls;
 }
 
+/** Funnel stats from a single Tavily search batch, surfaced to the admin
+ *  Maintenance heartbeat so you can see whether the gather pipeline is
+ *  healthy or where it's choking. `final_kept` is the count of sources
+ *  passed onward (after all tools, after the final cap), not just Tavily's. */
+export interface GatherStats {
+  tavily_queries: number;
+  tavily_raw: number;
+  after_score_filter: number;
+  after_url_dedupe: number;
+  after_title_dedupe: number;
+  final_kept: number;
+}
+
+/** Normalise a headline for word-set comparison. Lowercase, strip
+ *  punctuation, collapse whitespace. */
+function normalizeTitle(t: string): string {
+  return t.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Tokenise a title into a set of "content" words (length ≥ 3, not a
+ *  function word). Used as the input to Jaccard similarity for
+ *  "same story, different outlet" detection. */
+const TITLE_STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "into", "over", "than", "that", "this", "these",
+  "those", "what", "when", "where", "who", "why", "how", "are", "was", "were", "has",
+  "have", "had", "but", "not", "you", "your", "they", "them", "their", "its", "his",
+  "her", "she", "him", "all", "any", "out", "off", "now", "new", "old",
+  "says", "said", "told", "amid", "after", "before", "during", "while", "since",
+]);
+function titleWords(t: string): Set<string> {
+  return new Set(
+    normalizeTitle(t)
+      .split(" ")
+      .filter((w) => w.length >= 3 && !TITLE_STOPWORDS.has(w)),
+  );
+}
+
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersect = 0;
+  for (const w of a) if (b.has(w)) intersect++;
+  const union = a.size + b.size - intersect;
+  return union === 0 ? 0 : intersect / union;
+}
+
 /** Step 2: gather evidence by dispatching each tool call to its handler.
  *  Each handler returns zero or more GatheredSource rows in the common
  *  `{ title, url, content }` shape; typed tools flatten their structured
- *  output to markdown so the writer LLM doesn't need to know the shape. */
+ *  output to markdown so the writer LLM doesn't need to know the shape.
+ *  Returns the stats funnel alongside the sources so admin can surface
+ *  "Tavily 142 → 87 (score) → 71 (URL) → 34 (story) → 30 final". */
 async function gatherSources(
   env: Env,
   queries: string[],
   target: Target,
   calls: SkillToolCall[],
-): Promise<GatheredSource[]> {
+): Promise<{ sources: GatheredSource[]; stats: GatherStats }> {
   await checkBudget(env, "searches");
 
+  const stats: GatherStats = {
+    tavily_queries: 0,
+    tavily_raw: 0,
+    after_score_filter: 0,
+    after_url_dedupe: 0,
+    after_title_dedupe: 0,
+    final_kept: 0,
+  };
   const out: GatheredSource[] = [];
+
   for (const c of calls) {
     try {
       switch (c.tool) {
-        case "tavily":
-          out.push(...(await gatherTavily(env, queries, c)));
+        case "tavily": {
+          const { sources, stats: tavilyStats } = await gatherTavily(env, queries, c);
+          stats.tavily_queries += tavilyStats.tavily_queries;
+          stats.tavily_raw += tavilyStats.tavily_raw;
+          stats.after_score_filter += tavilyStats.after_score_filter;
+          stats.after_url_dedupe += tavilyStats.after_url_dedupe;
+          stats.after_title_dedupe += tavilyStats.after_title_dedupe;
+          out.push(...sources);
           break;
+        }
         case "land_registry":
           out.push(...(await gatherLandRegistry(c, target)));
           break;
@@ -820,49 +1096,123 @@ async function gatherSources(
     }
   }
 
-  return out.slice(0, 20).map((s) => ({
+  // Defensive cap. Today's filters settle at ~30–60 sources; 100 is
+  // headroom for skills with many queries or unusually diverse news.
+  const SOURCES_CAP = 100;
+  const finalSources = out.slice(0, SOURCES_CAP).map((s) => ({
     ...s,
     content: s.content.slice(0, MAX_CHARS_PER_SOURCE),
   }));
+  stats.final_kept = finalSources.length;
+  return { sources: finalSources, stats };
 }
 
 async function gatherTavily(
   env: Env,
   queries: string[],
   c: SkillToolCall,
-): Promise<GatheredSource[]> {
+): Promise<{ sources: GatheredSource[]; stats: GatherStats }> {
+  const emptyStats: GatherStats = {
+    tavily_queries: 0,
+    tavily_raw: 0,
+    after_score_filter: 0,
+    after_url_dedupe: 0,
+    after_title_dedupe: 0,
+    final_kept: 0,
+  };
+
   if (c.op === "extract" && c.sources?.length) {
     const extracted = await tavilyExtract(env.TAVILY_API_KEY, c.sources).catch(() => []);
     await bumpUsage(env, "searches", Math.max(1, Math.ceil(c.sources.length / 5)));
-    return extracted.map((r) => ({ title: r.url, url: r.url, content: r.raw_content }));
+    return {
+      sources: extracted.map((r) => ({ title: r.url, url: r.url, content: r.raw_content })),
+      stats: emptyStats,
+    };
   }
+
+  // Ask Tavily for max_results=20 per query (Tavily's hard upper bound).
+  // Cost is per-request (1 credit), not per-result — so 20 results costs the
+  // same as 5. Wider candidate pool = better signal post-filter.
   const opts: TavilySearchOptions = {
     topic: (c.params["Search topic"]?.toLowerCase() as TavilySearchOptions["topic"]) ?? "general",
     time_range: c.params["Time range"]?.toLowerCase() as TavilySearchOptions["time_range"],
     search_depth: (c.params["Depth"]?.toLowerCase() as TavilySearchOptions["search_depth"]) ?? "basic",
+    max_results: 20,
   };
   const results = await Promise.all(
     queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts).catch(() => [])),
   );
   await bumpUsage(env, "searches", queries.length);
 
-  // Drop low-relevance results before they reach the writer. Tavily's
-  // `news` topic isn't perfectly strict — off-topic hits (Facebook posts,
-  // local feel-good stories, etc.) slip through with score < ~0.4. Reuters
-  // / AP / BBC primary reporting on the actual query typically scores 0.7+.
-  const MIN_SCORE = 0.4;
-
-  const seen = new Set<string>();
-  const flat: GatheredSource[] = [];
+  type Scored = { title: string; url: string; content: string; score: number };
+  const allRaw: Scored[] = [];
   for (const list of results) {
     for (const r of list) {
-      if (!r.url || seen.has(r.url)) continue;
-      if (r.score < MIN_SCORE) continue;
-      seen.add(r.url);
-      flat.push({ title: r.title, url: r.url, content: r.content });
+      if (!r.url) continue;
+      allRaw.push({ title: r.title, url: r.url, content: r.content, score: r.score });
     }
   }
-  return flat;
+
+  const stats: GatherStats = { ...emptyStats, tavily_queries: queries.length, tavily_raw: allRaw.length };
+
+  // Step 1 — drop low-relevance hits. Tavily's `news` topic lets through
+  // off-topic content (Facebook posts, local fluff) with score < ~0.4;
+  // Reuters / AP / BBC primary reporting on the actual query typically
+  // scores 0.7+. 0.4 is the Tavily-documented bottom rail. Admin-editable
+  // via /admin/settings → "Search tuning" card → tavily_min_score.
+  const minScoreRaw = await getSetting(env, "tavily_min_score", "0.4");
+  let MIN_SCORE = parseFloat(minScoreRaw);
+  if (!Number.isFinite(MIN_SCORE) || MIN_SCORE < 0 || MIN_SCORE > 1) MIN_SCORE = 0.4;
+  const scored = allRaw.filter((r) => r.score >= MIN_SCORE);
+  stats.after_score_filter = scored.length;
+
+  // Sort by score desc — both dedupe passes below favour higher-scored
+  // entries (URL dedupe keeps the first seen; title dedupe keeps the first
+  // in each cluster, which is the highest-scored).
+  scored.sort((a, b) => b.score - a.score);
+
+  // Step 2 — URL dedupe.
+  const seenUrl = new Set<string>();
+  const urlDeduped: Scored[] = [];
+  for (const r of scored) {
+    if (seenUrl.has(r.url)) continue;
+    seenUrl.add(r.url);
+    urlDeduped.push(r);
+  }
+  stats.after_url_dedupe = urlDeduped.length;
+
+  // Step 3 — Title Jaccard dedupe. Clusters titles by word-set overlap
+  // (>= 0.7 = same story), keeps top KEEP_PER_CLUSTER from each so the
+  // writer can still see ONE cross-reference per major story (catches
+  // disagreements between outlets) without one story eating 5 slots.
+  const JACCARD_THRESHOLD = 0.7;
+  const KEEP_PER_CLUSTER = 2;
+  const clusters: Array<{ words: Set<string>; members: Scored[] }> = [];
+  for (const r of urlDeduped) {
+    const words = titleWords(r.title);
+    let placed = false;
+    for (const cluster of clusters) {
+      if (jaccardSimilarity(words, cluster.words) >= JACCARD_THRESHOLD) {
+        cluster.members.push(r);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) clusters.push({ words, members: [r] });
+  }
+  const titleDeduped: Scored[] = [];
+  for (const cluster of clusters) {
+    for (let i = 0; i < Math.min(KEEP_PER_CLUSTER, cluster.members.length); i++) {
+      titleDeduped.push(cluster.members[i]);
+    }
+  }
+  titleDeduped.sort((a, b) => b.score - a.score);
+  stats.after_title_dedupe = titleDeduped.length;
+
+  return {
+    sources: titleDeduped.map((r) => ({ title: r.title, url: r.url, content: r.content })),
+    stats,
+  };
 }
 
 async function gatherLandRegistry(c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
@@ -978,34 +1328,104 @@ async function gatherCompaniesHouse(
   ];
 }
 
-/** Step 4: recall similar past reports across the whole memory. Same-target
- *  history is also surfaced separately so the new report doesn't repeat. */
+/** A past report surfaced by the recall layer. Both chronological "what
+ *  did we last write on this target" hits and semantic "what topically
+ *  related thing have we written anywhere" hits flow through this shape,
+ *  so downstream code can treat them uniformly. */
+export interface RecalledReport {
+  id: string;
+  title: string;
+  snippet: string;
+  target_id: string;
+  target_name: string;
+  target_slug: string;
+  same_target: boolean;
+  age_days: number;
+  score: number; // similarity 0..1, or 1 for guaranteed-continuity recents
+}
+
+const RECALL_TOP_K = 10;
+const RECALL_SCORE_THRESHOLD = 0.65;
+const RECALL_MAX_KEPT = 5;
+const RECALL_MAX_SAME_TARGET_RECENT = 2;
+
+/** Step 4: build the recall context. Three sources, layered:
+ *   1. Last 1-2 reports on THIS target via D1 (guaranteed continuity even
+ *      if today's draft is semantically different from yesterday's).
+ *   2. Vectorize top-K semantic hits filtered by similarity threshold,
+ *      preferring same-target then cross-target, deduped against step 1.
+ *   3. Hard cap at RECALL_MAX_KEPT total to control prompt size.
+ *  Caller treats every hit identically — same source list, same citation
+ *  numbering. Failures are best-effort; an empty result is fine. */
 async function recallMemory(
   env: Env,
   target: Target,
   skill: Skill,
-): Promise<{ priorOnTarget: Report[]; relatedAcrossTargets: string[] }> {
-  const priorOnTarget = await listReportsForTarget(env, target.id, 4);
+): Promise<RecalledReport[]> {
+  const now = Date.now();
+  const ageDays = (ts: number) => Math.max(0, Math.floor((now - ts) / 86_400_000));
 
-  let related: string[] = [];
+  // 1. Chronological recents on this target (guaranteed continuity).
+  const recents = (await listReportsForTarget(env, target.id, RECALL_MAX_SAME_TARGET_RECENT))
+    .map<RecalledReport>((r) => ({
+      id: r.id,
+      title: r.title,
+      snippet: r.snippet,
+      target_id: target.id,
+      target_name: target.name,
+      target_slug: target.slug,
+      same_target: true,
+      age_days: ageDays(r.created_at),
+      score: 1,
+    }));
+  const seen = new Set<string>(recents.map((r) => r.id));
+
+  // 2. Semantic hits via Vectorize. Cast wide, filter by threshold, sort
+  //    same-target-first, dedupe against recents, cap.
+  let semantic: RecalledReport[] = [];
   try {
     const emb: any = await env.AI.run(EMBED_MODEL, {
       text: [`${target.name}. ${skill.name}. ${target.description ?? ""}`.slice(0, 1000)],
     });
-    const vec = emb.data?.[0];
+    const vec = emb?.data?.[0];
     if (vec) {
-      const hits = await env.MEMORY.query(vec, { topK: 4, returnMetadata: "all" });
-      related = (hits.matches ?? [])
-        .filter((m: any) => m.score > 0.4)
-        .filter((m: any) => m.metadata?.target_id !== target.id)
-        .map((m: any) =>
-          `- ${m.metadata?.target_name ?? "?"}: ${String(m.metadata?.snippet ?? "").slice(0, 220)}`,
-        );
+      const hits = await env.MEMORY.query(vec, { topK: RECALL_TOP_K, returnMetadata: "all" });
+      semantic = (hits.matches ?? [])
+        .filter((m: any) => m.score >= RECALL_SCORE_THRESHOLD)
+        .filter((m: any) => !seen.has(m.id))
+        .map<RecalledReport>((m: any) => ({
+          id: m.id,
+          title: String(m.metadata?.title ?? "Untitled"),
+          snippet: String(m.metadata?.snippet ?? ""),
+          target_id: String(m.metadata?.target_id ?? ""),
+          target_name: String(m.metadata?.target_name ?? "?"),
+          target_slug: String(m.metadata?.target_slug ?? ""),
+          same_target: m.metadata?.target_id === target.id,
+          age_days: m.metadata?.created_at ? ageDays(Number(m.metadata.created_at)) : 0,
+          score: Number(m.score),
+        }))
+        .sort((a, b) => {
+          // Same-target first; within each bucket, higher score first.
+          if (a.same_target !== b.same_target) return a.same_target ? -1 : 1;
+          return b.score - a.score;
+        });
     }
   } catch (e) {
-    console.error("recall failed", e);
+    console.error("recallMemory: semantic query failed", e);
   }
-  return { priorOnTarget, relatedAcrossTargets: related };
+
+  return [...recents, ...semantic].slice(0, RECALL_MAX_KEPT);
+}
+
+/** Unified citation row passed to the writer. Web hits and recalled past
+ *  reports share the same shape so the LLM cites both with one [N]
+ *  numbering scheme — and the rendered report's Sources footer can render
+ *  them side by side. */
+interface CitableSource {
+  kind: "web" | "archive";
+  title: string;
+  url: string;
+  content: string; // what the writer actually reads
 }
 
 /** Step 4: ask the LLM to write the report, given everything we gathered. */
@@ -1013,28 +1433,39 @@ async function writeReport(
   env: Env,
   skill: Skill,
   target: Target,
-  sources: GatheredSource[],
-  priorOnTarget: Report[],
-  relatedAcrossTargets: string[],
+  webSources: GatheredSource[],
+  recalled: RecalledReport[],
   model: string,
-): Promise<{ title: string; body: string }> {
-  const sourceBlock = sources.length
-    ? sources
-        .map(
-          (s, i) =>
-            `[${i + 1}] ${s.title}\n${s.url}\n${s.content}`,
-        )
+): Promise<{ title: string; body: string; citations: CitableSource[] }> {
+  // Web sources first (fresh material the writer must rely on), archive
+  // sources after (background/continuity). One unified numbering scheme.
+  const citations: CitableSource[] = [
+    ...webSources.map<CitableSource>((s) => ({
+      kind: "web",
+      title: s.title,
+      url: s.url,
+      content: s.content,
+    })),
+    ...recalled.map<CitableSource>((r) => ({
+      kind: "archive",
+      title: `${r.title} (${r.age_days === 0 ? "today" : r.age_days === 1 ? "yesterday" : `${r.age_days} days ago`}${r.same_target ? "" : ` · from "${r.target_name}"`})`,
+      url: `/report/${r.id}`,
+      content: r.snippet,
+    })),
+  ];
+
+  const sourceBlock = citations.length
+    ? citations
+        .map((c, i) => {
+          const tag = c.kind === "archive" ? " (PRIOR REPORT)" : "";
+          return `[${i + 1}]${tag} ${c.title}\n${c.url}\n${c.content}`;
+        })
         .join("\n\n")
-    : "(No web search results — write from general knowledge but explicitly say so.)";
+    : "(No sources gathered — write from general knowledge but explicitly say so.)";
 
-  const priorBlock = priorOnTarget.length
-    ? `\n\nPRIOR REPORTS ON THIS TARGET (do not repeat — build on them, surface what's changed):\n${priorOnTarget
-        .map((r) => `- ${new Date(r.created_at).toISOString().slice(0, 10)} — ${r.title}: ${r.snippet}`)
-        .join("\n")}`
-    : "";
-
-  const relatedBlock = relatedAcrossTargets.length
-    ? `\n\nRELATED CONTEXT FROM OTHER TARGETS (use sparingly — only if genuinely connecting):\n${relatedAcrossTargets.join("\n")}`
+  const archiveCount = citations.filter((c) => c.kind === "archive").length;
+  const archiveGuidance = archiveCount > 0
+    ? `\n\n${archiveCount} of the source${archiveCount === 1 ? " is a PRIOR REPORT" : "s are PRIOR REPORTS"} from this archive (marked above). Do NOT repeat what those said verbatim — instead build on them, surface what has changed since, and cite them with their [N] when the new report relies on or contradicts them.`
     : "";
 
   const userMsg = `SKILL TO APPLY
@@ -1047,13 +1478,11 @@ Name: ${target.name}
 Kind: ${target.kind ?? "(unspecified)"}
 Description: ${target.description ?? "(none)"}
 
-WEB SOURCES (extracted page content)
-====================================
-${sourceBlock}
-${priorBlock}
-${relatedBlock}
+SOURCES (cite inline with [n])
+==============================
+${sourceBlock}${archiveGuidance}
 
-Now write the report. Follow the output structure defined in the skill. Cite sources inline by [n] (matching the numbered sources above) wherever you draw from a source. Do NOT write a "Sources" section at the end — the report page renders a canonical numbered source list automatically. Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
+Now write the report. Follow the output structure defined in the skill. Cite sources inline by [n] (matching the numbered sources above — including PRIOR REPORTS) wherever you draw from a source or build on/contradict prior coverage. Do NOT write a "Sources" section at the end — the report page renders a canonical numbered source list automatically. Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
 
   const res = await runChat(env, model, {
     messages: [
@@ -1084,7 +1513,43 @@ Markdown formatting rules (follow strictly — the rendering engine depends on t
   const dateLabel = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
   const title = `${target.name} — ${skill.name} (${dateLabel})`;
 
-  return { title, body };
+  return { title, body, citations };
+}
+
+/** Pipeline step labels used by runResearch's step-boundary breadcrumb.
+ *  These flow into both the live `last_run_attempt` setting (so admin can
+ *  see "in-flight at step X") and the `runs.error` text (so completed
+ *  failures are tagged "gather: Tavily timeout" rather than just "Tavily
+ *  timeout"). Order matters — it's the actual pipeline sequence. */
+export type RunStep = "init" | "plan" | "gather" | "recall" | "write" | "persist" | "done";
+
+/** Live "what's happening right now" breadcrumb. Overwritten by each new
+ *  runResearch invocation (we only care about the most-recent attempt for
+ *  the live heartbeat — historical failures are recorded in `runs`).
+ *  Stored as JSON in settings so the admin can read it without a schema
+ *  change. `completed_at` is null while in-flight, set on success or error. */
+interface LastRunAttempt {
+  run_id: string;
+  target_slug: string;
+  triggered_by: "cron" | "manual";
+  started_at: number;
+  last_step: RunStep;
+  completed_at: number | null;
+  outcome: "in_flight" | "success" | "error";
+  error?: string;
+  gather_stats?: GatherStats;
+}
+
+async function markStep(
+  env: Env,
+  attempt: LastRunAttempt,
+  step: RunStep,
+): Promise<void> {
+  attempt.last_step = step;
+  console.log(`runResearch[${attempt.run_id}] ${attempt.target_slug} ${attempt.triggered_by} → ${step}`);
+  await setSetting(env, "last_run_attempt", JSON.stringify(attempt)).catch((e) =>
+    console.error("markStep: setSetting failed", e),
+  );
 }
 
 /** The full research loop. Plan → gather → recall → write → persist. */
@@ -1100,6 +1565,17 @@ export async function runResearch(
   const t0 = Date.now();
   let chatModel = "";
 
+  const attempt: LastRunAttempt = {
+    run_id: runId,
+    target_slug: target.slug,
+    triggered_by: triggeredBy,
+    started_at: t0,
+    last_step: "init",
+    completed_at: null,
+    outcome: "in_flight",
+  };
+  await markStep(env, attempt, "init");
+
   try {
     await checkBudget(env, "reports");
 
@@ -1114,43 +1590,51 @@ export async function runResearch(
     const needsQueries = calls.some(
       (c) => c.tool === "tavily" && c.op === "search",
     );
+    await markStep(env, attempt, "plan");
     const queries = needsQueries
       ? (await planResearch(env, skill, target, chatModel)).queries
       : [];
-    const sources = await gatherSources(env, queries, target, calls);
-    const { priorOnTarget, relatedAcrossTargets } = await recallMemory(env, target, skill);
 
-    const { title, body } = await writeReport(
+    await markStep(env, attempt, "gather");
+    const { sources, stats: gatherStats } = await gatherSources(env, queries, target, calls);
+    attempt.gather_stats = gatherStats;
+
+    await markStep(env, attempt, "recall");
+    const recalled = await recallMemory(env, target, skill);
+
+    await markStep(env, attempt, "write");
+    const { title, body, citations } = await writeReport(
       env,
       skill,
       target,
       sources,
-      priorOnTarget,
-      relatedAcrossTargets,
+      recalled,
       chatModel,
     );
+
+    await markStep(env, attempt, "persist");
 
     const reportId = uid();
     const created = Date.now();
     const wordCount = body.split(/\s+/).filter(Boolean).length;
     const snippet = body.replace(/\s+/g, " ").slice(0, 240).trim() + "…";
 
-    const md = [
-      `# ${title}`,
-      ``,
-      `*Target: [${target.name}](/target/${target.slug}) · Skill: ${skill.name}*`,
-      `*Generated: ${new Date(created).toISOString()}*`,
-      ``,
-      body,
-    ].join("\n");
+    // R2 stores just title + body. Target / skill / generated-at metadata
+    // is rendered from the D1 row in the page header, no need to duplicate
+    // it inline in the markdown.
+    const md = `# ${title}\n\n${body}\n`;
 
     const r2Key = `reports/${created}-${reportId}.md`;
     await env.REPORTS.put(r2Key, md, {
       httpMetadata: { contentType: "text/markdown; charset=utf-8" },
     });
 
+    // Persist the unified citation list (web + archive) so the rendered
+    // report footer can group them and link archive entries to /report/:id.
+    // Schema: [{ title, url, kind: "web" | "archive" }]. Old rows without
+    // `kind` are treated as web in the renderer (backwards-compatible).
     const sourcesJson = JSON.stringify(
-      sources.map((s) => ({ title: s.title, url: s.url })).slice(0, 20),
+      citations.map((c) => ({ title: c.title, url: c.url, kind: c.kind })).slice(0, 20),
     );
 
     await env.DB.prepare(
@@ -1160,32 +1644,22 @@ export async function runResearch(
       .bind(reportId, target.id, skill.id, title, snippet, r2Key, wordCount, sourcesJson, runId, chatModel, created)
       .run();
 
-    // Embed for cross-target recall.
-    try {
-      const emb: any = await env.AI.run(EMBED_MODEL, {
-        text: [`${target.name}. ${skill.name}. ${body}`.slice(0, 2000)],
-      });
-      const vec = emb.data?.[0];
-      if (vec) {
-        await env.MEMORY.upsert([
-          {
-            id: reportId,
-            values: vec,
-            metadata: {
-              target_id: target.id,
-              target_name: target.name,
-              target_slug: target.slug,
-              skill_slug: skill.slug,
-              title,
-              snippet,
-              created_at: created,
-            },
-          },
-        ]);
-      }
-    } catch (e) {
-      console.error("embed failed", e);
-    }
+    // Embed for cross-target recall. Best-effort: failures are surfaced
+    // to the admin Maintenance card via settings; they never abort the
+    // report write.
+    await embedReport(env, {
+      id: reportId,
+      target_id: target.id,
+      target_name: target.name,
+      target_slug: target.slug,
+      skill_id: skill.id,
+      skill_slug: skill.slug,
+      skill_name: skill.name,
+      title,
+      snippet,
+      body,
+      created_at: created,
+    });
 
     await env.DB.prepare("UPDATE skills SET used_count = used_count + 1, updated_at = ? WHERE id = ?")
       .bind(Date.now(), skill.id)
@@ -1206,23 +1680,45 @@ export async function runResearch(
 
     await bumpUsage(env, "reports");
 
+    attempt.completed_at = Date.now();
+    attempt.outcome = "success";
+    await markStep(env, attempt, "done");
+
     return (await getReportById(env, reportId))!;
   } catch (err: any) {
-    await env.DB.prepare(
-      `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, error, duration_ms, created_at)
-       VALUES (?, ?, ?, ?, 'error', ?, ?, ?)`,
-    )
-      .bind(
-        runId,
-        target.id,
-        skill.id,
-        triggeredBy,
-        String(err?.message ?? err),
-        Date.now() - t0,
-        Date.now(),
+    // Tag the error with the step we failed at, so Activity can render
+    // "failed @ gather" instead of just "error", and so you can grep
+    // wrangler tail for which boundary actually broke.
+    const failedStep = attempt.last_step;
+    const errMessage = `${failedStep}: ${String(err?.message ?? err)}`;
+    console.error(`runResearch[${runId}] failed at ${failedStep}:`, err);
+
+    attempt.completed_at = Date.now();
+    attempt.outcome = "error";
+    attempt.error = errMessage;
+    await markStep(env, attempt, failedStep);
+
+    try {
+      await env.DB.prepare(
+        `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, error, duration_ms, created_at)
+         VALUES (?, ?, ?, ?, 'error', ?, ?, ?)`,
       )
-      .run()
-      .catch(() => {});
+        .bind(
+          runId,
+          target.id,
+          skill.id,
+          triggeredBy,
+          errMessage,
+          Date.now() - t0,
+          Date.now(),
+        )
+        .run();
+    } catch (insertErr) {
+      // If even the error-row INSERT failed, the live `last_run_attempt`
+      // setting we just wrote above is now the only fingerprint of this
+      // failure. Log loudly so wrangler tail still surfaces it.
+      console.error(`runResearch[${runId}] could not record error run row:`, insertErr);
+    }
     throw err;
   }
 }
@@ -1274,5 +1770,17 @@ export async function cronTick(env: Env): Promise<{ processed: number; skipped: 
   }
 
   await setSetting(env, "last_cron_run", String(now));
+
+  // Periodic R2 sweep. Cheap on small buckets and keeps any drift from
+  // failed deletes from accumulating beyond an hour without admin attention.
+  try {
+    const gc = await gcOrphanedR2(env);
+    if (gc.orphans > 0 || gc.failures.length > 0) {
+      console.log("cronTick: gcOrphanedR2", gc);
+    }
+  } catch (e) {
+    console.error("cronTick: gcOrphanedR2 failed", e);
+  }
+
   return { processed, skipped, errors };
 }

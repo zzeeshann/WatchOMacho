@@ -58,13 +58,154 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | --- | --- | --- | --- |
 | 1 | **Budget check** | D1 read | ~free |
 | 2 | **Parse skill** — scan procedure_md for any registered tool's `**<Tool> op:**` header; collect each tool's per-tool params into a `SkillToolCall[]`. Default to one Tavily search if none declared. | local | free |
-| 3 | **Plan** — LLM picks 3–6 search queries (only if at least one tool call is Tavily search) | 1 chat call | ~150–300 neurons |
-| 4 | **Gather** — dispatch over the `SkillToolCall[]`. Each tool's handler fetches and flattens to markdown `{ title, url, content }`. Typed-tool output (Land Registry rows, ONS context, police crimes, Companies House hits) is rendered as a markdown table or labelled block so the writer sees a uniform source format. | N HTTP calls across the tools | Tavily: N credits; everything else: free |
-| 5 | **Recall** — Vectorize for related past reports + D1 for same-target history | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
-| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context | 1 chat call | ~300–700 neurons |
-| 7 | **Persist** — R2 put + D1 insert + embed + Vectorize upsert + update target.next_run_at + audit row | 1 R2 put + 4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
+| 3 | **Plan** — LLM picks **exactly 10** search queries (only if at least one tool call is Tavily search) | 1 chat call | ~150–300 neurons (Llama) / ~$0.001 (Haiku) |
+| 4 | **Gather** — dispatch over the `SkillToolCall[]`. Each tool's handler fetches and flattens to markdown `{ title, url, content }`. Tavily passes through 4 filters (see "Gather pipeline" below). | N HTTP calls across the tools | Tavily: 1 credit/query; everything else: free |
+| 5 | **Recall** — Vectorize semantic + D1 same-target recents, layered & deduped | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
+| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context | 1 chat call | ~$0.013–0.026 (Haiku) |
+| 7 | **Persist** — R2 put + D1 inserts + embed + Vectorize upsert + update target.next_run_at + runs audit row + heartbeat setting | 1 R2 put + ~4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
 
-**Total per run:** ~2 chat calls + 1 embedding + (3–6 Tavily calls if used) + (0–N typed-tool HTTP calls) → roughly **600–1200 neurons + 0–6 Tavily credits**. Typed-tool calls are upstream-rate-limited but cost nothing.
+**Total per run (Haiku default):** ~2 chat calls + 1 embedding + (~10 Tavily calls) + (0–N typed-tool HTTP calls) → roughly **$0.013–0.026 + 10 Tavily credits**. At 2 runs/day = **~$10–20/year + 600 Tavily credits/month** (free tier is 1000).
+
+---
+
+## Gather pipeline (Tavily side, post-2026-05-18)
+
+```
+                  ┌──────────────────────────────┐
+                  │  Planner LLM                  │
+                  │  produces EXACTLY 10 queries  │
+                  └──────────────┬───────────────┘
+                                 │
+                                 ▼
+                    Tavily search × 10 queries
+                    (max_results=20 per query)
+                                 │
+                                 ▼
+                  ~100–200 raw candidates per run
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                                      │
+   Filter 1: SCORE                                  │
+   drop hits with score < tavily_min_score          │
+   (admin-editable, default 0.4 — Tavily's          │
+   bottom rail)                                      │
+              │                                      │
+              ▼                                      │
+   ~10–60 survive (varies by news cycle)             │
+              │                                      │
+              ▼                                      │
+   Filter 2: URL DEDUPE                              │
+   drop any URL we've already kept this run          │
+              │                                      │
+              ▼                                      │
+   Filter 3: TITLE JACCARD DEDUPE                    │
+   normalise titles (lowercase, no punctuation,      │
+   no stopwords) → Jaccard similarity ≥ 0.7 =       │
+   same story, keep top 2 per cluster sorted by     │
+   Tavily score                                      │
+              │                                      │
+              ▼                                      │
+   Truncate each source's content to                 │
+   MAX_CHARS_PER_SOURCE (4000 chars ≈ 1000 toks)     │
+              │                                      │
+              ▼                                      │
+   Cap at 100 final sources (safety ceiling;         │
+   natural ceiling is ~30–40)                        │
+              │                                      ▼
+              │                            Other tools' output
+              │                            (Land Registry rows,
+              │                             ONS context, etc.)
+              │                                      │
+              └──────────────────┬──────────────────┘
+                                 ▼
+                       Passed to Recall step
+```
+
+Counters at each stage are persisted to `last_run_attempt.gather_stats` and surfaced in the admin Maintenance card so the funnel shape is auditable per run.
+
+---
+
+## Recall pipeline (Vectorize side)
+
+```
+                target + skill description
+                       │
+                       ▼
+              ┌────────────────┐
+              │ Embed model    │ @cf/baai/bge-base-en-v1.5
+              │ (768-dim)      │  (free, Workers AI)
+              └────────┬───────┘
+                       │
+        ┌──────────────┼────────────────┐
+        ▼                                ▼
+   D1: last 2 same-target           Vectorize: top-10
+   reports (chronological            semantic hits
+   continuity, guaranteed)            (similarity ≥ 0.65)
+        │                                │
+        │  ◄──── deduped against ────────┤
+        │       (don't double-count)     │
+        │                                │
+        └────────────────┬───────────────┘
+                         │
+            same-target hits first,
+            cross-target fallback,
+            cap 5 total
+                         │
+                         ▼
+                Recalled past reports
+            (passed as [N] sources alongside
+             web results in unified citation)
+```
+
+Recall is **best-effort** — if the embed call fails or Vectorize is empty, the writer just proceeds without prior-report context. Doesn't block writes.
+
+---
+
+## Observability (the Maintenance card)
+
+Every run writes one settings row (`last_run_attempt`) that's read on each admin page load. Combined with the `runs` table, this gives four signals visible at a glance:
+
+```
+┌─ Maintenance ─────────────────────────────────────────────────────────┐
+│                                                                        │
+│  STORED REPORT FILES (R2)                                              │
+│  4 files · no orphans                              [Sweep orphans now] │
+│                                                                        │
+│  ─────────────────────                                                 │
+│                                                                        │
+│  ACTIVITY HEARTBEAT                                                    │
+│  Cron last ran        37 min ago                       (green)         │
+│  Last attempt         success · world-news · 30s ago · manual          │
+│  Last completed run   success · 30s ago · 21.5s                        │
+│  Last run gather      Tavily 10q · 166 raw → 10 (score)               │
+│                       → 10 (URL) → 10 (story) → 10 final               │
+│                                                                        │
+│  ─────────────────────                                                 │
+│                                                                        │
+│  RECALL MEMORY (VECTORIZE)                                             │
+│  Guardrails: layer 2 same-target recents · top-10 semantic ·          │
+│              threshold 0.65 · cap 5 per run                            │
+│                                                                        │
+│  EMBEDDING STATUS                                                      │
+│  Last successful embed JUST NOW                        [Backfill memory] │
+│  8 reports in D1.                                                      │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+State sources:
+
+| Field | Read from | Refresh frequency |
+|---|---|---|
+| Cron last ran | `settings.last_cron_run` | once per cron tick |
+| Last attempt | `settings.last_run_attempt.{started_at, outcome, last_step}` | every step boundary |
+| Last completed run | most recent `runs` row | on each runResearch persist |
+| Last run gather | `settings.last_run_attempt.gather_stats` | overwritten each run |
+| R2 stats | live `env.REPORTS.list()` | every admin page load |
+| Embedding status | `settings.embed_last_ok_at` / `embed_last_error` | every embedReport call |
+
+Step boundaries inside `runResearch` flow: `init → plan → gather → recall → write → persist → done`. Failures tag the error message with the step (`gather: Tavily timeout`, `write: 5021: ... exceeded context window`). Activity row on target page renders `failed @ <step>` badge.
+
+---
 
 ---
 

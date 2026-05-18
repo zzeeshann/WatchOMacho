@@ -8,8 +8,11 @@ import {
   cronTick,
   createSkillFromMarkdown,
   createTarget,
+  backfillMemory,
+  deleteReport,
   deleteSkill,
   deleteTarget,
+  gcOrphanedR2,
   getChatModel,
   getDailyUsage,
   getReportById,
@@ -381,6 +384,20 @@ export default {
         return redirect("/admin");
       }
 
+      // Reports: delete a single report (R2 + Vectorize + D1 row; run stays).
+      if (path.startsWith("/admin/reports/") && path.endsWith("/delete") && req.method === "POST") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const id = path.slice("/admin/reports/".length, path.length - "/delete".length);
+        if (!/^[a-z0-9-]+$/.test(id)) {
+          return new Response("Bad id", withSecurityHeaders({ status: 400 }));
+        }
+        const report = await getReportById(env, id);
+        if (!report) return redirect(req.headers.get("referer") || "/admin");
+        const target = await getTargetById(env, report.target_id);
+        await deleteReport(env, id);
+        return redirect(target ? `/admin/targets/${target.slug}` : "/admin");
+      }
+
       // Skills: create / update / delete
       if (path === "/admin/skills" && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
@@ -479,6 +496,19 @@ export default {
           await setSetting(env, "chat_model", form.chat_model);
           updated.chat_model = form.chat_model;
         }
+        // Tavily relevance threshold — float in [0, 1]. Editable via the
+        // "Search tuning" admin card. 0.4 is the Tavily-documented sweet
+        // spot; lower = more candidates (noisier), higher = stricter.
+        if (form.tavily_min_score !== undefined && form.tavily_min_score !== "") {
+          const f = parseFloat(form.tavily_min_score);
+          if (!Number.isFinite(f) || f < 0 || f > 1) {
+            return json({ error: "tavily_min_score must be a number between 0 and 1" }, { status: 400 });
+          }
+          // Quantise to 2 decimals so storage stays tidy ("0.40" not "0.4000000001").
+          const rounded = Math.round(f * 100) / 100;
+          await setSetting(env, "tavily_min_score", String(rounded));
+          updated.tavily_min_score = String(rounded);
+        }
         return json({ ok: true, updated });
       }
 
@@ -486,6 +516,20 @@ export default {
       if (path === "/admin/cron/tick" && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
         const res = await cronTick(env);
+        return json({ ok: true, ...res });
+      }
+
+      // Sweep R2 blobs not referenced by any reports.r2_key.
+      if (path === "/admin/storage/gc" && req.method === "POST") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const res = await gcOrphanedR2(env);
+        return json({ ok: true, ...res });
+      }
+
+      // Re-embed every report in D1 and upsert into Vectorize. Idempotent.
+      if (path === "/admin/memory/backfill" && req.method === "POST") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const res = await backfillMemory(env);
         return json({ ok: true, ...res });
       }
 
