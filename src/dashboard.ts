@@ -1169,22 +1169,35 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 
   const active = targets.filter((t) => t.status === "active");
   const dueNow = active.filter((t) => t.next_run_at && t.next_run_at <= Date.now() && t.primary_skill_id);
+  const statusRank: Record<string, number> = { active: 0, paused: 1, archived: 2 };
+  const sortedTargets = [...targets].sort((a, b) => {
+    const sa = statusRank[a.status] ?? 3;
+    const sb = statusRank[b.status] ?? 3;
+    if (sa !== sb) return sa - sb;
+    return (a.next_run_at ?? Infinity) - (b.next_run_at ?? Infinity);
+  });
 
-  const targetRows = active.length === 0
+  const targetRows = sortedTargets.length === 0
     ? `<div class="empty">No targets yet. Add one above.</div>`
-    : `<ul class="list-none">${active.map((t) => `
+    : `<ul class="list-none">${sortedTargets.map((t) => {
+        const isActive = t.status === "active";
+        const meta = isActive
+          ? `${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"} · every ${t.cadence_hours}h`
+          : `every ${t.cadence_hours}h`;
+        return `
         <li class="py-2.5 border-b border-[rgba(232,228,222,0.6)]">
           <div class="flex flex-wrap justify-between items-baseline gap-3">
-            <a href="/admin/targets/${escapeHtml(t.slug)}" class="font-medium text-zee-text">
+            <a href="/admin/targets/${escapeHtml(t.slug)}" class="font-medium ${isActive ? "text-zee-text" : "text-zee-muted"}">
               ${escapeHtml(t.name)}
               ${t.kind ? `<span class="label-muted ml-2">${escapeHtml(t.kind)}</span>` : ""}
+              <span class="badge badge-${escapeHtml(t.status)} ml-2">${escapeHtml(t.status)}</span>
             </a>
             <span class="tt text-xs text-zee-muted">
-              ${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"}
-              · every ${t.cadence_hours}h
+              ${meta}
             </span>
           </div>
-        </li>`).join("")}</ul>`;
+        </li>`;
+      }).join("")}</ul>`;
 
   const targetById = new Map(targets.map((t) => [t.id, t]));
   const runsHtml = (runRows.results ?? []).map((r: any) => {
@@ -1215,7 +1228,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     <section class="pt-6 pb-3">
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Console.</h1>
-      <p class="subhead"><strong class="text-zee-text">${active.length}</strong> ${active.length === 1 ? "target" : "targets"}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <strong class="text-zee-text">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
+      <p class="subhead"><strong class="text-zee-text">${active.length}</strong> active${sortedTargets.length > active.length ? ` · <strong class="text-zee-muted">${sortedTargets.length - active.length}</strong> paused/archived` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <strong class="text-zee-text">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
     </section>
 
     <details class="card" open>
@@ -1268,8 +1281,8 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     <details class="card" open>
       <summary>
         <div class="h3-row">
-          <h3>Active targets</h3>
-          <span class="label-muted">${active.length} total<span class="chev">▾</span></span>
+          <h3>Targets</h3>
+          <span class="label-muted">${sortedTargets.length} total${active.length !== sortedTargets.length ? ` · ${active.length} active` : ""}<span class="chev">▾</span></span>
         </div>
       </summary>
       ${targetRows}
