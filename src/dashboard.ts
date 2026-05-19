@@ -646,8 +646,9 @@ ${FONTS}
   <div class="wrap site-header-inner">
     <a href="/" class="brand">WatchOMacho</a>
     <nav class="nav">
-      ${navLink("/", "Targets", "home")}
-      ${isAdmin ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/skills", "Skills", "skills")} ${navLink("/admin/tools", "Tools", "tools")} <form method="post" action="/admin/logout" class="inline ml-2"><button class="btn btn-secondary px-2.5 py-1 text-[11px]">Logout</button></form>` : navLink("/admin/login", "Admin", "admin")}
+      ${isAdmin
+        ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/targets", "Targets", "targets")} ${navLink("/admin/skills", "Skills", "skills")} ${navLink("/admin/tools", "Tools", "tools")} <form method="post" action="/admin/logout" class="inline ml-2"><button class="btn btn-secondary px-2.5 py-1 text-[11px]">Logout</button></form>`
+        : `${navLink("/", "Targets", "home")} ${navLink("/admin/login", "Admin", "admin")}`}
     </nav>
   </div>
 </header>
@@ -1099,6 +1100,108 @@ export function renderAdminLogin(error?: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Admin: system heartbeat (renders the four-row status panel — promoted out of
+// the Maintenance card so it's the first thing you see on /admin).
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface HeartbeatInput {
+  lastCronRun: number;
+  lastRunAttempt: {
+    run_id: string;
+    target_slug: string;
+    triggered_by: "cron" | "manual";
+    started_at: number;
+    last_step: string;
+    completed_at: number | null;
+    outcome: "in_flight" | "success" | "error";
+    error?: string;
+    gather_stats?: {
+      tavily_queries: number;
+      tavily_raw: number;
+      after_score_filter: number;
+      after_url_dedupe: number;
+      after_title_dedupe: number;
+      final_kept: number;
+    };
+  } | null;
+  lastCompletedRun: { status: string; error: string | null; duration_ms: number | null; created_at: number } | null;
+}
+
+function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun }: HeartbeatInput): string {
+  const now = Date.now();
+  const cronAgeMin = lastCronRun > 0 ? Math.floor((now - lastCronRun) / 60_000) : null;
+  const cronColor = cronAgeMin == null
+    ? "text-zee-muted"
+    : cronAgeMin < 75 ? "text-zee-primary"
+    : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
+    : "text-[rgb(180,60,60)]";
+  const cronLine = cronAgeMin == null
+    ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
+    : `<span class="${cronColor}">${cronAgeMin} min ago</span>`;
+
+  let attemptLine = `<span class="text-zee-muted">no attempts recorded yet</span>`;
+  if (lastRunAttempt) {
+    const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
+    const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : `${Math.floor(startedAgo / 60)} min ago`;
+    if (lastRunAttempt.outcome === "in_flight") {
+      const stalled = startedAgo > 180;
+      const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
+      const label = stalled ? "stalled" : "in flight";
+      attemptLine = `<span class="${tone}">${label}</span> at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
+    } else if (lastRunAttempt.outcome === "success") {
+      attemptLine = `<span class="text-zee-primary">success</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
+    } else {
+      attemptLine = `<span class="text-[rgb(180,60,60)]">failed @ ${escapeHtml(lastRunAttempt.last_step)}</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel}</span>`;
+    }
+  }
+
+  let completedLine = `<span class="text-zee-muted">no completed runs yet</span>`;
+  if (lastCompletedRun) {
+    const ago = Math.floor((now - lastCompletedRun.created_at) / 60_000);
+    const agoLabel = ago < 1 ? "just now" : `${ago} min ago`;
+    const dur = lastCompletedRun.duration_ms ? fmtDuration(lastCompletedRun.duration_ms) : "";
+    const status = lastCompletedRun.status === "success"
+      ? `<span class="text-zee-primary">success</span>`
+      : `<span class="text-[rgb(180,60,60)]">error: ${escapeHtml((lastCompletedRun.error ?? "unknown").slice(0, 60))}</span>`;
+    completedLine = `${status} · <span class="label-muted">${agoLabel}${dur ? ` · ${dur}` : ""}</span>`;
+  }
+
+  let gatherLine = `<span class="text-zee-muted">no gather data yet</span>`;
+  if (lastRunAttempt?.gather_stats) {
+    const g = lastRunAttempt.gather_stats;
+    if (g.tavily_queries > 0) {
+      gatherLine = `Tavily <strong class="font-medium">${g.tavily_queries}q</strong> · <span class="tt">${g.tavily_raw}</span> raw → <span class="tt">${g.after_score_filter}</span> (score) → <span class="tt">${g.after_url_dedupe}</span> (URL) → <span class="tt">${g.after_title_dedupe}</span> (story) → <strong class="font-medium tt">${g.final_kept}</strong> final`;
+    } else if (g.final_kept > 0) {
+      gatherLine = `<span class="text-zee-muted">${g.final_kept} sources gathered (no Tavily this run)</span>`;
+    }
+  }
+
+  return `
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>System heartbeat</h3>
+          <span class="label-muted">${cronAgeMin == null ? "no cron yet" : `cron ${cronAgeMin}m ago`}<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      <div class="field-help mt-3" style="max-width: 70ch;">
+        Live status of the agent. <em>Cron last ran</em> should be under an hour. <em>Last attempt</em> is the most recent Run-now or cron-triggered run (overwritten on each new run, even if the run later crashes — a click always leaves a fingerprint). <em>Last completed run</em> is the most recent row in the runs table that finished.
+      </div>
+      <div class="mt-4 grid gap-y-3" style="grid-template-columns: 170px 1fr;">
+        <div class="label-muted">Cron last ran</div>
+        <div>${cronLine}</div>
+        <div class="label-muted">Last attempt</div>
+        <div>${attemptLine}</div>
+        <div class="label-muted">Last completed run</div>
+        <div>${completedLine}</div>
+        <div class="label-muted">Last run gather</div>
+        <div class="text-sm">${gatherLine}</div>
+      </div>
+    </details>
+  `;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Admin: overview panel
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1221,64 +1324,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       <p class="subhead"><strong class="text-zee-text">${active.length}</strong> active${sortedTargets.length > active.length ? ` · <strong class="text-zee-muted">${sortedTargets.length - active.length}</strong> paused/archived` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <strong class="text-zee-text">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
     </section>
 
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Add a target</h3>
-          <span class="text-xs">
-            <a href="/admin/skills" class="text-zee-primary" onclick="event.stopPropagation()">Manage skills →</a>
-            <span class="chev">▾</span>
-          </span>
-        </div>
-      </summary>
-      <form method="post" action="/admin/targets">
-        <div class="field">
-          <label>Name</label>
-          <input name="name" placeholder="SW1A 1AA, Bhutan, OpenAI, etc." required maxlength="200">
-        </div>
-        <div class="field">
-          <label>Kind <span class="font-normal normal-case tracking-normal">(optional)</span></label>
-          <input name="kind" placeholder="postcode / place / topic / person / company">
-        </div>
-        <div class="field">
-          <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
-          <input name="description" maxlength="400">
-        </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
-            <label>Cadence</label>
-            <select name="cadence_hours">
-              <option value="1">every hour</option>
-              <option value="6">every 6 hours</option>
-              <option value="12">every 12 hours</option>
-              <option value="24" selected>every 24 hours</option>
-              <option value="72">every 3 days</option>
-              <option value="168">every week</option>
-            </select>
-          </div>
-          <div class="field flex-[2] mb-0">
-            <label>Skill to apply</label>
-            <select name="skill_slug">${skillOptions}</select>
-          </div>
-        </div>
-        <label class="flex items-center gap-2 mb-3.5 text-[13px] text-zee-muted">
-          <input type="checkbox" name="run_now" value="1"> Run once now
-        </label>
-        <button class="btn" type="submit">Add target</button>
-      </form>
-    </details>
+    ${renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun })}
 
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Targets</h3>
-          <span class="label-muted">${sortedTargets.length} total${active.length !== sortedTargets.length ? ` · ${active.length} active` : ""}<span class="chev">▾</span></span>
-        </div>
-      </summary>
-      ${targetRows}
-    </details>
-
-    <details class="card" open>
+    <details class="card">
       <summary>
         <div class="h3-row">
           <h3>Budgets &amp; settings</h3>
@@ -1291,7 +1339,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <select name="chat_model">${modelOptions}</select>
           <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
         </div>
-        <div class="row gap-4">
+        <div class="row gap-4 mb-4">
           <div class="field flex-1 mb-0">
             <label>Reports / day</label>
             <input type="number" name="daily_report_limit" min="0" max="10000" value="${escapeHtml(reportLim)}">
@@ -1308,42 +1356,25 @@ export async function renderAdminPanel(env: Env): Promise<string> {
             <div class="field-help">Cap per hourly cron firing</div>
           </div>
         </div>
+
+        <div class="label-muted mt-2 mb-2">Run guardrails <span class="font-normal normal-case tracking-normal text-zee-muted">(worker-wide CPU + kill switches)</span></div>
+        <div class="row gap-4 mb-2">
+          <div class="field flex-1 mb-0">
+            <label>Max chars per source</label>
+            <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}">
+            <div class="field-help mt-1.5">How much of each source's text is sent to the writer. Default <strong>4000</strong>. Drop to <strong>2000</strong> for Workers AI Llama (24k context).</div>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Max run seconds <span class="font-normal normal-case tracking-normal">(kill switch)</span></label>
+            <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}">
+            <div class="field-help mt-1.5">Soft ceiling on a single run's wall-clock. Aborts hung fetches. Default <strong>90&nbsp;s</strong>. Hard ceiling is the 15-min DO alarm limit.</div>
+          </div>
+        </div>
+
         <div class="row mt-3.5">
           <button class="btn" type="submit">Save</button>
           <button id="cron-now-btn" type="button" class="btn btn-secondary">Run cron now</button>
           <span id="cron-result" class="text-xs text-zee-muted"></span>
-        </div>
-      </form>
-    </details>
-
-    <details class="card">
-      <summary>
-        <div class="h3-row">
-          <h3>Run guardrails</h3>
-          <span class="label-muted">${maxCharsPerSource} chars/src · max ${maxRunSeconds}s<span class="chev">▾</span></span>
-        </div>
-      </summary>
-      <div class="field-help mt-3.5" style="max-width: 72ch;">
-        Worker-wide kill switches. Per-target Tavily knobs (queries per run, min score, max sources) live on each target's edit page now — these two stay global because they're CPU/safety levers, not tuning.
-      </div>
-      <form id="search-tuning-form">
-        <div class="field mb-3.5">
-          <label>Max chars per source</label>
-          <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            How much of each source's body text is sent to the writer. Default <strong>4000</strong> (~1000 tokens/source — fine for Haiku 4.5's 200k context). Drop to <strong>2000</strong> if you switch back to Workers AI Llama (24k context).
-          </div>
-        </div>
-        <div class="field mb-3.5">
-          <label>Max run seconds (kill switch)</label>
-          <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            Soft ceiling on a single run's wall-clock. When exceeded, the Durable Object alarm aborts in-flight fetches, the heartbeat is marked errored, and a row is written to <em>Recent runs</em>. Default <strong>90 s</strong>. Hard ceiling is the 15-min DO alarm limit.
-          </div>
-        </div>
-        <div class="row">
-          <button class="btn" type="submit">Save</button>
-          <span id="search-tuning-result" class="text-xs text-zee-muted"></span>
         </div>
       </form>
     </details>
@@ -1391,82 +1422,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         <div>
           <button id="gc-r2-btn" type="button" class="btn btn-danger"${r2Stats && r2Stats.orphans.length === 0 ? " disabled" : ""}>Sweep orphans now</button>
           <div id="gc-r2-result" class="field-help mt-1"></div>
-        </div>
-      </div>
-
-      <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
-
-      <div class="label-muted mb-2">Activity heartbeat</div>
-      <div class="field-help" style="max-width: 64ch;">
-        Three timestamps that tell you whether the agent is actually running. <em>Cron last ran</em> should be under an hour. <em>Last attempt</em> is the most-recent <code>Run now</code> or cron-triggered run (overwritten on each new run, even if the run later crashes — so a click always leaves a fingerprint). <em>Last completed run</em> is the most recent row in the runs table that finished (success or error).
-      </div>
-      <div class="row mt-4 items-baseline">
-        <div class="flex-1 text-sm">
-          ${(() => {
-            const now = Date.now();
-            const cronAgeMin = lastCronRun > 0 ? Math.floor((now - lastCronRun) / 60_000) : null;
-            const cronColor = cronAgeMin == null
-              ? "text-zee-muted"
-              : cronAgeMin < 75 ? "text-zee-primary"
-              : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
-              : "text-[rgb(180,60,60)]";
-            const cronLine = cronAgeMin == null
-              ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
-              : `<span class="${cronColor}">${cronAgeMin} min ago</span>`;
-
-            let attemptLine = `<span class="text-zee-muted">no attempts recorded yet</span>`;
-            if (lastRunAttempt) {
-              const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
-              const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : `${Math.floor(startedAgo / 60)} min ago`;
-              if (lastRunAttempt.outcome === "in_flight") {
-                const stalled = startedAgo > 180; // 3 min — runs normally finish in 12-25s
-                const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
-                const label = stalled ? "stalled" : "in flight";
-                attemptLine = `<span class="${tone}">${label}</span> at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
-              } else if (lastRunAttempt.outcome === "success") {
-                attemptLine = `<span class="text-zee-primary">success</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
-              } else {
-                attemptLine = `<span class="text-[rgb(180,60,60)]">failed @ ${escapeHtml(lastRunAttempt.last_step)}</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel}</span>`;
-              }
-            }
-
-            let completedLine = `<span class="text-zee-muted">no completed runs yet</span>`;
-            if (lastCompletedRun) {
-              const ago = Math.floor((now - lastCompletedRun.created_at) / 60_000);
-              const agoLabel = ago < 1 ? "just now" : `${ago} min ago`;
-              const dur = lastCompletedRun.duration_ms ? fmtDuration(lastCompletedRun.duration_ms) : "";
-              const status = lastCompletedRun.status === "success"
-                ? `<span class="text-zee-primary">success</span>`
-                : `<span class="text-[rgb(180,60,60)]">error: ${escapeHtml((lastCompletedRun.error ?? "unknown").slice(0, 60))}</span>`;
-              completedLine = `${status} · <span class="label-muted">${agoLabel}${dur ? ` · ${dur}` : ""}</span>`;
-            }
-
-            // Tavily gather funnel from the most recent run. Shows the
-            // shape of "what we asked for → what survived each filter →
-            // what reached the writer", so a thin section in a report is
-            // diagnosable at a glance.
-            let gatherLine = `<span class="text-zee-muted">no gather data yet</span>`;
-            if (lastRunAttempt?.gather_stats) {
-              const g = lastRunAttempt.gather_stats;
-              if (g.tavily_queries > 0) {
-                gatherLine = `Tavily <strong class="font-medium">${g.tavily_queries}q</strong> · <span class="tt">${g.tavily_raw}</span> raw → <span class="tt">${g.after_score_filter}</span> (score) → <span class="tt">${g.after_url_dedupe}</span> (URL) → <span class="tt">${g.after_title_dedupe}</span> (story) → <strong class="font-medium tt">${g.final_kept}</strong> final`;
-              } else if (g.final_kept > 0) {
-                gatherLine = `<span class="text-zee-muted">no Tavily this run · ${g.final_kept} sources from typed tools</span>`;
-              }
-            }
-
-            return `
-              <div class="grid gap-y-3" style="grid-template-columns: 170px 1fr;">
-                <div class="label-muted">Cron last ran</div>
-                <div>${cronLine}</div>
-                <div class="label-muted">Last attempt</div>
-                <div>${attemptLine}</div>
-                <div class="label-muted">Last completed run</div>
-                <div>${completedLine}</div>
-                <div class="label-muted">Last run gather</div>
-                <div class="text-sm">${gatherLine}</div>
-              </div>`;
-          })()}
         </div>
       </div>
 
@@ -1556,36 +1511,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           result.textContent = 'Failed: ' + (err && err.message || err);
         } finally {
           btn.disabled = false;
-        }
-      });
-
-      $('search-tuning-form')?.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const btn = e.target.querySelector('button[type=submit]');
-        const result = $('search-tuning-result');
-        const orig = btn.textContent;
-        btn.disabled = true;
-        result.textContent = '';
-        try {
-          const res = await fetch('/admin/settings', { method: 'POST', body: new FormData(e.target) });
-          const d = await res.json().catch(() => ({}));
-          if (!res.ok) {
-            btn.textContent = 'Error';
-            result.textContent = d.error || ('HTTP ' + res.status);
-            return;
-          }
-          btn.textContent = 'Saved ✓';
-          const u = d.updated || {};
-          const parts = [];
-          if (u.max_chars_per_source !== undefined) parts.push('chars≤' + u.max_chars_per_source);
-          if (u.max_run_seconds !== undefined) parts.push('max≤' + u.max_run_seconds + 's');
-          result.textContent = parts.join(' · ') || 'no change';
-          setTimeout(() => location.reload(), 800);
-        } catch (err) {
-          btn.textContent = 'Error';
-          result.textContent = String(err && err.message || err);
-        } finally {
-          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
         }
       });
 
@@ -1835,6 +1760,115 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     ${list}
   `;
   return shell("Skills · WatchOMacho", body, { activeNav: "skills", adminFooter: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin: dedicated /admin/targets page — list + add form (lifted off the
+// main admin console so /admin is just status + settings).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderAdminTargetsList(env: Env): Promise<string> {
+  const [targets, skills] = await Promise.all([listTargets(env), listSkills(env)]);
+  const active = targets.filter((t) => t.status === "active");
+  const dueNow = active.filter((t) => t.next_run_at && t.next_run_at <= Date.now() && t.primary_skill_id);
+  const statusRank: Record<string, number> = { active: 0, paused: 1, archived: 2 };
+  const sortedTargets = [...targets].sort((a, b) => {
+    const sa = statusRank[a.status] ?? 3;
+    const sb = statusRank[b.status] ?? 3;
+    if (sa !== sb) return sa - sb;
+    return (a.next_run_at ?? Infinity) - (b.next_run_at ?? Infinity);
+  });
+  const skillOptions = skills.length === 0
+    ? `<option value="">(no skills yet — use Skills tab to create one)</option>`
+    : `<option value="">(none — attach later)</option>` + skills.map((s) =>
+        `<option value="${escapeHtml(s.slug)}">${escapeHtml(s.name)}</option>`,
+      ).join("");
+
+  const targetRows = sortedTargets.length === 0
+    ? `<div class="empty">No targets yet. Add one above.</div>`
+    : `<ul class="list-none">${sortedTargets.map((t) => {
+        const isActive = t.status === "active";
+        const meta = isActive
+          ? `${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"} · every ${t.cadence_hours}h`
+          : `every ${t.cadence_hours}h`;
+        return `
+        <li class="py-2.5 border-b border-[rgba(232,228,222,0.6)]">
+          <div class="flex flex-wrap justify-between items-baseline gap-3">
+            <a href="/admin/targets/${escapeHtml(t.slug)}" class="font-medium ${isActive ? "text-zee-text" : "text-zee-muted"}">
+              ${escapeHtml(t.name)}
+              ${t.kind ? `<span class="label-muted ml-2">${escapeHtml(t.kind)}</span>` : ""}
+              <span class="badge badge-${escapeHtml(t.status)} ml-2">${escapeHtml(t.status)}</span>
+            </a>
+            <span class="tt text-xs text-zee-muted">${meta}</span>
+          </div>
+        </li>`;
+      }).join("")}</ul>`;
+
+  const body = `
+    <section class="pt-6 pb-3">
+      <p class="label">Admin · Targets</p>
+      <h1 class="headline mt-2 text-[32px]">Targets.</h1>
+      <p class="subhead"><strong class="text-zee-text">${active.length}</strong> active${sortedTargets.length > active.length ? ` · <strong class="text-zee-muted">${sortedTargets.length - active.length}</strong> paused/archived` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""}.</p>
+    </section>
+
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Targets</h3>
+          <span class="label-muted">${sortedTargets.length} total<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      ${targetRows}
+    </details>
+
+    <details class="card">
+      <summary>
+        <div class="h3-row">
+          <h3>Add a target</h3>
+          <span class="text-xs">
+            <a href="/admin/skills" class="text-zee-primary" onclick="event.stopPropagation()">Manage skills →</a>
+            <span class="chev">▾</span>
+          </span>
+        </div>
+      </summary>
+      <form method="post" action="/admin/targets">
+        <div class="field">
+          <label>Name</label>
+          <input name="name" placeholder="SW1A 1AA, Bhutan, OpenAI, etc." required maxlength="200">
+        </div>
+        <div class="field">
+          <label>Kind <span class="font-normal normal-case tracking-normal">(optional)</span></label>
+          <input name="kind" placeholder="postcode / place / topic / person / company">
+        </div>
+        <div class="field">
+          <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
+          <input name="description" maxlength="400">
+        </div>
+        <div class="row gap-4 mb-4">
+          <div class="field flex-1 mb-0">
+            <label>Cadence</label>
+            <select name="cadence_hours">
+              <option value="1">every hour</option>
+              <option value="6">every 6 hours</option>
+              <option value="12">every 12 hours</option>
+              <option value="24" selected>every 24 hours</option>
+              <option value="72">every 3 days</option>
+              <option value="168">every week</option>
+            </select>
+          </div>
+          <div class="field flex-[2] mb-0">
+            <label>Skill to apply</label>
+            <select name="skill_slug">${skillOptions}</select>
+          </div>
+        </div>
+        <label class="flex items-center gap-2 mb-3.5 text-[13px] text-zee-muted">
+          <input type="checkbox" name="run_now" value="1"> Run once now
+        </label>
+        <button class="btn" type="submit">Add target</button>
+      </form>
+    </details>
+  `;
+  return shell("Targets · Admin · WatchOMacho", body, { activeNav: "targets", adminFooter: true });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -45,6 +45,7 @@ import {
   renderAdminPanel,
   renderAdminSkills,
   renderAdminTargetEdit,
+  renderAdminTargetsList,
   renderAdminTools,
   renderHome,
   renderReportPage,
@@ -317,6 +318,11 @@ export default {
       if (path === "/admin/tools" && req.method === "GET") {
         if (!isAdmin(req, env)) return redirect("/admin/login");
         return html(renderAdminTools());
+      }
+
+      if (path === "/admin/targets" && req.method === "GET") {
+        if (!isAdmin(req, env)) return redirect("/admin/login");
+        return html(await renderAdminTargetsList(env));
       }
 
       if (path.startsWith("/admin/targets/") && req.method === "GET") {
