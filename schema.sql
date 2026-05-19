@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS targets (
   primary_skill_id TEXT,
   last_run_at INTEGER,
   next_run_at INTEGER,
+  -- Per-target Tavily knobs (v11). NULL = use the global default from the
+  -- `settings` table. Keeps tuning out of the global namespace so changing
+  -- one target's behaviour doesn't silently change every other target's.
+  queries_per_run INTEGER,
+  tavily_min_score REAL,
+  tavily_max_final_sources INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -30,7 +36,16 @@ CREATE TABLE IF NOT EXISTS skills (
   slug TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
   description TEXT,
+  -- The writer instructions. Goes verbatim into the planner + writer
+  -- system prompts. Replaces the old "parse markdown headers for tool
+  -- selection" magic (v10+). Tool selection now lives in tool_slug etc.
   procedure_md TEXT NOT NULL,
+  -- Explicit tool config (v10). Replaces the old markdown-header parser.
+  -- NULL tool_slug means "writer only — no data gathering".
+  tool_slug TEXT,
+  tool_op TEXT,
+  tool_params_json TEXT,    -- {"topic":"news","time_range":"day","depth":"basic"}
+  tool_sources_json TEXT,   -- ["https://...","..."] (only used by tavily/extract)
   author TEXT NOT NULL,
   used_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,

@@ -77,6 +77,28 @@ function withSecurityHeaders(init: ResponseInit): ResponseInit {
   };
 }
 
+/** Pull the per-skill tool params from a form. Returns a flat object of
+ *  whatever was set; blank values are dropped so they fall back to the
+ *  tool's defaults at run time. */
+function collectSkillToolParams(form: Record<string, string>): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const k of ["topic", "time_range", "depth"]) {
+    const v = (form[k] ?? "").trim();
+    if (v) params[k] = v;
+  }
+  return params;
+}
+
+/** Parse a textarea of URLs (one per line, # comments OK) into a clean
+ *  list. Returns [] when empty. */
+function parseSourceUrls(raw: string): string[] {
+  return raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"))
+    .filter((l) => /^https?:\/\//i.test(l));
+}
+
 function html(body: string, init: ResponseInit = {}): Response {
   return new Response(body, withSecurityHeaders({
     ...init,
@@ -364,6 +386,34 @@ export default {
             patch.primary_skill_id = null as any;
           }
         }
+        // Per-target Tavily knobs. Blank = "use the global default" → NULL.
+        if (form.queries_per_run !== undefined) {
+          const raw = form.queries_per_run.trim();
+          if (raw === "") {
+            patch.queries_per_run = null;
+          } else {
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n) && n >= 1 && n <= 20) patch.queries_per_run = n;
+          }
+        }
+        if (form.tavily_min_score !== undefined) {
+          const raw = form.tavily_min_score.trim();
+          if (raw === "") {
+            patch.tavily_min_score = null;
+          } else {
+            const f = parseFloat(raw);
+            if (Number.isFinite(f) && f >= 0 && f <= 1) patch.tavily_min_score = f;
+          }
+        }
+        if (form.tavily_max_final_sources !== undefined) {
+          const raw = form.tavily_max_final_sources.trim();
+          if (raw === "") {
+            patch.tavily_max_final_sources = null;
+          } else {
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n) && n >= 1 && n <= 200) patch.tavily_max_final_sources = n;
+          }
+        }
         await updateTarget(env, target.id, patch);
         return redirect(`/admin/targets/${target.slug}`);
       }
@@ -424,12 +474,20 @@ export default {
         const md = (form.procedure_md ?? "").trim();
         if (!name) return json({ error: "name required" }, { status: 400 });
         if (md.length < 30) return json({ error: "procedure_md too short" }, { status: 400 });
-        const skill = await createSkillFromMarkdown(env, {
-          name,
-          description: form.description?.trim() || undefined,
-          procedure_md: md,
-        });
-        return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        try {
+          const skill = await createSkillFromMarkdown(env, {
+            name,
+            description: form.description?.trim() || undefined,
+            procedure_md: md,
+            tool_slug: form.tool_slug === "" ? null : (form.tool_slug ?? undefined),
+            tool_op: form.tool_op === "" ? null : (form.tool_op ?? undefined),
+            tool_params: collectSkillToolParams(form),
+            tool_sources: parseSourceUrls(form.tool_sources ?? ""),
+          });
+          return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        } catch (e: any) {
+          return json({ error: e?.message ?? "create failed" }, { status: 400 });
+        }
       }
 
       if (path.startsWith("/admin/skills/") && path.endsWith("/update") && req.method === "POST") {
@@ -438,12 +496,26 @@ export default {
         const skill = await getSkillBySlug(env, slug);
         if (!skill) return json({ error: "not found" }, { status: 404 });
         const form = await readForm(req);
-        await updateSkill(env, skill.id, {
-          name: form.name?.trim() || undefined,
-          description: form.description?.trim(),
-          procedure_md: form.procedure_md?.trim() || undefined,
-        });
-        return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        try {
+          await updateSkill(env, skill.id, {
+            name: form.name?.trim() || undefined,
+            description: form.description?.trim(),
+            procedure_md: form.procedure_md?.trim() || undefined,
+            tool_slug: form.tool_slug === undefined
+              ? undefined
+              : (form.tool_slug === "" ? null : form.tool_slug),
+            tool_op: form.tool_op === undefined
+              ? undefined
+              : (form.tool_op === "" ? null : form.tool_op),
+            tool_params: form.tool_slug === undefined ? undefined : collectSkillToolParams(form),
+            tool_sources: form.tool_sources === undefined
+              ? undefined
+              : parseSourceUrls(form.tool_sources),
+          });
+          return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        } catch (e: any) {
+          return json({ error: e?.message ?? "update failed" }, { status: 400 });
+        }
       }
 
       if (path.startsWith("/admin/skills/") && path.endsWith("/delete") && req.method === "POST") {
@@ -488,18 +560,9 @@ export default {
           daily_report_limit: [0, 10000],
           daily_search_limit: [0, 100000],
           cron_max_per_tick: [1, 20],
-          // Search-tuning CPU levers (Workers Free = 10ms CPU per
-          // invocation). max_final_sources caps how many sources reach the
-          // writer; max_chars_per_source caps each source's content. Writer
-          // prompt size = product of the two and is the dominant CPU spend.
-          max_final_sources: [1, 200],
+          // Worker-wide CPU + safety levers. Tavily knobs moved to per-
+          // target columns (v11) so they're no longer here.
           max_chars_per_source: [200, 8000],
-          // Run guardrail. Aborts in-flight Tavily / Anthropic fetches when
-          // the run wall-clock exceeds this many seconds. Hard ceiling is
-          // the 15-min Durable Object alarm limit; this is the soft cap
-          // below it. Floor is 5s — low enough to deliberately trigger an
-          // abort during testing (every run will fail at 5s, but the error
-          // message names the cause so it's self-diagnostic).
           max_run_seconds: [5, 600],
         };
         const updated: Record<string, string> = {};
@@ -519,19 +582,6 @@ export default {
           }
           await setSetting(env, "chat_model", form.chat_model);
           updated.chat_model = form.chat_model;
-        }
-        // Tavily relevance threshold — float in [0, 1]. Editable via the
-        // "Search tuning" admin card. 0.4 is the Tavily-documented sweet
-        // spot; lower = more candidates (noisier), higher = stricter.
-        if (form.tavily_min_score !== undefined && form.tavily_min_score !== "") {
-          const f = parseFloat(form.tavily_min_score);
-          if (!Number.isFinite(f) || f < 0 || f > 1) {
-            return json({ error: "tavily_min_score must be a number between 0 and 1" }, { status: 400 });
-          }
-          // Quantise to 2 decimals so storage stays tidy ("0.40" not "0.4000000001").
-          const rounded = Math.round(f * 100) / 100;
-          await setSetting(env, "tavily_min_score", String(rounded));
-          updated.tavily_min_score = String(rounded);
         }
         return json({ ok: true, updated });
       }

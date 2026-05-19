@@ -1103,7 +1103,7 @@ export function renderAdminLogin(error?: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminPanel(env: Env): Promise<string> {
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, lastCompletedRun, tavilyMinScoreStr, maxFinalSourcesStr, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, lastCompletedRun, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1121,19 +1121,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     getSetting(env, "last_cron_run", "0"),
     getSetting(env, "last_run_attempt", ""),
     env.DB.prepare("SELECT status, error, duration_ms, created_at FROM runs ORDER BY created_at DESC LIMIT 1").first<{ status: string; error: string | null; duration_ms: number | null; created_at: number }>(),
-    getSetting(env, "tavily_min_score", "0.4"),
-    getSetting(env, "max_final_sources", "100"),
     getSetting(env, "max_chars_per_source", "4000"),
     getSetting(env, "max_run_seconds", "90"),
   ]);
-  const tavilyMinScore = (() => {
-    const f = parseFloat(tavilyMinScoreStr);
-    return Number.isFinite(f) && f >= 0 && f <= 1 ? f : 0.4;
-  })();
-  const maxFinalSources = (() => {
-    const n = parseInt(maxFinalSourcesStr, 10);
-    return Number.isFinite(n) && n >= 1 && n <= 200 ? n : 100;
-  })();
   const maxCharsPerSource = (() => {
     const n = parseInt(maxCharsPerSourceStr, 10);
     return Number.isFinite(n) && n >= 200 && n <= 8000 ? n : 4000;
@@ -1326,44 +1316,29 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       </form>
     </details>
 
-    <details class="card" open>
+    <details class="card">
       <summary>
         <div class="h3-row">
-          <h3>Search tuning &amp; run guardrails</h3>
-          <span class="label-muted">min score ${tavilyMinScore.toFixed(2)} · cap ${maxFinalSources} src × ${maxCharsPerSource} chars · max ${maxRunSeconds}s<span class="chev">▾</span></span>
+          <h3>Run guardrails</h3>
+          <span class="label-muted">${maxCharsPerSource} chars/src · max ${maxRunSeconds}s<span class="chev">▾</span></span>
         </div>
       </summary>
       <div class="field-help mt-3.5" style="max-width: 72ch;">
-        <strong>Source caps</strong> (first two fields) control how much material reaches the writer — smaller payload means faster Anthropic call. <strong>Max run seconds</strong> (third field) is the run-level kill switch: when wall-clock exceeds it, in-flight Tavily / Anthropic fetches are aborted, the heartbeat is marked errored, and a row is written to <em>Recent runs</em>. The hard ceiling is the 15-minute Durable Object alarm budget; this soft cap sits well below to catch a hung API early. There is also a per-skill lever, <strong>Depth</strong> (<code>basic</code> vs <code>advanced</code>) set in the skill body's <code>## Search configuration</code> block — <code>advanced</code> is slower per query and returns richer content; switch to <code>basic</code> if a particular skill keeps blowing budget.
+        Worker-wide kill switches. Per-target Tavily knobs (queries per run, min score, max sources) live on each target's edit page now — these two stay global because they're CPU/safety levers, not tuning.
       </div>
       <form id="search-tuning-form">
-        <div class="field mb-3.5">
-          <label>Tavily minimum score</label>
-          <input type="number" name="tavily_min_score" min="0" max="1" step="0.05" value="${tavilyMinScore.toFixed(2)}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            Drops Tavily hits below this score. 0 = keep everything (noisy). 1 = only perfect matches (very few). Tavily-recommended sweet spot: <strong>0.4</strong>. Lower = more candidates reach the writer (richer + noisier). Higher = stricter (cleaner but sparser). Watch the gather funnel in Maintenance after each run to see the effect.
-          </div>
-        </div>
-        <div class="field mb-3.5">
-          <label>Max final sources</label>
-          <input type="number" name="max_final_sources" min="1" max="200" step="1" value="${maxFinalSources}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            Hard cap on how many sources reach the writer after all filtering. Default <strong>100</strong> (defensive ceiling — filters usually settle naturally at ~25–30). Drop to <strong>15</strong> if runs are silently dying mid-write on Workers Free; that's the cheapest way to halve the prompt-build CPU. Drop further if even that fails.
-          </div>
-        </div>
         <div class="field mb-3.5">
           <label>Max chars per source</label>
           <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}" style="max-width: 140px;">
           <div class="field-help mt-1.5" style="max-width: 64ch;">
-            How much of each source's body text is sent to the writer. Default <strong>4000</strong> (~1000 tokens/source — fine for Haiku 4.5's 200k context). Drop to <strong>2000</strong> if you switch back to Workers AI Llama (24k context), or if you need to shrink the writer payload.
+            How much of each source's body text is sent to the writer. Default <strong>4000</strong> (~1000 tokens/source — fine for Haiku 4.5's 200k context). Drop to <strong>2000</strong> if you switch back to Workers AI Llama (24k context).
           </div>
         </div>
-        <div style="margin: 20px 0; border-top: 1px solid #D6CFC4;"></div>
         <div class="field mb-3.5">
           <label>Max run seconds (kill switch)</label>
           <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}" style="max-width: 140px;">
           <div class="field-help mt-1.5" style="max-width: 64ch;">
-            Soft ceiling on a single run's wall-clock. When exceeded, the Durable Object alarm aborts in-flight fetches (Tavily, Anthropic), the heartbeat is marked errored, and a row is written to <em>Recent runs</em> with <code>watchdog reaped</code>. Default <strong>90 s</strong> — comfortably above today's slowest successful run (~50 s). The hard ceiling is the 15-minute DO alarm limit; this soft cap catches hung APIs early so a stuck call can't burn the daily Durable Objects compute quota (13,000 GB-s on Workers Free, ~115 GB-s per 15-min stuck run).
+            Soft ceiling on a single run's wall-clock. When exceeded, the Durable Object alarm aborts in-flight fetches, the heartbeat is marked errored, and a row is written to <em>Recent runs</em>. Default <strong>90 s</strong>. Hard ceiling is the 15-min DO alarm limit.
           </div>
         </div>
         <div class="row">
@@ -1602,8 +1577,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           btn.textContent = 'Saved ✓';
           const u = d.updated || {};
           const parts = [];
-          if (u.tavily_min_score !== undefined) parts.push('min_score=' + u.tavily_min_score);
-          if (u.max_final_sources !== undefined) parts.push('sources≤' + u.max_final_sources);
           if (u.max_chars_per_source !== undefined) parts.push('chars≤' + u.max_chars_per_source);
           if (u.max_run_seconds !== undefined) parts.push('max≤' + u.max_run_seconds + 's');
           result.textContent = parts.join(' · ') || 'no change';
@@ -1672,14 +1645,50 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 export async function renderAdminSkills(env: Env): Promise<string> {
   const skills = await listSkills(env);
 
+  // Centralised dropdown helpers — used by both the create form and every
+  // edit form below. Same option lists, same semantics.
+  const toolOptions = (selected: string | null | undefined) => {
+    const opts = Object.values(TOOLS).map((t) =>
+      `<option value="${escapeHtml(t.slug)}"${t.slug === selected ? " selected" : ""}>${escapeHtml(t.display)}</option>`,
+    ).join("");
+    return `<option value=""${!selected ? " selected" : ""}>(none — writer only, no gathering)</option>${opts}`;
+  };
+  const opOptionsFor = (toolSlug: string | null | undefined, selectedOp: string | null | undefined) => {
+    if (!toolSlug || !TOOLS[toolSlug]) return `<option value="">(pick a tool first)</option>`;
+    return Object.keys(TOOLS[toolSlug].operations).map((op) =>
+      `<option value="${escapeHtml(op)}"${op === selectedOp ? " selected" : ""}>${escapeHtml(op)}</option>`,
+    ).join("");
+  };
+  const topicOptions = (selected: string) =>
+    ["general", "news", "finance"].map((t) =>
+      `<option value="${t}"${t === selected ? " selected" : ""}>${t}</option>`,
+    ).join("");
+  const timeRangeOptions = (selected: string) =>
+    ["", "day", "week", "month", "year"].map((t) =>
+      `<option value="${t}"${t === selected ? " selected" : ""}>${t === "" ? "(any time)" : t}</option>`,
+    ).join("");
+  const depthOptions = (selected: string) =>
+    ["basic", "advanced"].map((t) =>
+      `<option value="${t}"${t === selected ? " selected" : ""}>${t}</option>`,
+    ).join("");
+
   const list = skills.length === 0
-    ? `<div class="empty">No skills yet. Synthesise one below from a brief, or paste your own markdown.</div>`
-    : skills.map((s) => `
-        <details class="card px-5 py-4" ${s.slug ? "" : "open"}>
+    ? `<div class="empty">No skills yet. Synthesise one below from a brief, or write one by hand.</div>`
+    : skills.map((s) => {
+      const params: Record<string, string> = s.tool_params_json
+        ? (() => { try { return JSON.parse(s.tool_params_json!); } catch { return {}; } })()
+        : {};
+      const sourcesText = s.tool_sources_json
+        ? (() => { try { return (JSON.parse(s.tool_sources_json!) as string[]).join("\n"); } catch { return ""; } })()
+        : "";
+      const isTavilyExtract = s.tool_slug === "tavily" && s.tool_op === "extract";
+      return `
+        <details class="card px-5 py-4">
           <summary class="cursor-pointer list-none flex flex-wrap justify-between items-baseline gap-3">
             <span>
               <strong class="font-medium">${escapeHtml(s.name)}</strong>
               <span class="badge badge-${s.author} ml-2">${s.author}</span>
+              ${s.tool_slug ? `<span class="label-muted ml-2">${escapeHtml(s.tool_slug)} / ${escapeHtml(s.tool_op ?? "")}</span>` : `<span class="label-muted ml-2">writer only</span>`}
               <a href="/skill/${escapeHtml(s.slug)}" class="ml-2 text-xs text-zee-primary">public →</a>
             </span>
             <span class="label-muted">used ${s.used_count}× · ${escapeHtml(timeAgo(s.updated_at))}</span>
@@ -1693,8 +1702,40 @@ export async function renderAdminSkills(env: Env): Promise<string> {
               <label>Description</label>
               <input name="description" value="${escapeHtml(s.description ?? "")}" maxlength="200">
             </div>
+
+            <div class="row gap-4 mb-4">
+              <div class="field flex-1 mb-0">
+                <label>Tool</label>
+                <select name="tool_slug">${toolOptions(s.tool_slug)}</select>
+              </div>
+              <div class="field flex-1 mb-0">
+                <label>Operation</label>
+                <select name="tool_op">${opOptionsFor(s.tool_slug, s.tool_op)}</select>
+              </div>
+            </div>
+
+            <div class="row gap-4 mb-4">
+              <div class="field flex-1 mb-0">
+                <label>Search topic</label>
+                <select name="topic">${topicOptions(params.topic ?? "general")}</select>
+              </div>
+              <div class="field flex-1 mb-0">
+                <label>Time range</label>
+                <select name="time_range">${timeRangeOptions(params.time_range ?? "")}</select>
+              </div>
+              <div class="field flex-1 mb-0">
+                <label>Depth</label>
+                <select name="depth">${depthOptions(params.depth ?? "basic")}</select>
+              </div>
+            </div>
+
+            <details class="mb-4"${isTavilyExtract ? " open" : ""}>
+              <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
+              <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line. Lines starting with # are ignored.">${escapeHtml(sourcesText)}</textarea>
+            </details>
+
             <div class="field">
-              <label>Procedure (markdown)</label>
+              <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
               <textarea name="procedure_md" class="min-h-[280px] font-mono text-[13px]">${escapeHtml(s.procedure_md)}</textarea>
             </div>
             <div class="row">
@@ -1703,18 +1744,19 @@ export async function renderAdminSkills(env: Env): Promise<string> {
             </div>
           </form>
         </details>
-      `).join("");
+      `;
+    }).join("");
 
   const body = `
     <section class="pt-6 pb-2">
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Skills.</h1>
-      <p class="subhead">The agent's library of reusable research procedures. Each skill is a markdown document — write it yourself or let the agent synthesise one from a brief.</p>
+      <p class="subhead">The agent's library of reusable research procedures. Each skill picks a tool, configures it, and writes the instructions the LLM uses to plan + author the report. WYSIWYG — no hidden parsing.</p>
     </section>
 
     <div class="card">
       <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the procedure document for you and pick which <a href="/admin/tools" class="text-zee-primary">tools</a> to use (Tavily web search, HM Land Registry sold prices, ONS postcode context, data.police.uk crime stats, Companies House) based on what the brief implies.</p>
+      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the writer-instruction markdown for you (defaults to <code>tavily / search</code>; you can change the tool config after).</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="synthesize">
         <div class="field">
@@ -1731,7 +1773,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Write a skill by hand</h3></div>
-      <p class="field-help mb-3">Optional tool headers you can declare in the markdown (all defaults are sensible). A skill may declare one or more tools (one of each): <code>**Tavily op:** search|extract</code>, <code>**Land Registry op:** sold-prices</code>, <code>**ONS op:** context</code>, <code>**Police op:** crimes</code>, <code>**Companies House op:** search|by-postcode</code>. Per-tool params (e.g. <code>**Months:** 6</code>, <code>**Search topic:** news</code>) live underneath. Full catalog with every header: <a href="/admin/tools" class="text-zee-primary">/admin/tools</a>.</p>
+      <p class="field-help mb-3">Pick a tool + op, set its params, then write the instructions. The agent feeds the instructions verbatim into the planner (to generate queries) and the writer (to author the report).</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="write">
         <div class="field">
@@ -1742,13 +1784,46 @@ export async function renderAdminSkills(env: Env): Promise<string> {
           <label>Description</label>
           <input name="description" maxlength="200">
         </div>
-        <div class="field">
-          <label>Procedure (markdown)</label>
-          <textarea name="procedure_md" required class="min-h-[240px] font-mono text-[13px]" placeholder="# Skill name
 
-**Purpose:** ...
-**Search queries:**
-- {target} ...
+        <div class="row gap-4 mb-4">
+          <div class="field flex-1 mb-0">
+            <label>Tool</label>
+            <select name="tool_slug">${toolOptions("tavily")}</select>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Operation</label>
+            <select name="tool_op">${opOptionsFor("tavily", "search")}</select>
+          </div>
+        </div>
+
+        <div class="row gap-4 mb-4">
+          <div class="field flex-1 mb-0">
+            <label>Search topic</label>
+            <select name="topic">${topicOptions("general")}</select>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Time range</label>
+            <select name="time_range">${timeRangeOptions("")}</select>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Depth</label>
+            <select name="depth">${depthOptions("basic")}</select>
+          </div>
+        </div>
+
+        <details class="mb-4">
+          <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
+          <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line."></textarea>
+        </details>
+
+        <div class="field">
+          <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
+          <textarea name="procedure_md" required class="min-h-[240px] font-mono text-[13px]" placeholder="**Purpose:** ...
+
+**When to use:** ...
+
+**Approach:** ...
+
 **Output structure:**
 - Heading: ...
 "></textarea>
@@ -1944,7 +2019,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <label>Description</label>
           <input name="description" value="${escapeHtml(target.description ?? "")}" maxlength="400">
         </div>
-        <div class="row gap-4">
+        <div class="row gap-4 mb-4">
           <div class="field flex-1 mb-0">
             <label>Status</label>
             <select name="status">
@@ -1960,6 +2035,31 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <div class="field flex-[2] mb-0">
             <label>Primary skill</label>
             <select name="skill_slug">${skillOptions}</select>
+          </div>
+        </div>
+
+        <div class="label-muted mt-2 mb-2">Tavily knobs <span class="font-normal normal-case tracking-normal text-zee-muted">(blank = use the global default)</span></div>
+        <div class="row gap-4">
+          <div class="field flex-1 mb-0">
+            <label>Queries per run</label>
+            <input type="number" name="queries_per_run" min="1" max="20" step="1"
+                   value="${target.queries_per_run ?? ""}"
+                   placeholder="10 (default)">
+            <div class="field-help mt-1.5">How many distinct search queries the planner produces. World-news-style skills want 10; a focused postcode dossier wants 2–3.</div>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Tavily min score</label>
+            <input type="number" name="tavily_min_score" min="0" max="1" step="0.05"
+                   value="${target.tavily_min_score != null ? target.tavily_min_score.toFixed(2) : ""}"
+                   placeholder="0.40 (default)">
+            <div class="field-help mt-1.5">Drops Tavily hits below this relevance score. 0 = keep everything (noisy). 1 = strict.</div>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Max final sources</label>
+            <input type="number" name="tavily_max_final_sources" min="1" max="200" step="1"
+                   value="${target.tavily_max_final_sources ?? ""}"
+                   placeholder="100 (default)">
+            <div class="field-help mt-1.5">Hard cap on how many sources reach the writer after dedupe.</div>
           </div>
         </div>
       </form>
@@ -2000,18 +2100,11 @@ export function renderAdminTools(): string {
   const cards = Object.values(TOOLS).map((tool) => {
     const opRows = Object.entries(tool.operations).map(([opName, op]) => `
       <tr>
-        <td class="whitespace-nowrap align-top pr-3 py-2 font-mono text-[13px] text-zee-primary">${escapeHtml(tool.slug)} (${escapeHtml(opName)})</td>
+        <td class="whitespace-nowrap align-top pr-3 py-2 font-mono text-[13px] text-zee-primary">${escapeHtml(tool.slug)} / ${escapeHtml(opName)}</td>
         <td class="align-top py-2 text-sm text-zee-text">
           <div>${escapeHtml(op.description)}</div>
           <div class="field-help mt-1"><em>When to use:</em> ${escapeHtml(op.when_to_use)}</div>
         </td>
-      </tr>
-    `).join("");
-
-    const headerRows = tool.headers.map((h) => `
-      <tr>
-        <td class="whitespace-nowrap align-top pr-3 py-1 font-mono text-[13px] text-zee-primary">**${escapeHtml(h.key)}:**</td>
-        <td class="align-top py-1 text-sm text-zee-text">${escapeHtml(h.values)}</td>
       </tr>
     `).join("");
 
@@ -2021,8 +2114,6 @@ export function renderAdminTools(): string {
         <p class="field-help mb-3">${escapeHtml(tool.summary)}</p>
         <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-2 mb-1">Operations</h4>
         <table class="w-full border-collapse"><tbody>${opRows}</tbody></table>
-        <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-4 mb-1">Skill markdown headers</h4>
-        <table class="w-full border-collapse"><tbody>${headerRows}</tbody></table>
       </div>
     `;
   }).join("");
@@ -2031,7 +2122,7 @@ export function renderAdminTools(): string {
     <section class="pt-6 pb-2">
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Tools.</h1>
-      <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. A skill may declare one or more tools (one of each) via headers in its procedure markdown. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
+      <p class="subhead">What skills can call. Today: Tavily only. Each skill picks one tool + one operation on its edit page. To add another tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together.</p>
     </section>
 
     ${cards}
