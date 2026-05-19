@@ -17,6 +17,17 @@ routes = [
 [triggers]
 crons = ["0 * * * *"]
 
+# Workers Logs — 7-day retention of console.log + uncaught errors in the
+# Cloudflare dashboard (Workers & Pages → watchomacho → Logs). Essential
+# when a run dies silently because the isolate hit the CPU cap (Workers Free
+# = 10ms CPU per invocation): `wrangler tail` only shows live logs going
+# forward, so without this you can't replay a failure after the fact.
+# head_sampling_rate = 1 keeps every invocation; lower if log volume becomes
+# a cost concern.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # Workers AI — for chat + embeddings
 [ai]
 binding = "AI"
@@ -41,6 +52,23 @@ bucket_name = "watchomacho-reports"
 [[vectorize]]
 binding = "MEMORY"
 index_name = "watchomacho-memory"
+
+# Durable Object: ResearchRunner — wraps `runResearch` in an alarm handler
+# so manual "Run Now" gets a 15-minute wall-clock budget instead of the
+# 30-second ctx.waitUntil cap on HTTP requests. One DO instance per target
+# slug (via idFromName) for natural serialisation. SQLite backend is
+# required for Workers Free — see `new_sqlite_classes` below.
+[[durable_objects.bindings]]
+name = "RESEARCH_RUNNER"
+class_name = "ResearchRunner"
+
+# Migration declaring ResearchRunner with the SQLite backend. Adding the
+# class to `new_sqlite_classes` (not `new_classes`) is what makes this
+# work on the Free plan. Bump the tag + use `renamed_classes` / etc. if
+# the class is ever renamed or removed.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ResearchRunner"]
 
 # Secrets are NOT defined here. Set with:
 #   wrangler secret put ADMIN_SECRET    — admin panel password

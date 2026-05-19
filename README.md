@@ -67,7 +67,10 @@ If you're upgrading from any earlier version, run the v6 migration instead of `d
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v6.sql
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v7.sql
 npx wrangler d1 execute watchomacho-db --remote --file=migration-v8.sql
+npx wrangler d1 execute watchomacho-db --remote --file=migration-v9.sql
 ```
+
+The first deploy after v9 also creates the `ResearchRunner` Durable Object (SQLite backend, declared in `wrangler.toml`). No manual setup — `wrangler deploy` handles it. The DO is what manual "Run Now" routes through so it gets a 15-minute alarm budget instead of the 30-second `waitUntil` cap on HTTP handlers.
 
 ### 3. Set the secrets
 
@@ -148,6 +151,15 @@ Set from `/admin`:
 - `cron_max_per_tick` — how many targets the cron advances per hour (default 2)
 
 Counters reset at 00:00 UTC.
+
+### Search tuning & run guardrails
+
+Same admin card hosts the per-run knobs:
+
+- `tavily_min_score` — drop Tavily hits below this relevance score (default 0.4)
+- `max_final_sources` — cap on how many sources reach the writer (default 100; lower if writer payload is causing slow runs)
+- `max_chars_per_source` — chars from each source's content sent to the writer (default 4000)
+- `max_run_seconds` — soft kill switch on the DO alarm. Default 90s. Aborts in-flight Tavily / Anthropic fetches when wall-clock exceeds, writes an error runs row tagged with the step. Hard ceiling above is the 15-min DO alarm limit.
 
 ### Chat models
 

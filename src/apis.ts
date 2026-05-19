@@ -60,6 +60,7 @@ export async function tavilySearch(
   apiKey: string | undefined,
   query: string,
   options: TavilySearchOptions = {},
+  signal?: AbortSignal,
 ): Promise<TavilySearchResult[]> {
   if (!apiKey) {
     console.warn("tavilySearch: TAVILY_API_KEY not set, skipping query:", query);
@@ -79,6 +80,7 @@ export async function tavilySearch(
       max_results: options.max_results ?? 5,
       include_raw_content: true,        // we want the page text
     }),
+    signal,
   });
   if (!r.ok) {
     const body = await r.text().catch(() => "");
@@ -106,6 +108,7 @@ export async function tavilyExtract(
   apiKey: string | undefined,
   urls: string[],
   extract_depth: "basic" | "advanced" = "basic",
+  signal?: AbortSignal,
 ): Promise<TavilyExtractResult[]> {
   if (!apiKey || urls.length === 0) return [];
   const r = await fetch("https://api.tavily.com/extract", {
@@ -116,6 +119,7 @@ export async function tavilyExtract(
       urls: urls.slice(0, 20),
       extract_depth,
     }),
+    signal,
   });
   if (!r.ok) {
     const body = await r.text().catch(() => "");

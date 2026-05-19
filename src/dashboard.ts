@@ -908,6 +908,16 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const html = wrapSectionsInCards(renderMarkdown(bodyMd));
   const sourcesHtml = renderSourcesSection(report.sources_json);
 
+  // Pull the run row this report came from so we can render the gather
+  // funnel + duration on the report header. Reports written before
+  // migration v9 won't have gather_stats_json; the helper returns "".
+  const runRow = report.run_id
+    ? await env.DB.prepare(
+        "SELECT gather_stats_json, duration_ms FROM runs WHERE id = ?",
+      ).bind(report.run_id).first<{ gather_stats_json: string | null; duration_ms: number | null }>()
+    : null;
+  const funnelHtml = renderGatherFunnel(runRow?.gather_stats_json);
+
   const body = `
     <section class="pt-8 pb-4">
       <p class="label">${target ? `<a href="/target/${escapeHtml(target.slug)}" class="text-inherit">${escapeHtml(target.name)}</a>` : "Report"}</p>
@@ -917,13 +927,43 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
         ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" class="text-zee-primary">${escapeHtml(skill.name)}</a></span>` : ""}
         <span class="label-muted">${report.word_count ?? 0} words</span>
         ${report.chat_model ? `<span class="label-muted" title="${escapeHtml(report.chat_model)}">written by <strong class="text-zee-text font-medium">${escapeHtml(chatModelShortLabel(report.chat_model))}</strong></span>` : ""}
+        ${runRow?.duration_ms ? `<span class="label-muted">${escapeHtml(fmtDuration(runRow.duration_ms))} runtime</span>` : ""}
       </div>
+      ${funnelHtml ? `<div class="field-help mt-2.5" style="max-width: 80ch;">${funnelHtml}</div>` : ""}
     </section>
     <article class="prose pt-6 pb-2">${html}</article>
     ${sourcesHtml}
     <div class="pb-12"></div>
   `;
   return shell(`${report.title} — WatchOMacho`, body);
+}
+
+/** Render the Tavily gather funnel ("200 raw → 122 score → 111 url → 111
+ *  story → 100 final") as compact inline HTML. Returns empty string if the
+ *  input is null / missing / malformed / shows no Tavily activity, so the
+ *  caller can include it unconditionally without spurious blank rows. */
+function renderGatherFunnel(json: string | null | undefined): string {
+  if (!json) return "";
+  try {
+    const g = JSON.parse(json) as {
+      tavily_queries?: number; tavily_raw?: number; after_score_filter?: number;
+      after_url_dedupe?: number; after_title_dedupe?: number; final_kept?: number;
+    };
+    if (!g.tavily_queries || g.tavily_queries === 0) {
+      if (g.final_kept && g.final_kept > 0) {
+        return `<span class="text-zee-muted">no Tavily · ${g.final_kept} sources from typed tools</span>`;
+      }
+      return "";
+    }
+    return `Tavily <strong class="font-medium">${g.tavily_queries}q</strong>`
+      + ` · <span class="tt">${g.tavily_raw}</span> raw`
+      + ` → <span class="tt">${g.after_score_filter}</span> (score)`
+      + ` → <span class="tt">${g.after_url_dedupe}</span> (URL)`
+      + ` → <span class="tt">${g.after_title_dedupe}</span> (story)`
+      + ` → <strong class="font-medium tt">${g.final_kept}</strong> final`;
+  } catch {
+    return "";
+  }
 }
 
 /** Strip a trailing Sources / References / Citations section from the report
@@ -1063,7 +1103,7 @@ export function renderAdminLogin(error?: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminPanel(env: Env): Promise<string> {
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, lastCompletedRun, tavilyMinScoreStr] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, lastCompletedRun, tavilyMinScoreStr, maxFinalSourcesStr, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1082,10 +1122,25 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     getSetting(env, "last_run_attempt", ""),
     env.DB.prepare("SELECT status, error, duration_ms, created_at FROM runs ORDER BY created_at DESC LIMIT 1").first<{ status: string; error: string | null; duration_ms: number | null; created_at: number }>(),
     getSetting(env, "tavily_min_score", "0.4"),
+    getSetting(env, "max_final_sources", "100"),
+    getSetting(env, "max_chars_per_source", "4000"),
+    getSetting(env, "max_run_seconds", "90"),
   ]);
   const tavilyMinScore = (() => {
     const f = parseFloat(tavilyMinScoreStr);
     return Number.isFinite(f) && f >= 0 && f <= 1 ? f : 0.4;
+  })();
+  const maxFinalSources = (() => {
+    const n = parseInt(maxFinalSourcesStr, 10);
+    return Number.isFinite(n) && n >= 1 && n <= 200 ? n : 100;
+  })();
+  const maxCharsPerSource = (() => {
+    const n = parseInt(maxCharsPerSourceStr, 10);
+    return Number.isFinite(n) && n >= 200 && n <= 8000 ? n : 4000;
+  })();
+  const maxRunSeconds = (() => {
+    const n = parseInt(maxRunSecondsStr, 10);
+    return Number.isFinite(n) && n >= 5 && n <= 600 ? n : 90;
   })();
   const embedLastOkAt = parseInt(embedLastOkStr, 10) || 0;
   const embedLastError: { message: string; at: number; report_id?: string } | null =
@@ -1261,16 +1316,41 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     <details class="card" open>
       <summary>
         <div class="h3-row">
-          <h3>Search tuning</h3>
-          <span class="label-muted">min score ${tavilyMinScore.toFixed(2)}<span class="chev">▾</span></span>
+          <h3>Search tuning &amp; run guardrails</h3>
+          <span class="label-muted">min score ${tavilyMinScore.toFixed(2)} · cap ${maxFinalSources} src × ${maxCharsPerSource} chars · max ${maxRunSeconds}s<span class="chev">▾</span></span>
         </div>
       </summary>
+      <div class="field-help mt-3.5" style="max-width: 72ch;">
+        <strong>Source caps</strong> (first two fields) control how much material reaches the writer — smaller payload means faster Anthropic call. <strong>Max run seconds</strong> (third field) is the run-level kill switch: when wall-clock exceeds it, in-flight Tavily / Anthropic fetches are aborted, the heartbeat is marked errored, and a row is written to <em>Recent runs</em>. The hard ceiling is the 15-minute Durable Object alarm budget; this soft cap sits well below to catch a hung API early. There is also a per-skill lever, <strong>Depth</strong> (<code>basic</code> vs <code>advanced</code>) set in the skill body's <code>## Search configuration</code> block — <code>advanced</code> is slower per query and returns richer content; switch to <code>basic</code> if a particular skill keeps blowing budget.
+      </div>
       <form id="search-tuning-form">
         <div class="field mb-3.5">
           <label>Tavily minimum score</label>
           <input type="number" name="tavily_min_score" min="0" max="1" step="0.05" value="${tavilyMinScore.toFixed(2)}" style="max-width: 140px;">
           <div class="field-help mt-1.5" style="max-width: 64ch;">
             Drops Tavily hits below this score. 0 = keep everything (noisy). 1 = only perfect matches (very few). Tavily-recommended sweet spot: <strong>0.4</strong>. Lower = more candidates reach the writer (richer + noisier). Higher = stricter (cleaner but sparser). Watch the gather funnel in Maintenance after each run to see the effect.
+          </div>
+        </div>
+        <div class="field mb-3.5">
+          <label>Max final sources</label>
+          <input type="number" name="max_final_sources" min="1" max="200" step="1" value="${maxFinalSources}" style="max-width: 140px;">
+          <div class="field-help mt-1.5" style="max-width: 64ch;">
+            Hard cap on how many sources reach the writer after all filtering. Default <strong>100</strong> (defensive ceiling — filters usually settle naturally at ~25–30). Drop to <strong>15</strong> if runs are silently dying mid-write on Workers Free; that's the cheapest way to halve the prompt-build CPU. Drop further if even that fails.
+          </div>
+        </div>
+        <div class="field mb-3.5">
+          <label>Max chars per source</label>
+          <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}" style="max-width: 140px;">
+          <div class="field-help mt-1.5" style="max-width: 64ch;">
+            How much of each source's body text is sent to the writer. Default <strong>4000</strong> (~1000 tokens/source — fine for Haiku 4.5's 200k context). Drop to <strong>2000</strong> if you switch back to Workers AI Llama (24k context), or if you need to shrink the writer payload.
+          </div>
+        </div>
+        <div style="margin: 20px 0; border-top: 1px solid #D6CFC4;"></div>
+        <div class="field mb-3.5">
+          <label>Max run seconds (kill switch)</label>
+          <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}" style="max-width: 140px;">
+          <div class="field-help mt-1.5" style="max-width: 64ch;">
+            Soft ceiling on a single run's wall-clock. When exceeded, the Durable Object alarm aborts in-flight fetches (Tavily, Anthropic), the heartbeat is marked errored, and a row is written to <em>Recent runs</em> with <code>watchdog reaped</code>. Default <strong>90 s</strong> — comfortably above today's slowest successful run (~50 s). The hard ceiling is the 15-minute DO alarm limit; this soft cap catches hung APIs early so a stuck call can't burn the daily Durable Objects compute quota (13,000 GB-s on Workers Free, ~115 GB-s per 15-min stuck run).
           </div>
         </div>
         <div class="row">
@@ -1434,6 +1514,18 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <div id="backfill-memory-result" class="field-help mt-1"></div>
         </div>
       </div>
+
+      <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
+
+      <div class="label-muted mb-2">Observability (Workers Logs)</div>
+      <div class="field-help" style="max-width: 72ch;">
+        Console output + uncaught errors from this worker are retained 7 days in the Cloudflare dashboard. Enabled via <code>[observability]</code> in <code>wrangler.toml</code>. Use this <strong>after</strong> a stalled run — <code>wrangler tail</code> only catches live logs going forward, so it can't replay a run that died before you started tailing. Filter by <code>runResearch[…]</code> in the dashboard to follow a specific run through each <code>markStep</code>. If a CPU-cap kill happens mid-run, the last <code>markStep</code> line tells you exactly which step you can't afford on the current settings.
+      </div>
+      <div class="row mt-3 items-baseline">
+        <div class="flex-1 text-sm">
+          <a href="https://dash.cloudflare.com/379ac7a184fcd14c809eb0aa2a0b2233/workers/services/view/watchomacho/production/observability/logs" target="_blank" rel="noopener" class="text-zee-primary underline">Open Workers Logs in Cloudflare dashboard ↗</a>
+        </div>
+      </div>
     </details>
 
     <script>
@@ -1495,7 +1587,13 @@ export async function renderAdminPanel(env: Env): Promise<string> {
             return;
           }
           btn.textContent = 'Saved ✓';
-          result.textContent = 'tavily_min_score = ' + (d.updated?.tavily_min_score ?? '?');
+          const u = d.updated || {};
+          const parts = [];
+          if (u.tavily_min_score !== undefined) parts.push('min_score=' + u.tavily_min_score);
+          if (u.max_final_sources !== undefined) parts.push('sources≤' + u.max_final_sources);
+          if (u.max_chars_per_source !== undefined) parts.push('chars≤' + u.max_chars_per_source);
+          if (u.max_run_seconds !== undefined) parts.push('max≤' + u.max_run_seconds + 's');
+          result.textContent = parts.join(' · ') || 'no change';
           setTimeout(() => location.reload(), 800);
         } catch (err) {
           btn.textContent = 'Error';
@@ -1746,6 +1844,14 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             ${metaParts.join(metaSep)}
           </div>`;
 
+        // Per-row gather funnel — populated from runs.gather_stats_json (new
+        // in migration v9). Empty for historical rows from before the
+        // migration; the helper returns "" so we render nothing extra.
+        const funnelHtml = renderGatherFunnel(r.gather_stats_json);
+        const funnelLine = funnelHtml
+          ? `<div class="field-help mt-1.5">${funnelHtml}</div>`
+          : "";
+
         if (isSuccess) {
           return `
             <li class="py-4 flex items-start gap-3.5">
@@ -1755,6 +1861,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
                   ${escapeHtml(r.report_title ?? "Untitled report")}
                 </a>
                 ${metaLine}
+                ${funnelLine}
               </div>
               <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline shrink-0" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
                 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
@@ -1778,6 +1885,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             <div class="flex-1 min-w-0">
               <div class="text-sm font-medium text-zee-text leading-snug">${titleLine}</div>
               ${metaLine}
+              ${funnelLine}
               <div class="field-help mt-2 text-[rgb(180,60,60)] break-words leading-relaxed" title="${escapeHtml(errFull)}">
                 ${escapeHtml(errShort)}
               </div>

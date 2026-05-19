@@ -9,6 +9,7 @@
 //              Accumulates on the Target's page over time as the cron
 //              re-runs the Skill on its configured cadence.
 
+import { DurableObject } from "cloudflare:workers";
 import {
   companiesHouseSearch,
   landRegSoldPrices,
@@ -37,6 +38,10 @@ export interface Env {
   // Fallback: ANTHROPIC_API_KEY — your own Anthropic console key, billed by Anthropic
   CF_AIG_TOKEN?: string;
   ANTHROPIC_API_KEY?: string;
+  // ─── Durable Object: longer-budget background work for Run Now ─────────────
+  // Manual runs schedule themselves into this DO's alarm handler (15-min wall
+  // budget) instead of the HTTP context's 30-second `waitUntil` cap.
+  RESEARCH_RUNNER: DurableObjectNamespace<ResearchRunner>;
 }
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -111,8 +116,10 @@ interface RunChatOutput {
   response: string;
 }
 
-async function runChat(env: Env, model: string, input: RunChatInput): Promise<RunChatOutput> {
+async function runChat(env: Env, model: string, input: RunChatInput, signal?: AbortSignal): Promise<RunChatOutput> {
   if (model.startsWith("@cf/")) {
+    // Workers AI binding doesn't accept an AbortSignal; we can't cancel
+    // it mid-call. In practice these calls are fast (<2s for embeddings).
     const res: any = await env.AI.run(model, {
       messages: input.messages,
       max_tokens: input.max_tokens,
@@ -121,7 +128,7 @@ async function runChat(env: Env, model: string, input: RunChatInput): Promise<Ru
   }
 
   if (model.startsWith("anthropic/")) {
-    return runAnthropicChat(env, model.slice("anthropic/".length), input);
+    return runAnthropicChat(env, model.slice("anthropic/".length), input, signal);
   }
 
   throw new Error(`Unknown chat model prefix: ${model}`);
@@ -131,6 +138,7 @@ async function runAnthropicChat(
   env: Env,
   anthropicModel: string,
   input: RunChatInput,
+  signal?: AbortSignal,
 ): Promise<RunChatOutput> {
   if (!env.AI_GATEWAY_ACCOUNT_ID || !env.AI_GATEWAY_NAME) {
     throw new Error(
@@ -177,6 +185,7 @@ async function runAnthropicChat(
       system: systemParts.length ? systemParts.join("\n\n") : undefined,
       messages: otherMsgs.map((m) => ({ role: m.role, content: m.content })),
     }),
+    signal,
   });
 
   if (!r.ok) {
@@ -860,7 +869,7 @@ interface SourceCitation {
 
 /** Step 1: ask the LLM what to search for. Returns an array of queries with
  *  {target} placeholders already expanded. */
-async function planResearch(env: Env, skill: Skill, target: Target, model: string): Promise<ResearchPlan> {
+async function planResearch(env: Env, skill: Skill, target: Target, model: string, signal?: AbortSignal): Promise<ResearchPlan> {
   const res = await runChat(env, model, {
     messages: [
       {
@@ -879,7 +888,7 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
       },
     ],
     max_tokens: 600,
-  });
+  }, signal);
   const raw = res.response;
   const m = raw.match(/\{[\s\S]*\}/);
   if (m) {
@@ -917,7 +926,20 @@ interface GatheredSource {
 // in Haiku 4.5's 200k context window. Note: if you switch the chat model
 // back to Workers AI Llama 3.3 70B (24k context), runs may fail at ~15+
 // sources — drop this to 2000 in that case (or add model-aware scaling).
-const MAX_CHARS_PER_SOURCE = 4000;
+// Default; can be overridden per-run via the `max_chars_per_source` setting
+// (Search tuning admin card).
+const DEFAULT_MAX_CHARS_PER_SOURCE = 4000;
+// Default soft ceiling on a single run's wall-clock. Hard ceiling is the
+// 15-min Durable Object alarm limit; this default catches runaway runs
+// (hung Tavily / hung Anthropic) within reasonable bounds. Editable via the
+// `max_run_seconds` setting in the Run guardrails admin card.
+const DEFAULT_MAX_RUN_SECONDS = 90;
+// Defensive ceiling on how many sources reach the writer. Larger source
+// count = larger prompt string to encode = more CPU. On Workers Free
+// (10ms CPU per invocation) the writer payload is the main CPU spend, so
+// this knob is the most direct lever for staying under the cap.
+// Default; can be overridden per-run via the `max_final_sources` setting.
+const DEFAULT_MAX_FINAL_SOURCES = 100;
 
 // A skill can declare ONE OR MORE tool calls. Each call records which tool
 // slug, which op, and the per-tool parameters parsed from the skill's
@@ -1050,6 +1072,7 @@ async function gatherSources(
   queries: string[],
   target: Target,
   calls: SkillToolCall[],
+  signal?: AbortSignal,
 ): Promise<{ sources: GatheredSource[]; stats: GatherStats }> {
   await checkBudget(env, "searches");
 
@@ -1067,7 +1090,7 @@ async function gatherSources(
     try {
       switch (c.tool) {
         case "tavily": {
-          const { sources, stats: tavilyStats } = await gatherTavily(env, queries, c);
+          const { sources, stats: tavilyStats } = await gatherTavily(env, queries, c, signal);
           stats.tavily_queries += tavilyStats.tavily_queries;
           stats.tavily_raw += tavilyStats.tavily_raw;
           stats.after_score_filter += tavilyStats.after_score_filter;
@@ -1096,21 +1119,44 @@ async function gatherSources(
     }
   }
 
-  // Defensive cap. Today's filters settle at ~30–60 sources; 100 is
-  // headroom for skills with many queries or unusually diverse news.
-  const SOURCES_CAP = 100;
-  const finalSources = out.slice(0, SOURCES_CAP).map((s) => ({
+  // Both caps are read from settings on every run so they can be tuned
+  // live from the Search tuning admin card without redeploying. The writer
+  // prompt size = finalSourcesCap × maxCharsPerSource — that string is the
+  // dominant CPU spend, so these two knobs are how you stay under the
+  // Workers Free 10ms CPU cap.
+  const [finalSourcesCap, maxCharsPerSource] = await Promise.all([
+    readIntSetting(env, "max_final_sources", DEFAULT_MAX_FINAL_SOURCES, 1, 200),
+    readIntSetting(env, "max_chars_per_source", DEFAULT_MAX_CHARS_PER_SOURCE, 200, 8000),
+  ]);
+  const finalSources = out.slice(0, finalSourcesCap).map((s) => ({
     ...s,
-    content: s.content.slice(0, MAX_CHARS_PER_SOURCE),
+    content: s.content.slice(0, maxCharsPerSource),
   }));
   stats.final_kept = finalSources.length;
   return { sources: finalSources, stats };
+}
+
+/** Reads a positive-integer setting, falling back to `def` if missing /
+ *  unparseable / out of [lo, hi]. Centralised so the admin POST validator
+ *  and the runtime reader can't drift on what counts as a valid value. */
+async function readIntSetting(
+  env: Env,
+  key: string,
+  def: number,
+  lo: number,
+  hi: number,
+): Promise<number> {
+  const raw = await getSetting(env, key, "");
+  if (!raw) return def;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= lo && n <= hi ? n : def;
 }
 
 async function gatherTavily(
   env: Env,
   queries: string[],
   c: SkillToolCall,
+  signal?: AbortSignal,
 ): Promise<{ sources: GatheredSource[]; stats: GatherStats }> {
   const emptyStats: GatherStats = {
     tavily_queries: 0,
@@ -1122,7 +1168,7 @@ async function gatherTavily(
   };
 
   if (c.op === "extract" && c.sources?.length) {
-    const extracted = await tavilyExtract(env.TAVILY_API_KEY, c.sources).catch(() => []);
+    const extracted = await tavilyExtract(env.TAVILY_API_KEY, c.sources, "basic", signal).catch(() => []);
     await bumpUsage(env, "searches", Math.max(1, Math.ceil(c.sources.length / 5)));
     return {
       sources: extracted.map((r) => ({ title: r.url, url: r.url, content: r.raw_content })),
@@ -1140,7 +1186,7 @@ async function gatherTavily(
     max_results: 20,
   };
   const results = await Promise.all(
-    queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts).catch(() => [])),
+    queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts, signal).catch(() => [])),
   );
   await bumpUsage(env, "searches", queries.length);
 
@@ -1436,6 +1482,7 @@ async function writeReport(
   webSources: GatheredSource[],
   recalled: RecalledReport[],
   model: string,
+  signal?: AbortSignal,
 ): Promise<{ title: string; body: string; citations: CitableSource[] }> {
   // Web sources first (fresh material the writer must rely on), archive
   // sources after (background/continuity). One unified numbering scheme.
@@ -1503,7 +1550,7 @@ Markdown formatting rules (follow strictly — the rendering engine depends on t
       { role: "user", content: userMsg },
     ],
     max_tokens: 2200,
-  });
+  }, signal);
 
   const body = res.response.trim();
   if (!body || body.length < 80) throw new Error("LLM returned empty or too-short report");
@@ -1552,12 +1599,78 @@ async function markStep(
   );
 }
 
-/** The full research loop. Plan → gather → recall → write → persist. */
+/** Watchdog: if the live heartbeat has been `in_flight` past max_run_seconds
+ *  plus a grace window, the DO alarm must have been killed before its catch
+ *  block could record the failure. Mark the run as errored so the Activity
+ *  card and runs table reflect reality, and rescue the heartbeat so the
+ *  Maintenance panel doesn't show a phantom "stalled" forever.
+ *
+ *  Called from cronTick once per hour. Idempotent: if heartbeat is already
+ *  resolved or doesn't exist, this is a no-op. We compare target_id by slug
+ *  because the heartbeat only stores slug, not id. */
+async function reapStalledRun(env: Env, now: number): Promise<void> {
+  const raw = await getSetting(env, "last_run_attempt", "");
+  if (!raw) return;
+  let attempt: LastRunAttempt;
+  try {
+    attempt = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (attempt.outcome !== "in_flight" || attempt.completed_at !== null) return;
+
+  const maxRunSeconds = await readIntSetting(env, "max_run_seconds", DEFAULT_MAX_RUN_SECONDS, 5, 600);
+  // Grace: alarm could legitimately use the full budget. Add 30s before
+  // declaring the heartbeat zombie, so we don't race a still-running alarm.
+  const ageMs = now - attempt.started_at;
+  const reapAfterMs = (maxRunSeconds + 30) * 1000;
+  if (ageMs < reapAfterMs) return;
+
+  console.warn(`reapStalledRun: heartbeat ${attempt.run_id} stalled at ${attempt.last_step} for ${Math.floor(ageMs/1000)}s — reaping`);
+
+  // Resolve target_id from slug so we can record a proper runs row. If the
+  // target has since been deleted, skip the runs row but still clear the
+  // heartbeat so the admin panel isn't stuck on a phantom.
+  const target = await getTargetBySlug(env, attempt.target_slug);
+  const errorMsg = `${attempt.last_step}: watchdog reaped after ${Math.floor(ageMs/1000)}s (alarm likely killed by runtime before catch could run)`;
+
+  if (target) {
+    try {
+      // skill_id may be unknown if the target's skill was reassigned mid-run.
+      // We use the current primary_skill_id as best-effort; the runs.error
+      // text carries the actual diagnosis.
+      const skillId = target.primary_skill_id ?? "";
+      const gatherStatsJson = attempt.gather_stats ? JSON.stringify(attempt.gather_stats) : null;
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO runs (id, target_id, skill_id, triggered_by, status, error, duration_ms, gather_stats_json, created_at)
+         VALUES (?, ?, ?, ?, 'error', ?, ?, ?, ?)`,
+      )
+        .bind(attempt.run_id, target.id, skillId, attempt.triggered_by, errorMsg, ageMs, gatherStatsJson, now)
+        .run();
+    } catch (e) {
+      console.error("reapStalledRun: failed to write error runs row", e);
+    }
+  }
+
+  attempt.completed_at = now;
+  attempt.outcome = "error";
+  attempt.error = errorMsg;
+  await setSetting(env, "last_run_attempt", JSON.stringify(attempt)).catch((e) =>
+    console.error("reapStalledRun: failed to update heartbeat", e),
+  );
+}
+
+/** The full research loop. Plan → gather → recall → write → persist.
+ *  `signal` (optional) is forwarded to Tavily/Anthropic fetches so the
+ *  ResearchRunner DO alarm can enforce a max_run_seconds ceiling — when the
+ *  signal fires, in-flight fetches throw `AbortError` and the catch block
+ *  records the run as errored with the originating step tagged. */
 export async function runResearch(
   env: Env,
   target: Target,
   skill: Skill,
   triggeredBy: "cron" | "manual",
+  signal?: AbortSignal,
 ): Promise<Report> {
   // Generate runId BEFORE the try block so the catch can always write a row,
   // even if pre-flight checks (budget / model resolution) throw.
@@ -1592,11 +1705,11 @@ export async function runResearch(
     );
     await markStep(env, attempt, "plan");
     const queries = needsQueries
-      ? (await planResearch(env, skill, target, chatModel)).queries
+      ? (await planResearch(env, skill, target, chatModel, signal)).queries
       : [];
 
     await markStep(env, attempt, "gather");
-    const { sources, stats: gatherStats } = await gatherSources(env, queries, target, calls);
+    const { sources, stats: gatherStats } = await gatherSources(env, queries, target, calls, signal);
     attempt.gather_stats = gatherStats;
 
     await markStep(env, attempt, "recall");
@@ -1610,6 +1723,7 @@ export async function runResearch(
       sources,
       recalled,
       chatModel,
+      signal,
     );
 
     await markStep(env, attempt, "persist");
@@ -1633,8 +1747,14 @@ export async function runResearch(
     // report footer can group them and link archive entries to /report/:id.
     // Schema: [{ title, url, kind: "web" | "archive" }]. Old rows without
     // `kind` are treated as web in the renderer (backwards-compatible).
+    // We store ALL citations the writer received — not a truncated subset —
+    // so every [N] marker in the body resolves to a real URL in the footer
+    // (the previous `.slice(0, 20)` left [21]..[N] as dead links whenever
+    // max_final_sources was set above 20). Row size is fine: at the new
+    // max_final_sources ceiling of 200, a citation entry is ~200 bytes →
+    // ~40KB JSON, well under D1's per-row capacity.
     const sourcesJson = JSON.stringify(
-      citations.map((c) => ({ title: c.title, url: c.url, kind: c.kind })).slice(0, 20),
+      citations.map((c) => ({ title: c.title, url: c.url, kind: c.kind })),
     );
 
     await env.DB.prepare(
@@ -1671,11 +1791,17 @@ export async function runResearch(
       .bind(created, created + target.cadence_hours * 3600 * 1000, created, target.id)
       .run();
 
+    // Persist the gather funnel onto the run row so historical Activity
+    // entries can show the same breakdown the heartbeat does for the
+    // most-recent run. Empty when no gather happened (skill with no
+    // queries-needing tools — won't be the common case).
+    const gatherStatsJson = attempt.gather_stats ? JSON.stringify(attempt.gather_stats) : null;
+
     await env.DB.prepare(
-      `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, report_id, duration_ms, created_at)
-       VALUES (?, ?, ?, ?, 'success', ?, ?, ?)`,
+      `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, report_id, duration_ms, gather_stats_json, created_at)
+       VALUES (?, ?, ?, ?, 'success', ?, ?, ?, ?)`,
     )
-      .bind(runId, target.id, skill.id, triggeredBy, reportId, Date.now() - t0, Date.now())
+      .bind(runId, target.id, skill.id, triggeredBy, reportId, Date.now() - t0, gatherStatsJson, Date.now())
       .run();
 
     await bumpUsage(env, "reports");
@@ -1698,10 +1824,15 @@ export async function runResearch(
     attempt.error = errMessage;
     await markStep(env, attempt, failedStep);
 
+    // Persist gather funnel onto the error row too, so a "failed at write"
+    // run still tells you which sources made it through gather (often the
+    // funnel is the smoking gun for *why* write blew up).
+    const gatherStatsJson = attempt.gather_stats ? JSON.stringify(attempt.gather_stats) : null;
+
     try {
       await env.DB.prepare(
-        `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, error, duration_ms, created_at)
-         VALUES (?, ?, ?, ?, 'error', ?, ?, ?)`,
+        `INSERT INTO runs (id, target_id, skill_id, triggered_by, status, error, duration_ms, gather_stats_json, created_at)
+         VALUES (?, ?, ?, ?, 'error', ?, ?, ?, ?)`,
       )
         .bind(
           runId,
@@ -1710,6 +1841,7 @@ export async function runResearch(
           triggeredBy,
           errMessage,
           Date.now() - t0,
+          gatherStatsJson,
           Date.now(),
         )
         .run();
@@ -1732,6 +1864,17 @@ export async function runResearch(
 export async function cronTick(env: Env): Promise<{ processed: number; skipped: number; errors: number }> {
   const now = Date.now();
   const maxPerTick = parseInt(await getSetting(env, "cron_max_per_tick", "2"), 10) || 2;
+
+  // Watchdog: clear any `in_flight` heartbeat that's been stalled past the
+  // configured ceiling + a small grace window. Catches the case where the
+  // Durable Object alarm was killed by the runtime before its catch block
+  // could write a runs row — without this, the heartbeat would say
+  // "stalled at write" forever and the Activity card would mislead.
+  try {
+    await reapStalledRun(env, now);
+  } catch (e) {
+    console.error("cronTick: watchdog reapStalledRun failed", e);
+  }
 
   const due = await env.DB.prepare(
     `SELECT * FROM targets
@@ -1783,4 +1926,110 @@ export async function cronTick(env: Env): Promise<{ processed: number; skipped: 
   }
 
   return { processed, skipped, errors };
+}
+
+// ─── ResearchRunner Durable Object ────────────────────────────────────────
+//
+// Per-target DO that wraps `runResearch` in an alarm handler so manual
+// "Run Now" gets a 15-minute wall-clock budget instead of the 30-second
+// `ctx.waitUntil()` cap on HTTP requests.
+//
+// Why it exists:
+//   The HTTP handler returns a redirect immediately. Any code we attach to
+//   `ctx.waitUntil` only gets 30 more seconds of wall-clock before Cloudflare
+//   silently kills the isolate (no exception, no error row written). For
+//   skills whose pipeline takes >30s end-to-end (slow Tavily gather or
+//   bloated writer), Run Now stalls every time.
+//
+// What it does:
+//   Route calls `stub.scheduleManualRun(targetSlug)` → DO stores the slug in
+//   its own SQLite + sets an alarm for now+1s → returns immediately. The
+//   alarm fires inside the scheduled-handler context, which has the
+//   15-minute budget. Same `runResearch()` runs, persistence into D1/R2/
+//   Vectorize is unchanged.
+//
+// Cost: per-run compute is ~70s × 0.128 GB = ~9 GB-seconds. The Workers
+// Free DO quota is 13,000 GB-seconds/day, so we can do ~1,400 manual runs
+// per day before hitting the cap (we average ~10/day).
+//
+// Naming: `idFromName(targetSlug)` so each target gets exactly one DO
+// instance — natural serialisation for back-to-back Run Now clicks on the
+// same target.
+//
+// On Workers Free, this DO MUST use the SQLite backend (declared in
+// wrangler.toml via `new_sqlite_classes`). Storage is tiny (one row per
+// pending job, deleted on completion).
+export class ResearchRunner extends DurableObject<Env> {
+  /** Called from the HTTP route. Records the pending job and sets a 1s
+   *  alarm; returns immediately so the route can redirect the user. */
+  async scheduleManualRun(targetSlug: string): Promise<void> {
+    await this.ctx.storage.put("job", {
+      targetSlug,
+      triggeredBy: "manual" as const,
+      scheduledAt: Date.now(),
+    });
+    // Fire effectively now. The 1s offset lets the DO settle before alarm.
+    await this.ctx.storage.setAlarm(Date.now() + 1000);
+  }
+
+  /** Cloudflare invokes this when our setAlarm time arrives. Runs in the
+   *  scheduled-handler context (15-min wall budget). We enforce a tighter
+   *  `max_run_seconds` ceiling via an AbortController so a hung Tavily /
+   *  Anthropic fetch can't burn the full 15 minutes (~115 GB-seconds). */
+  async alarm(): Promise<void> {
+    const job = await this.ctx.storage.get<{
+      targetSlug: string;
+      triggeredBy: "manual";
+      scheduledAt: number;
+    }>("job");
+    if (!job) {
+      console.warn("ResearchRunner alarm: no pending job; nothing to do");
+      return;
+    }
+
+    // Read the configurable per-run ceiling (Run guardrails admin card).
+    // 30–600s window: anything outside falls back to DEFAULT_MAX_RUN_SECONDS.
+    const maxRunSeconds = await readIntSetting(
+      this.env,
+      "max_run_seconds",
+      DEFAULT_MAX_RUN_SECONDS,
+      5,
+      600,
+    );
+
+    // AbortController feeds the signal down to every fetch (Tavily,
+    // Anthropic). When the timer fires, in-flight fetches throw
+    // `AbortError`; runResearch's catch records "<step>: AbortError" into
+    // the runs table and surfaces it on the Activity card.
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      console.warn(`ResearchRunner alarm: max_run_seconds (${maxRunSeconds}s) exceeded for ${job.targetSlug}, aborting`);
+      controller.abort(new Error(`max_run_seconds (${maxRunSeconds}s) exceeded`));
+    }, maxRunSeconds * 1000);
+
+    try {
+      const target = await getTargetBySlug(this.env, job.targetSlug);
+      if (!target) {
+        console.error(`ResearchRunner alarm: target not found: ${job.targetSlug}`);
+        return;
+      }
+      if (!target.primary_skill_id) {
+        console.error(`ResearchRunner alarm: target has no skill: ${job.targetSlug}`);
+        return;
+      }
+      const skill = await getSkillById(this.env, target.primary_skill_id);
+      if (!skill) {
+        console.error(`ResearchRunner alarm: skill not found for target: ${job.targetSlug}`);
+        return;
+      }
+      console.log(`ResearchRunner alarm: running ${job.targetSlug} (${job.triggeredBy}, max ${maxRunSeconds}s)`);
+      await runResearch(this.env, target, skill, job.triggeredBy, controller.signal);
+    } catch (e) {
+      console.error(`ResearchRunner alarm failed:`, e);
+    } finally {
+      clearTimeout(timer);
+      // Always clear the pending job so the DO can hibernate cleanly.
+      await this.ctx.storage.delete("job");
+    }
+  }
 }
