@@ -1137,12 +1137,12 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun }: 
     : "text-[rgb(180,60,60)]";
   const cronLine = cronAgeMin == null
     ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
-    : `<span class="${cronColor}">${cronAgeMin} min ago</span>`;
+    : `<span class="${cronColor}">${timeAgo(lastCronRun)}</span>`;
 
   let attemptLine = `<span class="text-zee-muted">no attempts recorded yet</span>`;
   if (lastRunAttempt) {
     const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
-    const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : `${Math.floor(startedAgo / 60)} min ago`;
+    const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : timeAgo(lastRunAttempt.started_at);
     if (lastRunAttempt.outcome === "in_flight") {
       const stalled = startedAgo > 180;
       const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
@@ -1157,13 +1157,11 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun }: 
 
   let completedLine = `<span class="text-zee-muted">no completed runs yet</span>`;
   if (lastCompletedRun) {
-    const ago = Math.floor((now - lastCompletedRun.created_at) / 60_000);
-    const agoLabel = ago < 1 ? "just now" : `${ago} min ago`;
     const dur = lastCompletedRun.duration_ms ? fmtDuration(lastCompletedRun.duration_ms) : "";
     const status = lastCompletedRun.status === "success"
       ? `<span class="text-zee-primary">success</span>`
       : `<span class="text-[rgb(180,60,60)]">error: ${escapeHtml((lastCompletedRun.error ?? "unknown").slice(0, 60))}</span>`;
-    completedLine = `${status} · <span class="label-muted">${agoLabel}${dur ? ` · ${dur}` : ""}</span>`;
+    completedLine = `${status} · <span class="label-muted">${timeAgo(lastCompletedRun.created_at)}${dur ? ` · ${dur}` : ""}</span>`;
   }
 
   let gatherLine = `<span class="text-zee-muted">no gather data yet</span>`;
@@ -1181,7 +1179,7 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun }: 
       <summary>
         <div class="h3-row">
           <h3>System heartbeat</h3>
-          <span class="label-muted">${cronAgeMin == null ? "no cron yet" : `cron ${cronAgeMin}m ago`}<span class="chev">▾</span></span>
+          <span class="label-muted">${cronAgeMin == null ? "no cron yet" : `cron ${timeAgo(lastCronRun)}`}<span class="chev">▾</span></span>
         </div>
       </summary>
       <div class="field-help mt-3" style="max-width: 70ch;">
@@ -1326,6 +1324,18 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 
     ${renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun })}
 
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Recent runs</h3>
+          <span class="label-muted">${(runRows.results ?? []).length} shown<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      ${runsHtml
+        ? `<table class="runs"><thead><tr><th>When</th><th>Target</th><th>Trigger</th><th>Status</th><th>Report</th><th>Duration</th></tr></thead><tbody>${runsHtml}</tbody></table>`
+        : `<div class="empty">No runs yet.</div>`}
+    </details>
+
     <details class="card">
       <summary>
         <div class="h3-row">
@@ -1377,18 +1387,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <span id="cron-result" class="text-xs text-zee-muted"></span>
         </div>
       </form>
-    </details>
-
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Recent runs</h3>
-          <span class="label-muted">${(runRows.results ?? []).length} shown<span class="chev">▾</span></span>
-        </div>
-      </summary>
-      ${runsHtml
-        ? `<table class="runs"><thead><tr><th>When</th><th>Target</th><th>Trigger</th><th>Status</th><th>Report</th><th>Duration</th></tr></thead><tbody>${runsHtml}</tbody></table>`
-        : `<div class="empty">No runs yet.</div>`}
     </details>
 
     <details class="card">
