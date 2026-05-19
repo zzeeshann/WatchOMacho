@@ -955,12 +955,16 @@ function renderGatherFunnel(json: string | null | undefined): string {
       }
       return "";
     }
-    return `Tavily <strong class="font-medium">${g.tavily_queries}q</strong>`
-      + ` · <span class="tt">${g.tavily_raw}</span> raw`
-      + ` → <span class="tt">${g.after_score_filter}</span> (score)`
-      + ` → <span class="tt">${g.after_url_dedupe}</span> (URL)`
-      + ` → <span class="tt">${g.after_title_dedupe}</span> (story)`
-      + ` → <strong class="font-medium tt">${g.final_kept}</strong> final`;
+    // Each chunk wrapped in its own span so neighboring text + arrows keep
+    // visible whitespace even when the parent flex/wrap rules kick in.
+    const sep = `<span class="mx-1.5 text-zee-border" aria-hidden="true">·</span>`;
+    const arrow = `<span class="mx-1.5 text-zee-border" aria-hidden="true">→</span>`;
+    return `<span>Tavily <strong class="font-medium text-zee-text">${g.tavily_queries}q</strong></span>${sep}`
+      + `<span class="tt">${g.tavily_raw} raw</span>${arrow}`
+      + `<span class="tt">${g.after_score_filter} (score)</span>${arrow}`
+      + `<span class="tt">${g.after_url_dedupe} (URL)</span>${arrow}`
+      + `<span class="tt">${g.after_title_dedupe} (story)</span>${arrow}`
+      + `<strong class="font-medium tt text-zee-text">${g.final_kept} final</strong>`;
   } catch {
     return "";
   }
@@ -1099,8 +1103,10 @@ export function renderAdminLogin(error?: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Admin: system heartbeat (renders the four-row status panel — promoted out of
-// the Maintenance card so it's the first thing you see on /admin).
+// Admin: system heartbeat — 24h digest + recent run mini-list. Replaces the
+// older "last attempt + last completed" two-row view (those duplicated each
+// other anyway). The in-flight banner is rendered separately at the top so
+// you can see active work even before it finishes.
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface HeartbeatInput {
@@ -1114,25 +1120,27 @@ interface HeartbeatInput {
     completed_at: number | null;
     outcome: "in_flight" | "success" | "error";
     error?: string;
-    gather_stats?: {
-      tavily_queries: number;
-      tavily_raw: number;
-      after_score_filter: number;
-      after_url_dedupe: number;
-      after_title_dedupe: number;
-      final_kept: number;
-    };
   } | null;
-  lastCompletedRun: { status: string; error: string | null; duration_ms: number | null; created_at: number; target_slug: string | null; target_name: string | null } | null;
-  /** Slugs of targets that currently exist. The `last_run_attempt` setting
-   *  in D1 persists across target deletion, so a deleted target's slug can
-   *  linger in the heartbeat forever. Used to render "(target gone)" rather
-   *  than a dead link. */
+  last24hStats: { total: number; ok: number; err: number; avg_ms: number | null } | null;
+  recentRuns: Array<{
+    id: string;
+    status: string;
+    error: string | null;
+    duration_ms: number | null;
+    created_at: number;
+    report_id: string | null;
+    target_slug: string | null;
+    target_name: string | null;
+  }>;
+  /** Slugs of targets that currently exist. Deleted-target slugs persist in
+   *  last_run_attempt; we render those as "(deleted)" rather than dead links. */
   knownTargetSlugs: Set<string>;
 }
 
-function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, knownTargetSlugs }: HeartbeatInput): string {
+function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recentRuns, knownTargetSlugs }: HeartbeatInput): string {
   const now = Date.now();
+
+  // ─── Cron status (still the first thing — tells you the scheduler's alive) ─
   const cronAgeMin = lastCronRun > 0 ? Math.floor((now - lastCronRun) / 60_000) : null;
   const cronColor = cronAgeMin == null
     ? "text-zee-muted"
@@ -1141,55 +1149,71 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, kn
     : "text-[rgb(180,60,60)]";
   const cronLine = cronAgeMin == null
     ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
-    : `<span class="${cronColor}">${timeAgo(lastCronRun)}</span>`;
+    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next within the hour</span>`;
 
-  let attemptLine = `<span class="text-zee-muted">no attempts recorded yet</span>`;
-  if (lastRunAttempt) {
+  // ─── In-flight banner (only when a run is currently running). The runs
+  //     table only has completed rows, so this is the only signal that work
+  //     is happening RIGHT NOW. ────────────────────────────────────────────
+  let inFlightBanner = "";
+  if (lastRunAttempt && lastRunAttempt.outcome === "in_flight") {
     const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
     const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : timeAgo(lastRunAttempt.started_at);
-    // Defensive: a deleted target leaves its slug in last_run_attempt forever
-    // until something else runs. Render plain text + "(deleted)" instead of
-    // a dead link.
     const slug = lastRunAttempt.target_slug;
     const targetExists = knownTargetSlugs.has(slug);
+    const stalled = startedAgo > 180;
+    const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
+    const label = stalled ? "stalled" : "in flight";
     const targetRef = targetExists
-      ? `<a href="/admin/targets/${escapeHtml(slug)}" class="text-zee-primary">${escapeHtml(slug)}</a>`
+      ? `<a href="/admin/targets/${escapeHtml(slug)}" class="text-zee-primary hover:underline">${escapeHtml(slug)}</a>`
       : `<span class="text-zee-muted">${escapeHtml(slug)} <em>(deleted)</em></span>`;
-    if (lastRunAttempt.outcome === "in_flight") {
-      const stalled = startedAgo > 180;
-      const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
-      const label = stalled ? "stalled" : "in flight";
-      attemptLine = `<span class="${tone}">${label}</span> at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> · ${targetRef} · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
-    } else if (lastRunAttempt.outcome === "success") {
-      attemptLine = `<span class="text-zee-primary">success</span> · ${targetRef} · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
-    } else {
-      attemptLine = `<span class="text-[rgb(180,60,60)]">failed @ ${escapeHtml(lastRunAttempt.last_step)}</span> · ${targetRef} · <span class="label-muted">${startedLabel}</span>`;
-    }
+    inFlightBanner = `
+      <div class="mt-3 rounded border border-zee-primary/40 bg-zee-primary/5 px-3 py-2 text-sm">
+        <span class="${tone} font-medium">${label}</span>
+        at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> ·
+        ${targetRef} ·
+        <span class="text-zee-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>
+      </div>`;
   }
 
-  let completedLine = `<span class="text-zee-muted">no completed runs yet</span>`;
-  if (lastCompletedRun) {
-    const dur = lastCompletedRun.duration_ms ? fmtDuration(lastCompletedRun.duration_ms) : "";
-    const status = lastCompletedRun.status === "success"
-      ? `<span class="text-zee-primary">success</span>`
-      : `<span class="text-[rgb(180,60,60)]">error: ${escapeHtml((lastCompletedRun.error ?? "unknown").slice(0, 60))}</span>`;
-    // Make the target a clickable link so "click takes me to the page".
-    const slug = lastCompletedRun.target_slug;
-    const targetRef = slug && knownTargetSlugs.has(slug)
-      ? `<a href="/admin/targets/${escapeHtml(slug)}" class="text-zee-primary">${escapeHtml(lastCompletedRun.target_name ?? slug)}</a> · `
-      : (slug ? `<span class="text-zee-muted">${escapeHtml(lastCompletedRun.target_name ?? slug)} <em>(deleted)</em></span> · ` : "");
-    completedLine = `${status} · ${targetRef}<span class="label-muted">${timeAgo(lastCompletedRun.created_at)}${dur ? ` · ${dur}` : ""}</span>`;
-  }
+  // ─── Last 24h digest ──────────────────────────────────────────────────────
+  const s = last24hStats ?? { total: 0, ok: 0, err: 0, avg_ms: null };
+  const avg = s.avg_ms ? fmtDuration(Math.round(s.avg_ms)) : null;
+  const digestBits: string[] = [
+    `<strong class="font-medium text-zee-text">${s.total}</strong> ${s.total === 1 ? "run" : "runs"}`,
+  ];
+  if (s.ok > 0) digestBits.push(`<span class="text-zee-primary"><strong class="font-medium">${s.ok}</strong> ✓</span>`);
+  if (s.err > 0) digestBits.push(`<span class="text-[rgb(180,60,60)]"><strong class="font-medium">${s.err}</strong> ✕</span>`);
+  if (avg) digestBits.push(`<span class="text-zee-muted">avg ${avg}</span>`);
+  const digestLine = digestBits.join(`<span class="mx-2.5 text-zee-border" aria-hidden="true">·</span>`);
 
-  let gatherLine = `<span class="text-zee-muted">no gather data yet</span>`;
-  if (lastRunAttempt?.gather_stats) {
-    const g = lastRunAttempt.gather_stats;
-    if (g.tavily_queries > 0) {
-      gatherLine = `Tavily <strong class="font-medium">${g.tavily_queries}q</strong> · <span class="tt">${g.tavily_raw}</span> raw → <span class="tt">${g.after_score_filter}</span> (score) → <span class="tt">${g.after_url_dedupe}</span> (URL) → <span class="tt">${g.after_title_dedupe}</span> (story) → <strong class="font-medium tt">${g.final_kept}</strong> final`;
-    } else if (g.final_kept > 0) {
-      gatherLine = `<span class="text-zee-muted">${g.final_kept} sources gathered (no Tavily this run)</span>`;
-    }
-  }
+  // ─── Recent runs mini-list (last 6). Clickable rows → target page. ───────
+  const recentList = recentRuns.length === 0
+    ? `<div class="text-sm text-zee-muted">No runs yet.</div>`
+    : `<ul class="list-none mt-2 divide-y divide-zee-border">${recentRuns.map((r) => {
+        const slug = r.target_slug;
+        const targetExists = !!slug && knownTargetSlugs.has(slug);
+        const targetLabel = r.target_name ?? slug ?? "(deleted target)";
+        const targetRef = targetExists
+          ? `<a href="/admin/targets/${escapeHtml(slug!)}" class="text-zee-text font-medium hover:text-zee-primary transition-colors">${escapeHtml(targetLabel)}</a>`
+          : `<span class="text-zee-muted italic">${escapeHtml(targetLabel)} (deleted)</span>`;
+        const dot = r.status === "success"
+          ? `<span class="text-zee-primary">✓</span>`
+          : `<span class="text-[rgb(180,60,60)]">✕</span>`;
+        const dur = r.duration_ms ? fmtDuration(r.duration_ms) : "";
+        const errSnippet = r.status !== "success" && r.error
+          ? ` · <span class="text-[rgb(180,60,60)]">${escapeHtml(r.error.replace(/^(init|plan|gather|recall|write|persist|done):\s*/, "").slice(0, 50))}</span>`
+          : "";
+        return `
+          <li class="py-2.5 flex items-center gap-3">
+            ${dot}
+            <div class="flex-1 min-w-0">
+              ${targetRef}
+              <span class="text-zee-muted text-sm ml-2">
+                <span class="tt">${timeAgo(r.created_at)}</span>${dur ? ` <span class="mx-1.5 text-zee-border">·</span> <span class="tt">${dur}</span>` : ""}${errSnippet}
+              </span>
+            </div>
+          </li>`;
+      }).join("")}</ul>`;
 
   return `
     <details class="card" open>
@@ -1200,18 +1224,17 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, kn
         </div>
       </summary>
       <div class="field-help mt-3" style="max-width: 70ch;">
-        Live status of the agent. <em>Cron last ran</em> should be under an hour. <em>Last attempt</em> is the most recent Run-now or cron-triggered run (overwritten on each new run, even if the run later crashes — a click always leaves a fingerprint). <em>Last completed run</em> is the most recent row in the runs table that finished.
+        Cron health, a digest of the last 24 hours, and the most recent runs across all targets. Click any row to jump to that target's activity.
       </div>
-      <div class="mt-4 grid gap-y-3" style="grid-template-columns: 170px 1fr;">
-        <div class="label-muted">Cron last ran</div>
-        <div>${cronLine}</div>
-        <div class="label-muted">Last attempt</div>
-        <div>${attemptLine}</div>
-        <div class="label-muted">Last completed run</div>
-        <div>${completedLine}</div>
-        <div class="label-muted">Last run gather</div>
-        <div class="text-sm">${gatherLine}</div>
+      ${inFlightBanner}
+      <div class="mt-4 grid gap-y-3" style="grid-template-columns: 140px 1fr;">
+        <div class="label-muted">Cron</div>
+        <div class="text-sm">${cronLine}</div>
+        <div class="label-muted">Last 24h</div>
+        <div class="text-sm">${digestLine}</div>
       </div>
+      <div class="mt-4 label-muted">Recent runs</div>
+      ${recentList}
     </details>
   `;
 }
@@ -1221,7 +1244,8 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, kn
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminPanel(env: Env): Promise<string> {
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, lastCompletedRun, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
+  const cutoff24h = Date.now() - 24 * 3600 * 1000;
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1239,12 +1263,20 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     getSetting(env, "last_cron_run", "0"),
     getSetting(env, "last_run_attempt", ""),
     env.DB.prepare(
-      `SELECT runs.status, runs.error, runs.duration_ms, runs.created_at,
+      `SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS ok,
+          SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS err,
+          AVG(duration_ms) AS avg_ms
+        FROM runs WHERE created_at > ?`,
+    ).bind(cutoff24h).first<{ total: number; ok: number; err: number; avg_ms: number | null }>(),
+    env.DB.prepare(
+      `SELECT runs.id, runs.status, runs.error, runs.duration_ms, runs.created_at, runs.report_id,
               targets.slug AS target_slug, targets.name AS target_name
          FROM runs
          LEFT JOIN targets ON targets.id = runs.target_id
-         ORDER BY runs.created_at DESC LIMIT 1`,
-    ).first<{ status: string; error: string | null; duration_ms: number | null; created_at: number; target_slug: string | null; target_name: string | null }>(),
+         ORDER BY runs.created_at DESC LIMIT 6`,
+    ).all<{ id: string; status: string; error: string | null; duration_ms: number | null; created_at: number; report_id: string | null; target_slug: string | null; target_name: string | null }>(),
     getSetting(env, "max_chars_per_source", "4000"),
     getSetting(env, "max_run_seconds", "90"),
   ]);
@@ -1284,7 +1316,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       </p>
     </section>
 
-    ${renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, knownTargetSlugs: new Set(targets.map((t) => t.slug)) })}
+    ${renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recentRuns: recentRuns.results ?? [], knownTargetSlugs: new Set(targets.map((t) => t.slug)) })}
 
     <details class="card">
       <summary>
@@ -1871,19 +1903,17 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     : `<ul class="list-none">${(activityRows.results ?? []).map((r: any) => {
         const isSuccess = r.status === "success" && r.report_id;
 
-        // ─── Line 1 — the run: when, how, how long, link to the report ───
+        // ─── Line 1 — when/how: time, trigger, duration. The title above is
+        //     already the report link, so no redundant "view report →" here.
         const lineRunParts: string[] = [
           `<span class="tt">${escapeHtml(timeAgo(r.created_at))}</span>`,
           escapeHtml(r.triggered_by),
         ];
         if (r.duration_ms) lineRunParts.push(`<span class="tt">${escapeHtml(fmtDuration(r.duration_ms))}</span>`);
-        if (isSuccess) {
-          lineRunParts.push(
-            `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary hover:underline">view report →</a>`,
-          );
-        }
 
-        // ─── Line 2 — the report: words, model, sources, skill ───
+        // ─── Line 2 — what was produced: words, model, sources. Skill name
+        //     is in the title ("World News — World news briefing") already;
+        //     no need to repeat it here.
         const lineReportParts: string[] = [];
         if (isSuccess && r.report_word_count != null) {
           lineReportParts.push(`<strong class="font-medium text-zee-text">${r.report_word_count.toLocaleString()}</strong> words`);
@@ -1904,21 +1934,16 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             }
           } catch { /* malformed JSON — skip */ }
         }
-        const skillLabel = r.skill_name
-          ? `<a href="/skill/${escapeHtml(r.skill_slug)}" class="text-zee-primary hover:underline">${escapeHtml(r.skill_name)}</a>`
-          : `<span class="text-zee-muted italic">(deleted skill)</span>`;
-        lineReportParts.push(`via ${skillLabel}`);
 
         // ─── Line 3 — gather funnel (only when populated) ───
         const funnelHtml = renderGatherFunnel(r.gather_stats_json);
 
-        // text-sm + text-zee-muted: bigger and clearer than the old
-        // .field-help (12px / faded). Generous mt-2 between sub-lines so
-        // groups don't sandwich into a wall of middots.
+        // No flex on the sub-lines — natural inline-text flow keeps the
+        // whitespace around middots/arrows visible (flex can collapse it).
         const metaBlock = `
-          <div class="mt-2 text-sm text-zee-muted flex flex-wrap items-center">${lineRunParts.join(metaSep)}</div>
-          ${lineReportParts.length ? `<div class="mt-1.5 text-sm text-zee-muted flex flex-wrap items-center">${lineReportParts.join(metaSep)}</div>` : ""}
-          ${funnelHtml ? `<div class="mt-1.5 text-sm text-zee-muted flex flex-wrap items-center">${funnelHtml}</div>` : ""}
+          <div class="mt-2 text-sm text-zee-muted">${lineRunParts.join(metaSep)}</div>
+          ${lineReportParts.length ? `<div class="mt-1.5 text-sm text-zee-muted">${lineReportParts.join(metaSep)}</div>` : ""}
+          ${funnelHtml ? `<div class="mt-1.5 text-sm text-zee-muted">${funnelHtml}</div>` : ""}
         `;
 
         if (isSuccess) {
