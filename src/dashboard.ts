@@ -770,17 +770,16 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
     `);
   }
   const reports = await listReportsForTarget(env, target.id, 30);
-  const skill = target.primary_skill_id
-    ? await env.DB.prepare("SELECT * FROM skills WHERE id = ?").bind(target.primary_skill_id).first<Skill>()
-    : null;
 
+  // Public target page meta is intentionally minimal: only what a reader of
+  // the reports cares about. Internal scheduling (cadence, next run, status,
+  // attached skill slug) is admin information and stays on /admin/targets/:slug.
   const meta = `
     <div class="flex flex-wrap items-center gap-3 mt-3">
-      <span class="badge badge-${target.status}">${target.status}</span>
       ${target.kind ? `<span class="label-muted">${escapeHtml(target.kind)}</span>` : ""}
-      ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" class="text-zee-primary">${escapeHtml(skill.name)}</a></span>` : `<span class="label-muted">no skill attached</span>`}
-      <span class="label-muted">every ${target.cadence_hours}h</span>
-      ${target.next_run_at ? `<span class="label-muted">next ${escapeHtml(timeUntil(target.next_run_at))}</span>` : ""}
+      ${reports[0]
+        ? `<span class="label-muted">last update ${escapeHtml(timeAgo(reports[0].created_at))}</span>`
+        : ""}
     </div>
   `;
 
@@ -819,7 +818,7 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
     body += `</section>`;
   }
 
-  return shell(`${target.name} — WatchOMacho`, body);
+  return shell(`${target.name} — WatchOMacho`, body, { activeNav: "home" });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1125,9 +1124,14 @@ interface HeartbeatInput {
     };
   } | null;
   lastCompletedRun: { status: string; error: string | null; duration_ms: number | null; created_at: number } | null;
+  /** Slugs of targets that currently exist. The `last_run_attempt` setting
+   *  in D1 persists across target deletion, so a deleted target's slug can
+   *  linger in the heartbeat forever. Used to render "(target gone)" rather
+   *  than a dead link. */
+  knownTargetSlugs: Set<string>;
 }
 
-function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun }: HeartbeatInput): string {
+function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, knownTargetSlugs }: HeartbeatInput): string {
   const now = Date.now();
   const cronAgeMin = lastCronRun > 0 ? Math.floor((now - lastCronRun) / 60_000) : null;
   const cronColor = cronAgeMin == null
@@ -1143,15 +1147,23 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun }: 
   if (lastRunAttempt) {
     const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
     const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : timeAgo(lastRunAttempt.started_at);
+    // Defensive: a deleted target leaves its slug in last_run_attempt forever
+    // until something else runs. Render plain text + "(deleted)" instead of
+    // a dead link.
+    const slug = lastRunAttempt.target_slug;
+    const targetExists = knownTargetSlugs.has(slug);
+    const targetRef = targetExists
+      ? `<a href="/admin/targets/${escapeHtml(slug)}" class="text-zee-primary">${escapeHtml(slug)}</a>`
+      : `<span class="text-zee-muted">${escapeHtml(slug)} <em>(deleted)</em></span>`;
     if (lastRunAttempt.outcome === "in_flight") {
       const stalled = startedAgo > 180;
       const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
       const label = stalled ? "stalled" : "in flight";
-      attemptLine = `<span class="${tone}">${label}</span> at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
+      attemptLine = `<span class="${tone}">${label}</span> at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> · ${targetRef} · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
     } else if (lastRunAttempt.outcome === "success") {
-      attemptLine = `<span class="text-zee-primary">success</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
+      attemptLine = `<span class="text-zee-primary">success</span> · ${targetRef} · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
     } else {
-      attemptLine = `<span class="text-[rgb(180,60,60)]">failed @ ${escapeHtml(lastRunAttempt.last_step)}</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel}</span>`;
+      attemptLine = `<span class="text-[rgb(180,60,60)]">failed @ ${escapeHtml(lastRunAttempt.last_step)}</span> · ${targetRef} · <span class="label-muted">${startedLabel}</span>`;
     }
   }
 
@@ -1248,93 +1260,20 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     `<option value="${escapeHtml(m)}"${m === currentChatModel ? " selected" : ""}>${escapeHtml(CHAT_MODEL_LABELS[m] ?? m)}</option>`,
   ).join("");
 
-  const runRows = await env.DB.prepare(
-    "SELECT * FROM runs ORDER BY created_at DESC LIMIT 12",
-  ).all<any>();
-
-  const skillOptions = skills.length === 0
-    ? `<option value="">(no skills yet — use "Manage skills →" to create one)</option>`
-    : `<option value="">(none — attach later)</option>` + skills.map((s) =>
-        `<option value="${escapeHtml(s.slug)}">${escapeHtml(s.name)}</option>`,
-      ).join("");
-
   const active = targets.filter((t) => t.status === "active");
+  const otherCount = targets.length - active.length;
   const dueNow = active.filter((t) => t.next_run_at && t.next_run_at <= Date.now() && t.primary_skill_id);
-  const statusRank: Record<string, number> = { active: 0, paused: 1, archived: 2 };
-  const sortedTargets = [...targets].sort((a, b) => {
-    const sa = statusRank[a.status] ?? 3;
-    const sb = statusRank[b.status] ?? 3;
-    if (sa !== sb) return sa - sb;
-    return (a.next_run_at ?? Infinity) - (b.next_run_at ?? Infinity);
-  });
-
-  const targetRows = sortedTargets.length === 0
-    ? `<div class="empty">No targets yet. Add one above.</div>`
-    : `<ul class="list-none">${sortedTargets.map((t) => {
-        const isActive = t.status === "active";
-        const meta = isActive
-          ? `${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"} · every ${t.cadence_hours}h`
-          : `every ${t.cadence_hours}h`;
-        return `
-        <li class="py-2.5 border-b border-[rgba(232,228,222,0.6)]">
-          <div class="flex flex-wrap justify-between items-baseline gap-3">
-            <a href="/admin/targets/${escapeHtml(t.slug)}" class="font-medium ${isActive ? "text-zee-text" : "text-zee-muted"}">
-              ${escapeHtml(t.name)}
-              ${t.kind ? `<span class="label-muted ml-2">${escapeHtml(t.kind)}</span>` : ""}
-              <span class="badge badge-${escapeHtml(t.status)} ml-2">${escapeHtml(t.status)}</span>
-            </a>
-            <span class="tt text-xs text-zee-muted">
-              ${meta}
-            </span>
-          </div>
-        </li>`;
-      }).join("")}</ul>`;
-
-  const targetById = new Map(targets.map((t) => [t.id, t]));
-  const runsHtml = (runRows.results ?? []).map((r: any) => {
-    const t = targetById.get(r.target_id);
-    const targetCell = t
-      ? `<a href="/admin/targets/${escapeHtml(t.slug)}" class="text-zee-primary">${escapeHtml(t.name)}</a>`
-      : `<span class="label-muted">(deleted)</span>`;
-    const reportCell = r.report_id && r.status === "success"
-      ? `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary">view →</a>`
-      : `<span class="label-muted">—</span>`;
-    const errFull = r.error ?? "";
-    const errShort = errFull.length > 60 ? errFull.slice(0, 60) + "…" : errFull;
-    return `
-    <tr>
-      <td class="tt">${escapeHtml(timeAgo(r.created_at))}</td>
-      <td>${targetCell}</td>
-      <td>${escapeHtml(r.triggered_by)}</td>
-      <td>${r.status === "success"
-            ? `<span class="badge badge-active">success</span>`
-            : `<span class="badge badge-error" title="${escapeHtml(errFull)}">${escapeHtml(errShort || "error")}</span>`}</td>
-      <td>${reportCell}</td>
-      <td class="tt">${escapeHtml(fmtDuration(r.duration_ms))}</td>
-    </tr>
-  `;
-  }).join("");
 
   const body = `
     <section class="pt-6 pb-3">
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Console.</h1>
-      <p class="subhead"><strong class="text-zee-text">${active.length}</strong> active${sortedTargets.length > active.length ? ` · <strong class="text-zee-muted">${sortedTargets.length - active.length}</strong> paused/archived` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <strong class="text-zee-text">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
+      <p class="subhead">
+        <a href="/admin/targets" class="text-zee-text hover:text-zee-primary"><strong>${active.length}</strong> active</a>${otherCount > 0 ? ` · <a href="/admin/targets" class="text-zee-muted hover:text-zee-primary"><strong>${otherCount}</strong> paused/archived</a>` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <a href="/admin/skills" class="text-zee-text hover:text-zee-primary"><strong>${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}</a>.
+      </p>
     </section>
 
-    ${renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun })}
-
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Recent runs</h3>
-          <span class="label-muted">${(runRows.results ?? []).length} shown<span class="chev">▾</span></span>
-        </div>
-      </summary>
-      ${runsHtml
-        ? `<table class="runs"><thead><tr><th>When</th><th>Target</th><th>Trigger</th><th>Status</th><th>Report</th><th>Duration</th></tr></thead><tbody>${runsHtml}</tbody></table>`
-        : `<div class="empty">No runs yet.</div>`}
-    </details>
+    ${renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, knownTargetSlugs: new Set(targets.map((t) => t.slug)) })}
 
     <details class="card">
       <summary>
@@ -1392,7 +1331,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     <details class="card">
       <summary>
         <div class="h3-row">
-          <h3>Maintenance</h3>
+          <h3>Memory &amp; cleanup</h3>
           <span class="label-muted">
             ${r2Stats
               ? `${r2Stats.scanned} R2 file${r2Stats.scanned === 1 ? "" : "s"} · `
@@ -1456,16 +1395,20 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         </div>
       </div>
 
-      <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
+    </details>
 
-      <div class="label-muted mb-2">Observability (Workers Logs)</div>
-      <div class="field-help" style="max-width: 72ch;">
-        Console output + uncaught errors from this worker are retained 7 days in the Cloudflare dashboard. Enabled via <code>[observability]</code> in <code>wrangler.toml</code>. Use this <strong>after</strong> a stalled run — <code>wrangler tail</code> only catches live logs going forward, so it can't replay a run that died before you started tailing. Filter by <code>runResearch[…]</code> in the dashboard to follow a specific run through each <code>markStep</code>. If a CPU-cap kill happens mid-run, the last <code>markStep</code> line tells you exactly which step you can't afford on the current settings.
+    <details class="card">
+      <summary>
+        <div class="h3-row">
+          <h3>Diagnostics</h3>
+          <span class="label-muted">Workers Logs · 7 day retention<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      <div class="field-help mt-3.5" style="max-width: 72ch;">
+        Console output + uncaught errors from this worker are kept for 7 days in the Cloudflare dashboard (enabled via <code>[observability]</code> in <code>wrangler.toml</code>). Use this <strong>after</strong> a stalled run — <code>wrangler tail</code> only catches live logs going forward, so it can't replay a run that died before you started tailing. Filter by <code>runResearch[…]</code> to follow a specific run through each <code>markStep</code>; if a CPU-cap kill happens mid-run, the last <code>markStep</code> line tells you which step you can't afford.
       </div>
       <div class="row mt-3 items-baseline">
-        <div class="flex-1 text-sm">
-          <a href="https://dash.cloudflare.com/379ac7a184fcd14c809eb0aa2a0b2233/workers/services/view/watchomacho/production/observability/logs" target="_blank" rel="noopener" class="text-zee-primary underline">Open Workers Logs in Cloudflare dashboard ↗</a>
-        </div>
+        <a href="https://dash.cloudflare.com/379ac7a184fcd14c809eb0aa2a0b2233/workers/services/view/watchomacho/production/observability" target="_blank" rel="noopener" class="text-zee-primary underline text-sm">Open Workers Observability ↗</a>
       </div>
     </details>
 
@@ -1876,7 +1819,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
 export async function renderAdminTargetEdit(env: Env, slug: string, queued = false): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
-    return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { adminFooter: true });
+    return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { activeNav: "targets", adminFooter: true });
   }
   const skills = await listSkills(env);
   const activityRows = await env.DB.prepare(
@@ -2035,11 +1978,11 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     </div>
     ` : ""}
 
-    <details class="card" open>
+    <details class="card">
       <summary>
         <div class="h3-row">
           <h3>Configure</h3>
-          <span class="chev">▾</span>
+          <span class="label-muted">${target.cadence_hours}h cadence${target.primary_skill_id ? "" : " · no skill"}<span class="chev">▾</span></span>
         </div>
       </summary>
       <form id="update-target-form" method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
@@ -2121,7 +2064,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
       ${activityList}
     </details>
   `;
-  return shell(`${target.name} · Admin`, body, { activeNav: "admin", adminFooter: true });
+  return shell(`${target.name} · Admin`, body, { activeNav: "targets", adminFooter: true });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
