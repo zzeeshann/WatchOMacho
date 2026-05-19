@@ -115,17 +115,6 @@ a { color: inherit; text-decoration: none; }
 .nav a:hover { color: var(--zee-primary); }
 .nav a.active { color: var(--zee-text); }
 
-/* Subhead-stat link: looks like plain text, turns teal on hover. Used by
- * the /admin Console subhead "N active · M skills" links. */
-.stat-link { color: inherit; transition: color .12s ease; }
-.stat-link:hover { color: var(--zee-primary); }
-
-/* Breadcrumb row: faint separators, hover-teal on the linked crumbs. */
-.crumbs { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--zee-muted); }
-.crumbs a { color: var(--zee-primary); }
-.crumbs a:hover { text-decoration: underline; }
-.crumbs .sep { margin: 0 .5em; color: var(--zee-border); }
-
 /* category labels (the daylila "TODAY" pill) */
 .label {
   font-size: 11px;
@@ -650,7 +639,7 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<link rel="stylesheet" href="/static/tailwind.v1.css">
+<link rel="stylesheet" href="/static/tailwind.v2.css">
 </head>
 <body>
 <header class="site-header">
@@ -1291,7 +1280,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Console.</h1>
       <p class="subhead">
-        <a href="/admin/targets" class="stat-link"><strong>${active.length}</strong> active</a>${otherCount > 0 ? ` · <a href="/admin/targets" class="stat-link" style="color:var(--zee-muted)"><strong>${otherCount}</strong> paused/archived</a>` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <a href="/admin/skills" class="stat-link"><strong>${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}</a>.
+        <a href="/admin/targets" class="text-zee-text hover:text-zee-primary transition-colors"><strong>${active.length}</strong> active</a>${otherCount > 0 ? ` · <a href="/admin/targets" class="text-zee-muted hover:text-zee-primary transition-colors"><strong>${otherCount}</strong> paused/archived</a>` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <a href="/admin/skills" class="text-zee-text hover:text-zee-primary transition-colors"><strong>${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}</a>.
       </p>
     </section>
 
@@ -1637,7 +1626,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span>Skills</p>
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>Skills</p>
       <h1 class="headline mt-2 text-[32px]">Skills.</h1>
       <p class="subhead">The agent's library of reusable research procedures. Each skill picks a tool, configures it, and writes the instructions the LLM uses to plan + author the report. WYSIWYG — no hidden parsing.</p>
     </section>
@@ -1769,7 +1758,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
 
   const body = `
     <section class="pt-6 pb-3">
-      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span>Targets</p>
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>Targets</p>
       <h1 class="headline mt-2 text-[32px]">Targets.</h1>
       <p class="subhead"><strong class="text-zee-text">${active.length}</strong> active${sortedTargets.length > active.length ? ` · <strong class="text-zee-muted">${sortedTargets.length - active.length}</strong> paused/archived` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""}.</p>
     </section>
@@ -1874,12 +1863,12 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     `<option value="${h}"${target.cadence_hours === h ? " selected" : ""}>${h === 1 ? "every hour" : h < 24 ? `every ${h} hours` : h === 24 ? "every 24 hours" : h === 72 ? "every 3 days" : "every week"}</option>`,
   ).join("");
 
-  /** Faint middot used between meta items on a single line. */
-  const metaSep = `<span class="text-zee-border mx-1.5" aria-hidden="true">·</span>`;
+  /** Middot separator between meta items on the same line. */
+  const metaSep = `<span class="mx-2.5 text-zee-border" aria-hidden="true">·</span>`;
 
   const activityList = (activityRows.results ?? []).length === 0
     ? `<div class="empty">No activity yet.</div>`
-    : `<ul class="list-none divide-y divide-[rgba(232,228,222,0.6)]">${(activityRows.results ?? []).map((r: any) => {
+    : `<ul class="list-none">${(activityRows.results ?? []).map((r: any) => {
         const isSuccess = r.status === "success" && r.report_id;
 
         // ─── Line 1 — the run: when, how, how long, link to the report ───
@@ -1890,14 +1879,14 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
         if (r.duration_ms) lineRunParts.push(`<span class="tt">${escapeHtml(fmtDuration(r.duration_ms))}</span>`);
         if (isSuccess) {
           lineRunParts.push(
-            `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary">view report →</a>`,
+            `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary hover:underline">view report →</a>`,
           );
         }
 
         // ─── Line 2 — the report: words, model, sources, skill ───
         const lineReportParts: string[] = [];
         if (isSuccess && r.report_word_count != null) {
-          lineReportParts.push(`<strong class="font-medium">${r.report_word_count.toLocaleString()}</strong> words`);
+          lineReportParts.push(`<strong class="font-medium text-zee-text">${r.report_word_count.toLocaleString()}</strong> words`);
         }
         if (isSuccess && r.report_chat_model) {
           lineReportParts.push(escapeHtml(chatModelShortLabel(r.report_chat_model)));
@@ -1916,22 +1905,25 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           } catch { /* malformed JSON — skip */ }
         }
         const skillLabel = r.skill_name
-          ? `<a href="/skill/${escapeHtml(r.skill_slug)}" class="text-zee-primary">${escapeHtml(r.skill_name)}</a>`
-          : `<span class="label-muted">(deleted skill)</span>`;
+          ? `<a href="/skill/${escapeHtml(r.skill_slug)}" class="text-zee-primary hover:underline">${escapeHtml(r.skill_name)}</a>`
+          : `<span class="text-zee-muted italic">(deleted skill)</span>`;
         lineReportParts.push(`via ${skillLabel}`);
 
         // ─── Line 3 — gather funnel (only when populated) ───
         const funnelHtml = renderGatherFunnel(r.gather_stats_json);
 
+        // text-sm + text-zee-muted: bigger and clearer than the old
+        // .field-help (12px / faded). Generous mt-2 between sub-lines so
+        // groups don't sandwich into a wall of middots.
         const metaBlock = `
-          <div class="mt-1.5 field-help">${lineRunParts.join(metaSep)}</div>
-          ${lineReportParts.length ? `<div class="mt-1 field-help">${lineReportParts.join(metaSep)}</div>` : ""}
-          ${funnelHtml ? `<div class="mt-1 field-help">${funnelHtml}</div>` : ""}
+          <div class="mt-2 text-sm text-zee-muted flex flex-wrap items-center">${lineRunParts.join(metaSep)}</div>
+          ${lineReportParts.length ? `<div class="mt-1.5 text-sm text-zee-muted flex flex-wrap items-center">${lineReportParts.join(metaSep)}</div>` : ""}
+          ${funnelHtml ? `<div class="mt-1.5 text-sm text-zee-muted flex flex-wrap items-center">${funnelHtml}</div>` : ""}
         `;
 
         if (isSuccess) {
           return `
-            <li class="py-4 flex items-start gap-3.5">
+            <li class="py-5 px-1 flex items-start gap-3.5 border-b border-zee-border last:border-b-0">
               <span class="activity-dot activity-dot--ok" aria-hidden="true">✓</span>
               <div class="flex-1 min-w-0">
                 <a href="/report/${escapeHtml(r.report_id)}" class="text-sm font-medium text-zee-text block leading-snug">
@@ -1956,7 +1948,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           ? `Run failed at <code class="tt font-mono text-[rgb(180,60,60)]">${failedStep}</code>`
           : `Run failed`;
         return `
-          <li class="py-4 flex items-start gap-3.5">
+          <li class="py-5 px-1 flex items-start gap-3.5 border-b border-zee-border last:border-b-0">
             <span class="activity-dot activity-dot--err" aria-hidden="true">✕</span>
             <div class="flex-1 min-w-0">
               <div class="text-sm font-medium text-zee-text leading-snug">${titleLine}</div>
@@ -1970,7 +1962,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span><a href="/admin/targets">Targets</a><span class="sep">·</span>${escapeHtml(target.name)}</p>
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span><a href="/admin/targets" class="text-zee-primary hover:underline">Targets</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>${escapeHtml(target.name)}</p>
       <h1 class="headline mt-2">${escapeHtml(target.name)}</h1>
       <p class="subhead">${target.description ? escapeHtml(target.description) : `<em class="text-zee-muted">No description</em>`}</p>
       <div class="flex flex-wrap items-center gap-3 mt-3.5">
@@ -2107,7 +2099,7 @@ export function renderAdminTools(): string {
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span>Tools</p>
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>Tools</p>
       <h1 class="headline mt-2 text-[32px]">Tools.</h1>
       <p class="subhead">What skills can call. Today: Tavily only. Each skill picks one tool + one operation on its edit page. To add another tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together.</p>
     </section>

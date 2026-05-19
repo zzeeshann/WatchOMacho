@@ -440,7 +440,10 @@ export async function updateTarget(
 
 /** R2 keys that aren't reports and must never be considered orphans. Bump
  *  this set when adding new static assets. */
-const R2_STATIC_KEEP: ReadonlySet<string> = new Set(["static/tailwind.v1.css"]);
+const R2_STATIC_KEEP: ReadonlySet<string> = new Set([
+  "static/tailwind.v1.css",   // legacy, kept for any still-cached pages
+  "static/tailwind.v2.css",   // current
+]);
 
 /** Scan R2 once, returning total object count and the keys not referenced by
  *  any `reports.r2_key`. Shared by the count-only admin display and the
