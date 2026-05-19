@@ -1,6 +1,11 @@
 ADMIN_SECRET=change-me-to-something-long-and-random
 TAVILY_API_KEY=tvly-...
 
+# Read-only API key for /api/reports/* endpoints. Callers (daylila etc.)
+# send this in the X-API-Key header. Generate with `openssl rand -hex 32`.
+# Set in production via `wrangler secret put WATCHOMACHO_API_KEY`.
+WATCHOMACHO_API_KEY=
+
 # Optional — only needed if any skill calls the companies_house tool.
 # Register for a free key at developer.company-information.service.gov.uk.
 CH_API_KEY=

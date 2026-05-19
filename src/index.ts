@@ -45,6 +45,7 @@ import {
   renderAdminPanel,
   renderAdminSkills,
   renderAdminTargetEdit,
+  renderAdminTargetsList,
   renderAdminTools,
   renderHome,
   renderReportPage,
@@ -77,6 +78,28 @@ function withSecurityHeaders(init: ResponseInit): ResponseInit {
   };
 }
 
+/** Pull the per-skill tool params from a form. Returns a flat object of
+ *  whatever was set; blank values are dropped so they fall back to the
+ *  tool's defaults at run time. */
+function collectSkillToolParams(form: Record<string, string>): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const k of ["topic", "time_range", "depth"]) {
+    const v = (form[k] ?? "").trim();
+    if (v) params[k] = v;
+  }
+  return params;
+}
+
+/** Parse a textarea of URLs (one per line, # comments OK) into a clean
+ *  list. Returns [] when empty. */
+function parseSourceUrls(raw: string): string[] {
+  return raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"))
+    .filter((l) => /^https?:\/\//i.test(l));
+}
+
 function html(body: string, init: ResponseInit = {}): Response {
   return new Response(body, withSecurityHeaders({
     ...init,
@@ -89,6 +112,25 @@ function json(data: any, init: ResponseInit = {}): Response {
     ...init,
     headers: { "content-type": "application/json", ...(init.headers ?? {}) },
   }));
+}
+
+/** Gate /api/* endpoints behind the X-API-Key header (timing-safe compare
+ *  against the WATCHOMACHO_API_KEY secret). Returns null when the request
+ *  is authorised, or a 401 Response to short-circuit otherwise. If the
+ *  secret isn't configured at all the API is locked down entirely — that's
+ *  intentional (fail closed, not open). */
+function requireApiKey(req: Request, env: Env): Response | null {
+  if (!env.WATCHOMACHO_API_KEY) {
+    return json(
+      { error: "API not configured", hint: "Set WATCHOMACHO_API_KEY via `wrangler secret put`." },
+      { status: 503 },
+    );
+  }
+  const sent = req.headers.get("x-api-key") ?? "";
+  if (!sent || !timingSafeEqual(sent, env.WATCHOMACHO_API_KEY)) {
+    return json({ error: "unauthorised" }, { status: 401 });
+  }
+  return null;
 }
 
 function redirect(location: string, extraHeaders: Record<string, string> = {}): Response {
@@ -196,8 +238,8 @@ export default {
       // ─── Static assets (served from R2 watchomacho-reports/static/) ──────
       // Versioned filenames are immutable: bump the filename version to bust
       // the edge cache.
-      if (path === "/static/tailwind.v1.css" && (req.method === "GET" || req.method === "HEAD")) {
-        const obj = await env.REPORTS.get("static/tailwind.v1.css");
+      if (path === "/static/tailwind.v2.css" && (req.method === "GET" || req.method === "HEAD")) {
+        const obj = await env.REPORTS.get("static/tailwind.v2.css");
         if (!obj) return new Response("Not found", { status: 404 });
         const headers = {
           "content-type": "text/css; charset=utf-8",
@@ -235,21 +277,114 @@ export default {
         return html(await renderReportPage(env, id));
       }
 
-      // ─── Public JSON API ─────────────────────────────────────────────────
-      if (path === "/api/targets" && req.method === "GET") {
-        const targets = await listTargets(env, "active");
-        return json({ targets });
-      }
+      // ─── JSON API ────────────────────────────────────────────────────────
+      // All /api/* endpoints are gated by the X-API-Key header. The secret
+      // is WATCHOMACHO_API_KEY (set via `wrangler secret put`). Callers
+      // (daylila dashboard etc.) include it on every request.
+      if (path.startsWith("/api/") && req.method === "GET") {
+        const denied = requireApiKey(req, env);
+        if (denied) return denied;
 
-      if (path === "/api/skills" && req.method === "GET") {
-        const skills = await listSkills(env);
-        return json({
-          skills: skills.map((s) => ({
-            id: s.id, slug: s.slug, name: s.name, description: s.description,
-            author: s.author, used_count: s.used_count,
-            created_at: s.created_at, updated_at: s.updated_at,
-          })),
-        });
+        if (path === "/api/targets") {
+          const targets = await listTargets(env, "active");
+          return json({
+            targets: targets.map((t) => ({
+              id: t.id, slug: t.slug, name: t.name, kind: t.kind,
+              description: t.description, cadence_hours: t.cadence_hours,
+              created_at: t.created_at, updated_at: t.updated_at,
+            })),
+          });
+        }
+
+        if (path === "/api/skills") {
+          const skills = await listSkills(env);
+          return json({
+            skills: skills.map((s) => ({
+              id: s.id, slug: s.slug, name: s.name, description: s.description,
+              author: s.author, used_count: s.used_count,
+              created_at: s.created_at, updated_at: s.updated_at,
+            })),
+          });
+        }
+
+        // GET /api/reports/recent?limit=N — cross-target latest reports for
+        // a "feed"-shaped consumer. Returns lightweight rows (no full body
+        // markdown) — pull individual reports for the full content.
+        if (path === "/api/reports/recent") {
+          const limitRaw = parseInt(url.searchParams.get("limit") ?? "10", 10);
+          const limit = Number.isFinite(limitRaw)
+            ? Math.max(1, Math.min(50, limitRaw))
+            : 10;
+          const origin = new URL(req.url).origin;
+          const rows = await env.DB.prepare(
+            `SELECT reports.id, reports.title, reports.snippet, reports.word_count,
+                    reports.sources_json, reports.created_at,
+                    targets.slug AS target_slug, targets.name AS target_name
+               FROM reports
+               LEFT JOIN targets ON targets.id = reports.target_id
+              ORDER BY reports.created_at DESC
+              LIMIT ?`,
+          ).bind(limit).all<any>();
+          const items = (rows.results ?? []).map((r) => ({
+            id: r.id,
+            title: r.title,
+            url: `${origin}/report/${r.id}`,
+            date: new Date(r.created_at).toISOString(),
+            summary: r.snippet,
+            word_count: r.word_count,
+            target: r.target_slug
+              ? { slug: r.target_slug, name: r.target_name }
+              : null,
+            source_count: r.sources_json
+              ? (() => { try { return JSON.parse(r.sources_json).length; } catch { return 0; } })()
+              : 0,
+          }));
+          return json({ reports: items });
+        }
+
+        // GET /api/reports/:id — full content of a single report. D1 row
+        // for metadata, R2 blob for the markdown body, sources_json for
+        // citations.
+        if (path.startsWith("/api/reports/")) {
+          const id = path.slice("/api/reports/".length);
+          if (!/^[a-z0-9-]+$/.test(id)) {
+            return json({ error: "bad id" }, { status: 400 });
+          }
+          const report = await getReportById(env, id);
+          if (!report) {
+            return json({ error: "not found" }, { status: 404 });
+          }
+          const obj = await env.REPORTS.get(report.r2_key);
+          const bodyMarkdown = obj ? await obj.text() : null;
+          const target = await getTargetById(env, report.target_id);
+          let sources: Array<{ title: string; url: string; kind: string }> = [];
+          if (report.sources_json) {
+            try {
+              const raw = JSON.parse(report.sources_json);
+              if (Array.isArray(raw)) {
+                sources = raw.map((s: any) => ({
+                  title: String(s?.title ?? ""),
+                  url: String(s?.url ?? ""),
+                  kind: String(s?.kind ?? "web"),
+                }));
+              }
+            } catch { /* corrupted JSON — return [] */ }
+          }
+          const origin = new URL(req.url).origin;
+          return json({
+            id: report.id,
+            title: report.title,
+            url: `${origin}/report/${report.id}`,
+            date: new Date(report.created_at).toISOString(),
+            summary: report.snippet,
+            word_count: report.word_count,
+            target: target ? { slug: target.slug, name: target.name } : null,
+            body_markdown: bodyMarkdown,
+            sources,
+          });
+        }
+
+        return json({ error: "unknown endpoint" }, { status: 404 });
       }
 
       // ─── Admin: auth ─────────────────────────────────────────────────────
@@ -295,6 +430,11 @@ export default {
       if (path === "/admin/tools" && req.method === "GET") {
         if (!isAdmin(req, env)) return redirect("/admin/login");
         return html(renderAdminTools());
+      }
+
+      if (path === "/admin/targets" && req.method === "GET") {
+        if (!isAdmin(req, env)) return redirect("/admin/login");
+        return html(await renderAdminTargetsList(env));
       }
 
       if (path.startsWith("/admin/targets/") && req.method === "GET") {
@@ -364,6 +504,34 @@ export default {
             patch.primary_skill_id = null as any;
           }
         }
+        // Per-target Tavily knobs. Blank = "use the global default" → NULL.
+        if (form.queries_per_run !== undefined) {
+          const raw = form.queries_per_run.trim();
+          if (raw === "") {
+            patch.queries_per_run = null;
+          } else {
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n) && n >= 1 && n <= 20) patch.queries_per_run = n;
+          }
+        }
+        if (form.tavily_min_score !== undefined) {
+          const raw = form.tavily_min_score.trim();
+          if (raw === "") {
+            patch.tavily_min_score = null;
+          } else {
+            const f = parseFloat(raw);
+            if (Number.isFinite(f) && f >= 0 && f <= 1) patch.tavily_min_score = f;
+          }
+        }
+        if (form.tavily_max_final_sources !== undefined) {
+          const raw = form.tavily_max_final_sources.trim();
+          if (raw === "") {
+            patch.tavily_max_final_sources = null;
+          } else {
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n) && n >= 1 && n <= 200) patch.tavily_max_final_sources = n;
+          }
+        }
         await updateTarget(env, target.id, patch);
         return redirect(`/admin/targets/${target.slug}`);
       }
@@ -424,12 +592,20 @@ export default {
         const md = (form.procedure_md ?? "").trim();
         if (!name) return json({ error: "name required" }, { status: 400 });
         if (md.length < 30) return json({ error: "procedure_md too short" }, { status: 400 });
-        const skill = await createSkillFromMarkdown(env, {
-          name,
-          description: form.description?.trim() || undefined,
-          procedure_md: md,
-        });
-        return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        try {
+          const skill = await createSkillFromMarkdown(env, {
+            name,
+            description: form.description?.trim() || undefined,
+            procedure_md: md,
+            tool_slug: form.tool_slug === "" ? null : (form.tool_slug ?? undefined),
+            tool_op: form.tool_op === "" ? null : (form.tool_op ?? undefined),
+            tool_params: collectSkillToolParams(form),
+            tool_sources: parseSourceUrls(form.tool_sources ?? ""),
+          });
+          return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        } catch (e: any) {
+          return json({ error: e?.message ?? "create failed" }, { status: 400 });
+        }
       }
 
       if (path.startsWith("/admin/skills/") && path.endsWith("/update") && req.method === "POST") {
@@ -438,12 +614,26 @@ export default {
         const skill = await getSkillBySlug(env, slug);
         if (!skill) return json({ error: "not found" }, { status: 404 });
         const form = await readForm(req);
-        await updateSkill(env, skill.id, {
-          name: form.name?.trim() || undefined,
-          description: form.description?.trim(),
-          procedure_md: form.procedure_md?.trim() || undefined,
-        });
-        return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        try {
+          await updateSkill(env, skill.id, {
+            name: form.name?.trim() || undefined,
+            description: form.description?.trim(),
+            procedure_md: form.procedure_md?.trim() || undefined,
+            tool_slug: form.tool_slug === undefined
+              ? undefined
+              : (form.tool_slug === "" ? null : form.tool_slug),
+            tool_op: form.tool_op === undefined
+              ? undefined
+              : (form.tool_op === "" ? null : form.tool_op),
+            tool_params: form.tool_slug === undefined ? undefined : collectSkillToolParams(form),
+            tool_sources: form.tool_sources === undefined
+              ? undefined
+              : parseSourceUrls(form.tool_sources),
+          });
+          return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
+        } catch (e: any) {
+          return json({ error: e?.message ?? "update failed" }, { status: 400 });
+        }
       }
 
       if (path.startsWith("/admin/skills/") && path.endsWith("/delete") && req.method === "POST") {
@@ -488,18 +678,9 @@ export default {
           daily_report_limit: [0, 10000],
           daily_search_limit: [0, 100000],
           cron_max_per_tick: [1, 20],
-          // Search-tuning CPU levers (Workers Free = 10ms CPU per
-          // invocation). max_final_sources caps how many sources reach the
-          // writer; max_chars_per_source caps each source's content. Writer
-          // prompt size = product of the two and is the dominant CPU spend.
-          max_final_sources: [1, 200],
+          // Worker-wide CPU + safety levers. Tavily knobs moved to per-
+          // target columns (v11) so they're no longer here.
           max_chars_per_source: [200, 8000],
-          // Run guardrail. Aborts in-flight Tavily / Anthropic fetches when
-          // the run wall-clock exceeds this many seconds. Hard ceiling is
-          // the 15-min Durable Object alarm limit; this is the soft cap
-          // below it. Floor is 5s — low enough to deliberately trigger an
-          // abort during testing (every run will fail at 5s, but the error
-          // message names the cause so it's self-diagnostic).
           max_run_seconds: [5, 600],
         };
         const updated: Record<string, string> = {};
@@ -519,19 +700,6 @@ export default {
           }
           await setSetting(env, "chat_model", form.chat_model);
           updated.chat_model = form.chat_model;
-        }
-        // Tavily relevance threshold — float in [0, 1]. Editable via the
-        // "Search tuning" admin card. 0.4 is the Tavily-documented sweet
-        // spot; lower = more candidates (noisier), higher = stricter.
-        if (form.tavily_min_score !== undefined && form.tavily_min_score !== "") {
-          const f = parseFloat(form.tavily_min_score);
-          if (!Number.isFinite(f) || f < 0 || f > 1) {
-            return json({ error: "tavily_min_score must be a number between 0 and 1" }, { status: 400 });
-          }
-          // Quantise to 2 decimals so storage stays tidy ("0.40" not "0.4000000001").
-          const rounded = Math.round(f * 100) / 100;
-          await setSetting(env, "tavily_min_score", String(rounded));
-          updated.tavily_min_score = String(rounded);
         }
         return json({ ok: true, updated });
       }

@@ -502,6 +502,16 @@ function formatDate(ts: number): string {
   return new Date(ts).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }
 
+/** Compact "14:23 · 19 May" used in dense lists where you want both the
+ *  relative time AND the absolute clock. The full ISO timestamp is
+ *  available on hover via the parent element's `title` attribute. */
+function formatDateTime(ts: number): string {
+  const d = new Date(ts);
+  const hhmm = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const day = d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  return `${hhmm} · ${day}`;
+}
+
 function timeAgo(ts: number): string {
   const diff = Date.now() - ts;
   const mins = Math.floor(diff / 60000);
@@ -639,15 +649,16 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<link rel="stylesheet" href="/static/tailwind.v1.css">
+<link rel="stylesheet" href="/static/tailwind.v2.css">
 </head>
 <body>
 <header class="site-header">
   <div class="wrap site-header-inner">
     <a href="/" class="brand">WatchOMacho</a>
     <nav class="nav">
-      ${navLink("/", "Targets", "home")}
-      ${isAdmin ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/skills", "Skills", "skills")} ${navLink("/admin/tools", "Tools", "tools")} <form method="post" action="/admin/logout" class="inline ml-2"><button class="btn btn-secondary px-2.5 py-1 text-[11px]">Logout</button></form>` : navLink("/admin/login", "Admin", "admin")}
+      ${isAdmin
+        ? `${navLink("/admin", "Admin", "admin")} ${navLink("/admin/targets", "Targets", "targets")} ${navLink("/admin/skills", "Skills", "skills")} ${navLink("/admin/tools", "Tools", "tools")} <form method="post" action="/admin/logout" class="inline ml-2"><button class="btn btn-secondary px-2.5 py-1 text-[11px]">Logout</button></form>`
+        : `${navLink("/", "Targets", "home")} ${navLink("/admin/login", "Admin", "admin")}`}
     </nav>
   </div>
 </header>
@@ -769,17 +780,16 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
     `);
   }
   const reports = await listReportsForTarget(env, target.id, 30);
-  const skill = target.primary_skill_id
-    ? await env.DB.prepare("SELECT * FROM skills WHERE id = ?").bind(target.primary_skill_id).first<Skill>()
-    : null;
 
+  // Public target page meta is intentionally minimal: only what a reader of
+  // the reports cares about. Internal scheduling (cadence, next run, status,
+  // attached skill slug) is admin information and stays on /admin/targets/:slug.
   const meta = `
     <div class="flex flex-wrap items-center gap-3 mt-3">
-      <span class="badge badge-${target.status}">${target.status}</span>
       ${target.kind ? `<span class="label-muted">${escapeHtml(target.kind)}</span>` : ""}
-      ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" class="text-zee-primary">${escapeHtml(skill.name)}</a></span>` : `<span class="label-muted">no skill attached</span>`}
-      <span class="label-muted">every ${target.cadence_hours}h</span>
-      ${target.next_run_at ? `<span class="label-muted">next ${escapeHtml(timeUntil(target.next_run_at))}</span>` : ""}
+      ${reports[0]
+        ? `<span class="label-muted">last update ${escapeHtml(timeAgo(reports[0].created_at))}</span>`
+        : ""}
     </div>
   `;
 
@@ -818,7 +828,7 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
     body += `</section>`;
   }
 
-  return shell(`${target.name} — WatchOMacho`, body);
+  return shell(`${target.name} — WatchOMacho`, body, { activeNav: "home" });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -889,14 +899,11 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const target = await env.DB.prepare("SELECT slug, name FROM targets WHERE id = ?")
     .bind(report.target_id)
     .first<{ slug: string; name: string }>();
-  const skill = report.skill_id
-    ? await env.DB.prepare("SELECT slug, name FROM skills WHERE id = ?").bind(report.skill_id).first<{ slug: string; name: string }>()
-    : null;
 
   // Strip everything that would visually duplicate the page header:
   //  - leading H1 (title sits in our own header above)
   //  - italic "Target / Generated" frontmatter lines (now redundant with
-  //    the page header's date / skill / model row)
+  //    the page header's date row)
   //  - trailing "Sources" / "References" section the LLM may have written
   //    (we render the canonical numbered list ourselves)
   const bodyMd = stripTrailingSourcesSection(
@@ -908,28 +915,17 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const html = wrapSectionsInCards(renderMarkdown(bodyMd));
   const sourcesHtml = renderSourcesSection(report.sources_json);
 
-  // Pull the run row this report came from so we can render the gather
-  // funnel + duration on the report header. Reports written before
-  // migration v9 won't have gather_stats_json; the helper returns "".
-  const runRow = report.run_id
-    ? await env.DB.prepare(
-        "SELECT gather_stats_json, duration_ms FROM runs WHERE id = ?",
-      ).bind(report.run_id).first<{ gather_stats_json: string | null; duration_ms: number | null }>()
-    : null;
-  const funnelHtml = renderGatherFunnel(runRow?.gather_stats_json);
-
+  // Public report page meta is intentionally minimal — date + word count.
+  // Skill, model, runtime, and the Tavily gather funnel are admin-only
+  // diagnostics and live on /admin instead.
   const body = `
     <section class="pt-8 pb-4">
       <p class="label">${target ? `<a href="/target/${escapeHtml(target.slug)}" class="text-inherit">${escapeHtml(target.name)}</a>` : "Report"}</p>
       <h1 class="headline mt-2">${escapeHtml(report.title)}</h1>
       <div class="flex flex-wrap gap-3 mt-3.5">
         <span class="label-muted">${escapeHtml(formatDate(report.created_at))}</span>
-        ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" class="text-zee-primary">${escapeHtml(skill.name)}</a></span>` : ""}
         <span class="label-muted">${report.word_count ?? 0} words</span>
-        ${report.chat_model ? `<span class="label-muted" title="${escapeHtml(report.chat_model)}">written by <strong class="text-zee-text font-medium">${escapeHtml(chatModelShortLabel(report.chat_model))}</strong></span>` : ""}
-        ${runRow?.duration_ms ? `<span class="label-muted">${escapeHtml(fmtDuration(runRow.duration_ms))} runtime</span>` : ""}
       </div>
-      ${funnelHtml ? `<div class="field-help mt-2.5" style="max-width: 80ch;">${funnelHtml}</div>` : ""}
     </section>
     <article class="prose pt-6 pb-2">${html}</article>
     ${sourcesHtml}
@@ -955,12 +951,16 @@ function renderGatherFunnel(json: string | null | undefined): string {
       }
       return "";
     }
-    return `Tavily <strong class="font-medium">${g.tavily_queries}q</strong>`
-      + ` · <span class="tt">${g.tavily_raw}</span> raw`
-      + ` → <span class="tt">${g.after_score_filter}</span> (score)`
-      + ` → <span class="tt">${g.after_url_dedupe}</span> (URL)`
-      + ` → <span class="tt">${g.after_title_dedupe}</span> (story)`
-      + ` → <strong class="font-medium tt">${g.final_kept}</strong> final`;
+    // Each chunk wrapped in its own span so neighboring text + arrows keep
+    // visible whitespace even when the parent flex/wrap rules kick in.
+    const sep = `<span class="mx-1.5 text-zee-border" aria-hidden="true">·</span>`;
+    const arrow = `<span class="mx-1.5 text-zee-border" aria-hidden="true">→</span>`;
+    return `<span>Tavily <strong class="font-medium text-zee-text">${g.tavily_queries}q</strong></span>${sep}`
+      + `<span class="tt">${g.tavily_raw} raw</span>${arrow}`
+      + `<span class="tt">${g.after_score_filter} (score)</span>${arrow}`
+      + `<span class="tt">${g.after_url_dedupe} (URL)</span>${arrow}`
+      + `<span class="tt">${g.after_title_dedupe} (story)</span>${arrow}`
+      + `<strong class="font-medium tt text-zee-text">${g.final_kept} final</strong>`;
   } catch {
     return "";
   }
@@ -1099,11 +1099,152 @@ export function renderAdminLogin(error?: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Admin: system heartbeat — 24h digest + recent run mini-list. Replaces the
+// older "last attempt + last completed" two-row view (those duplicated each
+// other anyway). The in-flight banner is rendered separately at the top so
+// you can see active work even before it finishes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface HeartbeatInput {
+  lastCronRun: number;
+  lastRunAttempt: {
+    run_id: string;
+    target_slug: string;
+    triggered_by: "cron" | "manual";
+    started_at: number;
+    last_step: string;
+    completed_at: number | null;
+    outcome: "in_flight" | "success" | "error";
+    error?: string;
+  } | null;
+  last24hStats: { total: number; ok: number; err: number; avg_ms: number | null } | null;
+  recentRuns: Array<{
+    id: string;
+    status: string;
+    error: string | null;
+    duration_ms: number | null;
+    created_at: number;
+    report_id: string | null;
+    target_slug: string | null;
+    target_name: string | null;
+  }>;
+  /** Slugs of targets that currently exist. Deleted-target slugs persist in
+   *  last_run_attempt; we render those as "(deleted)" rather than dead links. */
+  knownTargetSlugs: Set<string>;
+}
+
+function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recentRuns, knownTargetSlugs }: HeartbeatInput): string {
+  const now = Date.now();
+
+  // ─── Cron status (still the first thing — tells you the scheduler's alive) ─
+  const cronAgeMin = lastCronRun > 0 ? Math.floor((now - lastCronRun) / 60_000) : null;
+  const cronColor = cronAgeMin == null
+    ? "text-zee-muted"
+    : cronAgeMin < 75 ? "text-zee-primary"
+    : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
+    : "text-[rgb(180,60,60)]";
+  const cronLine = cronAgeMin == null
+    ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
+    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next within the hour</span>`;
+
+  // ─── In-flight banner (only when a run is currently running). The runs
+  //     table only has completed rows, so this is the only signal that work
+  //     is happening RIGHT NOW. ────────────────────────────────────────────
+  let inFlightBanner = "";
+  if (lastRunAttempt && lastRunAttempt.outcome === "in_flight") {
+    const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
+    const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : timeAgo(lastRunAttempt.started_at);
+    const slug = lastRunAttempt.target_slug;
+    const targetExists = knownTargetSlugs.has(slug);
+    const stalled = startedAgo > 180;
+    const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
+    const label = stalled ? "stalled" : "in flight";
+    const targetRef = targetExists
+      ? `<a href="/admin/targets/${escapeHtml(slug)}" class="text-zee-primary hover:underline">${escapeHtml(slug)}</a>`
+      : `<span class="text-zee-muted">${escapeHtml(slug)} <em>(deleted)</em></span>`;
+    inFlightBanner = `
+      <div class="mt-3 rounded border border-zee-primary/40 bg-zee-primary/5 px-3 py-2 text-sm">
+        <span class="${tone} font-medium">${label}</span>
+        at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> ·
+        ${targetRef} ·
+        <span class="text-zee-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>
+      </div>`;
+  }
+
+  // ─── Last 24h digest ──────────────────────────────────────────────────────
+  const s = last24hStats ?? { total: 0, ok: 0, err: 0, avg_ms: null };
+  const avg = s.avg_ms ? fmtDuration(Math.round(s.avg_ms)) : null;
+  const digestBits: string[] = [
+    `<strong class="font-medium text-zee-text">${s.total}</strong> ${s.total === 1 ? "run" : "runs"}`,
+  ];
+  if (s.ok > 0) digestBits.push(`<span class="text-zee-primary"><strong class="font-medium">${s.ok}</strong> ✓</span>`);
+  if (s.err > 0) digestBits.push(`<span class="text-[rgb(180,60,60)]"><strong class="font-medium">${s.err}</strong> ✕</span>`);
+  if (avg) digestBits.push(`<span class="text-zee-muted">avg ${avg}</span>`);
+  const digestLine = digestBits.join(`<span class="mx-2.5 text-zee-border" aria-hidden="true">·</span>`);
+
+  // ─── Recent runs mini-list (last 6). Clickable rows → target page. ───────
+  const recentList = recentRuns.length === 0
+    ? `<div class="text-sm text-zee-muted">No runs yet.</div>`
+    : `<ul class="list-none mt-2 divide-y divide-zee-border">${recentRuns.map((r) => {
+        const slug = r.target_slug;
+        const targetExists = !!slug && knownTargetSlugs.has(slug);
+        const targetLabel = r.target_name ?? slug ?? "(deleted target)";
+        const targetRef = targetExists
+          ? `<a href="/admin/targets/${escapeHtml(slug!)}" class="text-zee-text font-medium hover:text-zee-primary transition-colors">${escapeHtml(targetLabel)}</a>`
+          : `<span class="text-zee-muted italic">${escapeHtml(targetLabel)} (deleted)</span>`;
+        const dot = r.status === "success"
+          ? `<span class="text-zee-primary">✓</span>`
+          : `<span class="text-[rgb(180,60,60)]">✕</span>`;
+        const dur = r.duration_ms ? fmtDuration(r.duration_ms) : "";
+        const errSnippet = r.status !== "success" && r.error
+          ? ` · <span class="text-[rgb(180,60,60)]">${escapeHtml(r.error.replace(/^(init|plan|gather|recall|write|persist|done):\s*/, "").slice(0, 50))}</span>`
+          : "";
+        const fullIso = new Date(r.created_at).toISOString();
+        return `
+          <li class="py-2.5 flex items-center gap-3">
+            ${dot}
+            <div class="flex-1 min-w-0">
+              ${targetRef}
+              <span class="text-zee-muted text-sm ml-2" title="${escapeHtml(fullIso)}">
+                <span class="tt">${timeAgo(r.created_at)}</span>
+                <span class="mx-1.5 text-zee-border">·</span>
+                <span class="tt">${formatDateTime(r.created_at)}</span>${dur ? ` <span class="mx-1.5 text-zee-border">·</span> <span class="tt">${dur}</span>` : ""}${errSnippet}
+              </span>
+            </div>
+          </li>`;
+      }).join("")}</ul>`;
+
+  return `
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>System heartbeat</h3>
+          <span class="label-muted">${cronAgeMin == null ? "no cron yet" : `cron ${timeAgo(lastCronRun)}`}<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      <div class="field-help mt-3" style="max-width: 70ch;">
+        Cron health, a digest of the last 24 hours, and the most recent runs across all targets. Click any row to jump to that target's activity.
+      </div>
+      ${inFlightBanner}
+      <div class="mt-4 grid gap-y-3" style="grid-template-columns: 140px 1fr;">
+        <div class="label-muted">Cron</div>
+        <div class="text-sm">${cronLine}</div>
+        <div class="label-muted">Last 24h</div>
+        <div class="text-sm">${digestLine}</div>
+      </div>
+      <div class="mt-4 label-muted">Recent runs</div>
+      ${recentList}
+    </details>
+  `;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Admin: overview panel
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminPanel(env: Env): Promise<string> {
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, lastCompletedRun, tavilyMinScoreStr, maxFinalSourcesStr, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
+  const cutoff24h = Date.now() - 24 * 3600 * 1000;
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1120,20 +1261,24 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     env.DB.prepare("SELECT COUNT(*) AS n FROM reports").first<{ n: number }>(),
     getSetting(env, "last_cron_run", "0"),
     getSetting(env, "last_run_attempt", ""),
-    env.DB.prepare("SELECT status, error, duration_ms, created_at FROM runs ORDER BY created_at DESC LIMIT 1").first<{ status: string; error: string | null; duration_ms: number | null; created_at: number }>(),
-    getSetting(env, "tavily_min_score", "0.4"),
-    getSetting(env, "max_final_sources", "100"),
+    env.DB.prepare(
+      `SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS ok,
+          SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS err,
+          AVG(duration_ms) AS avg_ms
+        FROM runs WHERE created_at > ?`,
+    ).bind(cutoff24h).first<{ total: number; ok: number; err: number; avg_ms: number | null }>(),
+    env.DB.prepare(
+      `SELECT runs.id, runs.status, runs.error, runs.duration_ms, runs.created_at, runs.report_id,
+              targets.slug AS target_slug, targets.name AS target_name
+         FROM runs
+         LEFT JOIN targets ON targets.id = runs.target_id
+         ORDER BY runs.created_at DESC LIMIT 6`,
+    ).all<{ id: string; status: string; error: string | null; duration_ms: number | null; created_at: number; report_id: string | null; target_slug: string | null; target_name: string | null }>(),
     getSetting(env, "max_chars_per_source", "4000"),
     getSetting(env, "max_run_seconds", "90"),
   ]);
-  const tavilyMinScore = (() => {
-    const f = parseFloat(tavilyMinScoreStr);
-    return Number.isFinite(f) && f >= 0 && f <= 1 ? f : 0.4;
-  })();
-  const maxFinalSources = (() => {
-    const n = parseInt(maxFinalSourcesStr, 10);
-    return Number.isFinite(n) && n >= 1 && n <= 200 ? n : 100;
-  })();
   const maxCharsPerSource = (() => {
     const n = parseInt(maxCharsPerSourceStr, 10);
     return Number.isFinite(n) && n >= 200 && n <= 8000 ? n : 4000;
@@ -1157,125 +1302,22 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     `<option value="${escapeHtml(m)}"${m === currentChatModel ? " selected" : ""}>${escapeHtml(CHAT_MODEL_LABELS[m] ?? m)}</option>`,
   ).join("");
 
-  const runRows = await env.DB.prepare(
-    "SELECT * FROM runs ORDER BY created_at DESC LIMIT 12",
-  ).all<any>();
-
-  const skillOptions = skills.length === 0
-    ? `<option value="">(no skills yet — use "Manage skills →" to create one)</option>`
-    : `<option value="">(none — attach later)</option>` + skills.map((s) =>
-        `<option value="${escapeHtml(s.slug)}">${escapeHtml(s.name)}</option>`,
-      ).join("");
-
   const active = targets.filter((t) => t.status === "active");
+  const otherCount = targets.length - active.length;
   const dueNow = active.filter((t) => t.next_run_at && t.next_run_at <= Date.now() && t.primary_skill_id);
-
-  const targetRows = active.length === 0
-    ? `<div class="empty">No targets yet. Add one above.</div>`
-    : `<ul class="list-none">${active.map((t) => `
-        <li class="py-2.5 border-b border-[rgba(232,228,222,0.6)]">
-          <div class="flex flex-wrap justify-between items-baseline gap-3">
-            <a href="/admin/targets/${escapeHtml(t.slug)}" class="font-medium text-zee-text">
-              ${escapeHtml(t.name)}
-              ${t.kind ? `<span class="label-muted ml-2">${escapeHtml(t.kind)}</span>` : ""}
-            </a>
-            <span class="tt text-xs text-zee-muted">
-              ${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"}
-              · every ${t.cadence_hours}h
-            </span>
-          </div>
-        </li>`).join("")}</ul>`;
-
-  const targetById = new Map(targets.map((t) => [t.id, t]));
-  const runsHtml = (runRows.results ?? []).map((r: any) => {
-    const t = targetById.get(r.target_id);
-    const targetCell = t
-      ? `<a href="/admin/targets/${escapeHtml(t.slug)}" class="text-zee-primary">${escapeHtml(t.name)}</a>`
-      : `<span class="label-muted">(deleted)</span>`;
-    const reportCell = r.report_id && r.status === "success"
-      ? `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary">view →</a>`
-      : `<span class="label-muted">—</span>`;
-    const errFull = r.error ?? "";
-    const errShort = errFull.length > 60 ? errFull.slice(0, 60) + "…" : errFull;
-    return `
-    <tr>
-      <td class="tt">${escapeHtml(timeAgo(r.created_at))}</td>
-      <td>${targetCell}</td>
-      <td>${escapeHtml(r.triggered_by)}</td>
-      <td>${r.status === "success"
-            ? `<span class="badge badge-active">success</span>`
-            : `<span class="badge badge-error" title="${escapeHtml(errFull)}">${escapeHtml(errShort || "error")}</span>`}</td>
-      <td>${reportCell}</td>
-      <td class="tt">${escapeHtml(fmtDuration(r.duration_ms))}</td>
-    </tr>
-  `;
-  }).join("");
 
   const body = `
     <section class="pt-6 pb-3">
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Console.</h1>
-      <p class="subhead"><strong class="text-zee-text">${active.length}</strong> ${active.length === 1 ? "target" : "targets"}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <strong class="text-zee-text">${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}.</p>
+      <p class="subhead">
+        <a href="/admin/targets" class="text-zee-text hover:text-zee-primary transition-colors"><strong>${active.length}</strong> active</a>${otherCount > 0 ? ` · <a href="/admin/targets" class="text-zee-muted hover:text-zee-primary transition-colors"><strong>${otherCount}</strong> paused/archived</a>` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <a href="/admin/skills" class="text-zee-text hover:text-zee-primary transition-colors"><strong>${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}</a>.
+      </p>
     </section>
 
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Add a target</h3>
-          <span class="text-xs">
-            <a href="/admin/skills" class="text-zee-primary" onclick="event.stopPropagation()">Manage skills →</a>
-            <span class="chev">▾</span>
-          </span>
-        </div>
-      </summary>
-      <form method="post" action="/admin/targets">
-        <div class="field">
-          <label>Name</label>
-          <input name="name" placeholder="SW1A 1AA, Bhutan, OpenAI, etc." required maxlength="200">
-        </div>
-        <div class="field">
-          <label>Kind <span class="font-normal normal-case tracking-normal">(optional)</span></label>
-          <input name="kind" placeholder="postcode / place / topic / person / company">
-        </div>
-        <div class="field">
-          <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
-          <input name="description" maxlength="400">
-        </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
-            <label>Cadence</label>
-            <select name="cadence_hours">
-              <option value="1">every hour</option>
-              <option value="6">every 6 hours</option>
-              <option value="12">every 12 hours</option>
-              <option value="24" selected>every 24 hours</option>
-              <option value="72">every 3 days</option>
-              <option value="168">every week</option>
-            </select>
-          </div>
-          <div class="field flex-[2] mb-0">
-            <label>Skill to apply</label>
-            <select name="skill_slug">${skillOptions}</select>
-          </div>
-        </div>
-        <label class="flex items-center gap-2 mb-3.5 text-[13px] text-zee-muted">
-          <input type="checkbox" name="run_now" value="1"> Run once now
-        </label>
-        <button class="btn" type="submit">Add target</button>
-      </form>
-    </details>
+    ${renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recentRuns: recentRuns.results ?? [], knownTargetSlugs: new Set(targets.map((t) => t.slug)) })}
 
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Active targets</h3>
-          <span class="label-muted">${active.length} total<span class="chev">▾</span></span>
-        </div>
-      </summary>
-      ${targetRows}
-    </details>
-
-    <details class="card" open>
+    <details class="card">
       <summary>
         <div class="h3-row">
           <h3>Budgets &amp; settings</h3>
@@ -1288,7 +1330,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <select name="chat_model">${modelOptions}</select>
           <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
         </div>
-        <div class="row gap-4">
+        <div class="row gap-4 mb-4">
           <div class="field flex-1 mb-0">
             <label>Reports / day</label>
             <input type="number" name="daily_report_limit" min="0" max="10000" value="${escapeHtml(reportLim)}">
@@ -1305,6 +1347,21 @@ export async function renderAdminPanel(env: Env): Promise<string> {
             <div class="field-help">Cap per hourly cron firing</div>
           </div>
         </div>
+
+        <div class="label-muted mt-2 mb-2">Run guardrails <span class="font-normal normal-case tracking-normal text-zee-muted">(worker-wide CPU + kill switches)</span></div>
+        <div class="row gap-4 mb-2">
+          <div class="field flex-1 mb-0">
+            <label>Max chars per source</label>
+            <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}">
+            <div class="field-help mt-1.5">How much of each source's text is sent to the writer. Default <strong>4000</strong>. Drop to <strong>2000</strong> for Workers AI Llama (24k context).</div>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Max run seconds <span class="font-normal normal-case tracking-normal">(kill switch)</span></label>
+            <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}">
+            <div class="field-help mt-1.5">Soft ceiling on a single run's wall-clock. Aborts hung fetches. Default <strong>90&nbsp;s</strong>. Hard ceiling is the 15-min DO alarm limit.</div>
+          </div>
+        </div>
+
         <div class="row mt-3.5">
           <button class="btn" type="submit">Save</button>
           <button id="cron-now-btn" type="button" class="btn btn-secondary">Run cron now</button>
@@ -1313,69 +1370,10 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       </form>
     </details>
 
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Search tuning &amp; run guardrails</h3>
-          <span class="label-muted">min score ${tavilyMinScore.toFixed(2)} · cap ${maxFinalSources} src × ${maxCharsPerSource} chars · max ${maxRunSeconds}s<span class="chev">▾</span></span>
-        </div>
-      </summary>
-      <div class="field-help mt-3.5" style="max-width: 72ch;">
-        <strong>Source caps</strong> (first two fields) control how much material reaches the writer — smaller payload means faster Anthropic call. <strong>Max run seconds</strong> (third field) is the run-level kill switch: when wall-clock exceeds it, in-flight Tavily / Anthropic fetches are aborted, the heartbeat is marked errored, and a row is written to <em>Recent runs</em>. The hard ceiling is the 15-minute Durable Object alarm budget; this soft cap sits well below to catch a hung API early. There is also a per-skill lever, <strong>Depth</strong> (<code>basic</code> vs <code>advanced</code>) set in the skill body's <code>## Search configuration</code> block — <code>advanced</code> is slower per query and returns richer content; switch to <code>basic</code> if a particular skill keeps blowing budget.
-      </div>
-      <form id="search-tuning-form">
-        <div class="field mb-3.5">
-          <label>Tavily minimum score</label>
-          <input type="number" name="tavily_min_score" min="0" max="1" step="0.05" value="${tavilyMinScore.toFixed(2)}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            Drops Tavily hits below this score. 0 = keep everything (noisy). 1 = only perfect matches (very few). Tavily-recommended sweet spot: <strong>0.4</strong>. Lower = more candidates reach the writer (richer + noisier). Higher = stricter (cleaner but sparser). Watch the gather funnel in Maintenance after each run to see the effect.
-          </div>
-        </div>
-        <div class="field mb-3.5">
-          <label>Max final sources</label>
-          <input type="number" name="max_final_sources" min="1" max="200" step="1" value="${maxFinalSources}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            Hard cap on how many sources reach the writer after all filtering. Default <strong>100</strong> (defensive ceiling — filters usually settle naturally at ~25–30). Drop to <strong>15</strong> if runs are silently dying mid-write on Workers Free; that's the cheapest way to halve the prompt-build CPU. Drop further if even that fails.
-          </div>
-        </div>
-        <div class="field mb-3.5">
-          <label>Max chars per source</label>
-          <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            How much of each source's body text is sent to the writer. Default <strong>4000</strong> (~1000 tokens/source — fine for Haiku 4.5's 200k context). Drop to <strong>2000</strong> if you switch back to Workers AI Llama (24k context), or if you need to shrink the writer payload.
-          </div>
-        </div>
-        <div style="margin: 20px 0; border-top: 1px solid #D6CFC4;"></div>
-        <div class="field mb-3.5">
-          <label>Max run seconds (kill switch)</label>
-          <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}" style="max-width: 140px;">
-          <div class="field-help mt-1.5" style="max-width: 64ch;">
-            Soft ceiling on a single run's wall-clock. When exceeded, the Durable Object alarm aborts in-flight fetches (Tavily, Anthropic), the heartbeat is marked errored, and a row is written to <em>Recent runs</em> with <code>watchdog reaped</code>. Default <strong>90 s</strong> — comfortably above today's slowest successful run (~50 s). The hard ceiling is the 15-minute DO alarm limit; this soft cap catches hung APIs early so a stuck call can't burn the daily Durable Objects compute quota (13,000 GB-s on Workers Free, ~115 GB-s per 15-min stuck run).
-          </div>
-        </div>
-        <div class="row">
-          <button class="btn" type="submit">Save</button>
-          <span id="search-tuning-result" class="text-xs text-zee-muted"></span>
-        </div>
-      </form>
-    </details>
-
-    <details class="card" open>
-      <summary>
-        <div class="h3-row">
-          <h3>Recent runs</h3>
-          <span class="label-muted">${(runRows.results ?? []).length} shown<span class="chev">▾</span></span>
-        </div>
-      </summary>
-      ${runsHtml
-        ? `<table class="runs"><thead><tr><th>When</th><th>Target</th><th>Trigger</th><th>Status</th><th>Report</th><th>Duration</th></tr></thead><tbody>${runsHtml}</tbody></table>`
-        : `<div class="empty">No runs yet.</div>`}
-    </details>
-
     <details class="card">
       <summary>
         <div class="h3-row">
-          <h3>Maintenance</h3>
+          <h3>Memory &amp; cleanup</h3>
           <span class="label-muted">
             ${r2Stats
               ? `${r2Stats.scanned} R2 file${r2Stats.scanned === 1 ? "" : "s"} · `
@@ -1403,82 +1401,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         <div>
           <button id="gc-r2-btn" type="button" class="btn btn-danger"${r2Stats && r2Stats.orphans.length === 0 ? " disabled" : ""}>Sweep orphans now</button>
           <div id="gc-r2-result" class="field-help mt-1"></div>
-        </div>
-      </div>
-
-      <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
-
-      <div class="label-muted mb-2">Activity heartbeat</div>
-      <div class="field-help" style="max-width: 64ch;">
-        Three timestamps that tell you whether the agent is actually running. <em>Cron last ran</em> should be under an hour. <em>Last attempt</em> is the most-recent <code>Run now</code> or cron-triggered run (overwritten on each new run, even if the run later crashes — so a click always leaves a fingerprint). <em>Last completed run</em> is the most recent row in the runs table that finished (success or error).
-      </div>
-      <div class="row mt-4 items-baseline">
-        <div class="flex-1 text-sm">
-          ${(() => {
-            const now = Date.now();
-            const cronAgeMin = lastCronRun > 0 ? Math.floor((now - lastCronRun) / 60_000) : null;
-            const cronColor = cronAgeMin == null
-              ? "text-zee-muted"
-              : cronAgeMin < 75 ? "text-zee-primary"
-              : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
-              : "text-[rgb(180,60,60)]";
-            const cronLine = cronAgeMin == null
-              ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
-              : `<span class="${cronColor}">${cronAgeMin} min ago</span>`;
-
-            let attemptLine = `<span class="text-zee-muted">no attempts recorded yet</span>`;
-            if (lastRunAttempt) {
-              const startedAgo = Math.floor((now - lastRunAttempt.started_at) / 1000);
-              const startedLabel = startedAgo < 60 ? `${startedAgo}s ago` : `${Math.floor(startedAgo / 60)} min ago`;
-              if (lastRunAttempt.outcome === "in_flight") {
-                const stalled = startedAgo > 180; // 3 min — runs normally finish in 12-25s
-                const tone = stalled ? "text-[rgb(180,60,60)]" : "text-zee-primary";
-                const label = stalled ? "stalled" : "in flight";
-                attemptLine = `<span class="${tone}">${label}</span> at <code class="tt">${escapeHtml(lastRunAttempt.last_step)}</code> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
-              } else if (lastRunAttempt.outcome === "success") {
-                attemptLine = `<span class="text-zee-primary">success</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel} · ${escapeHtml(lastRunAttempt.triggered_by)}</span>`;
-              } else {
-                attemptLine = `<span class="text-[rgb(180,60,60)]">failed @ ${escapeHtml(lastRunAttempt.last_step)}</span> · <a href="/admin/targets/${escapeHtml(lastRunAttempt.target_slug)}" class="text-zee-primary">${escapeHtml(lastRunAttempt.target_slug)}</a> · <span class="label-muted">${startedLabel}</span>`;
-              }
-            }
-
-            let completedLine = `<span class="text-zee-muted">no completed runs yet</span>`;
-            if (lastCompletedRun) {
-              const ago = Math.floor((now - lastCompletedRun.created_at) / 60_000);
-              const agoLabel = ago < 1 ? "just now" : `${ago} min ago`;
-              const dur = lastCompletedRun.duration_ms ? fmtDuration(lastCompletedRun.duration_ms) : "";
-              const status = lastCompletedRun.status === "success"
-                ? `<span class="text-zee-primary">success</span>`
-                : `<span class="text-[rgb(180,60,60)]">error: ${escapeHtml((lastCompletedRun.error ?? "unknown").slice(0, 60))}</span>`;
-              completedLine = `${status} · <span class="label-muted">${agoLabel}${dur ? ` · ${dur}` : ""}</span>`;
-            }
-
-            // Tavily gather funnel from the most recent run. Shows the
-            // shape of "what we asked for → what survived each filter →
-            // what reached the writer", so a thin section in a report is
-            // diagnosable at a glance.
-            let gatherLine = `<span class="text-zee-muted">no gather data yet</span>`;
-            if (lastRunAttempt?.gather_stats) {
-              const g = lastRunAttempt.gather_stats;
-              if (g.tavily_queries > 0) {
-                gatherLine = `Tavily <strong class="font-medium">${g.tavily_queries}q</strong> · <span class="tt">${g.tavily_raw}</span> raw → <span class="tt">${g.after_score_filter}</span> (score) → <span class="tt">${g.after_url_dedupe}</span> (URL) → <span class="tt">${g.after_title_dedupe}</span> (story) → <strong class="font-medium tt">${g.final_kept}</strong> final`;
-              } else if (g.final_kept > 0) {
-                gatherLine = `<span class="text-zee-muted">no Tavily this run · ${g.final_kept} sources from typed tools</span>`;
-              }
-            }
-
-            return `
-              <div class="grid gap-y-3" style="grid-template-columns: 170px 1fr;">
-                <div class="label-muted">Cron last ran</div>
-                <div>${cronLine}</div>
-                <div class="label-muted">Last attempt</div>
-                <div>${attemptLine}</div>
-                <div class="label-muted">Last completed run</div>
-                <div>${completedLine}</div>
-                <div class="label-muted">Last run gather</div>
-                <div class="text-sm">${gatherLine}</div>
-              </div>`;
-          })()}
         </div>
       </div>
 
@@ -1515,16 +1437,20 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         </div>
       </div>
 
-      <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
+    </details>
 
-      <div class="label-muted mb-2">Observability (Workers Logs)</div>
-      <div class="field-help" style="max-width: 72ch;">
-        Console output + uncaught errors from this worker are retained 7 days in the Cloudflare dashboard. Enabled via <code>[observability]</code> in <code>wrangler.toml</code>. Use this <strong>after</strong> a stalled run — <code>wrangler tail</code> only catches live logs going forward, so it can't replay a run that died before you started tailing. Filter by <code>runResearch[…]</code> in the dashboard to follow a specific run through each <code>markStep</code>. If a CPU-cap kill happens mid-run, the last <code>markStep</code> line tells you exactly which step you can't afford on the current settings.
+    <details class="card">
+      <summary>
+        <div class="h3-row">
+          <h3>Diagnostics</h3>
+          <span class="label-muted">Workers Logs · 7 day retention<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      <div class="field-help mt-3.5" style="max-width: 72ch;">
+        Console output + uncaught errors from this worker are kept for 7 days in the Cloudflare dashboard (enabled via <code>[observability]</code> in <code>wrangler.toml</code>). Use this <strong>after</strong> a stalled run — <code>wrangler tail</code> only catches live logs going forward, so it can't replay a run that died before you started tailing. Filter by <code>runResearch[…]</code> to follow a specific run through each <code>markStep</code>; if a CPU-cap kill happens mid-run, the last <code>markStep</code> line tells you which step you can't afford.
       </div>
       <div class="row mt-3 items-baseline">
-        <div class="flex-1 text-sm">
-          <a href="https://dash.cloudflare.com/379ac7a184fcd14c809eb0aa2a0b2233/workers/services/view/watchomacho/production/observability/logs" target="_blank" rel="noopener" class="text-zee-primary underline">Open Workers Logs in Cloudflare dashboard ↗</a>
-        </div>
+        <a href="https://dash.cloudflare.com/379ac7a184fcd14c809eb0aa2a0b2233/workers/services/view/watchomacho/production/observability" target="_blank" rel="noopener" class="text-zee-primary underline text-sm">Open Workers Observability ↗</a>
       </div>
     </details>
 
@@ -1568,38 +1494,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           result.textContent = 'Failed: ' + (err && err.message || err);
         } finally {
           btn.disabled = false;
-        }
-      });
-
-      $('search-tuning-form')?.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const btn = e.target.querySelector('button[type=submit]');
-        const result = $('search-tuning-result');
-        const orig = btn.textContent;
-        btn.disabled = true;
-        result.textContent = '';
-        try {
-          const res = await fetch('/admin/settings', { method: 'POST', body: new FormData(e.target) });
-          const d = await res.json().catch(() => ({}));
-          if (!res.ok) {
-            btn.textContent = 'Error';
-            result.textContent = d.error || ('HTTP ' + res.status);
-            return;
-          }
-          btn.textContent = 'Saved ✓';
-          const u = d.updated || {};
-          const parts = [];
-          if (u.tavily_min_score !== undefined) parts.push('min_score=' + u.tavily_min_score);
-          if (u.max_final_sources !== undefined) parts.push('sources≤' + u.max_final_sources);
-          if (u.max_chars_per_source !== undefined) parts.push('chars≤' + u.max_chars_per_source);
-          if (u.max_run_seconds !== undefined) parts.push('max≤' + u.max_run_seconds + 's');
-          result.textContent = parts.join(' · ') || 'no change';
-          setTimeout(() => location.reload(), 800);
-        } catch (err) {
-          btn.textContent = 'Error';
-          result.textContent = String(err && err.message || err);
-        } finally {
-          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
         }
       });
 
@@ -1659,14 +1553,50 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 export async function renderAdminSkills(env: Env): Promise<string> {
   const skills = await listSkills(env);
 
+  // Centralised dropdown helpers — used by both the create form and every
+  // edit form below. Same option lists, same semantics.
+  const toolOptions = (selected: string | null | undefined) => {
+    const opts = Object.values(TOOLS).map((t) =>
+      `<option value="${escapeHtml(t.slug)}"${t.slug === selected ? " selected" : ""}>${escapeHtml(t.display)}</option>`,
+    ).join("");
+    return `<option value=""${!selected ? " selected" : ""}>(none — writer only, no gathering)</option>${opts}`;
+  };
+  const opOptionsFor = (toolSlug: string | null | undefined, selectedOp: string | null | undefined) => {
+    if (!toolSlug || !TOOLS[toolSlug]) return `<option value="">(pick a tool first)</option>`;
+    return Object.keys(TOOLS[toolSlug].operations).map((op) =>
+      `<option value="${escapeHtml(op)}"${op === selectedOp ? " selected" : ""}>${escapeHtml(op)}</option>`,
+    ).join("");
+  };
+  const topicOptions = (selected: string) =>
+    ["general", "news", "finance"].map((t) =>
+      `<option value="${t}"${t === selected ? " selected" : ""}>${t}</option>`,
+    ).join("");
+  const timeRangeOptions = (selected: string) =>
+    ["", "day", "week", "month", "year"].map((t) =>
+      `<option value="${t}"${t === selected ? " selected" : ""}>${t === "" ? "(any time)" : t}</option>`,
+    ).join("");
+  const depthOptions = (selected: string) =>
+    ["basic", "advanced"].map((t) =>
+      `<option value="${t}"${t === selected ? " selected" : ""}>${t}</option>`,
+    ).join("");
+
   const list = skills.length === 0
-    ? `<div class="empty">No skills yet. Synthesise one below from a brief, or paste your own markdown.</div>`
-    : skills.map((s) => `
-        <details class="card px-5 py-4" ${s.slug ? "" : "open"}>
+    ? `<div class="empty">No skills yet. Synthesise one below from a brief, or write one by hand.</div>`
+    : skills.map((s) => {
+      const params: Record<string, string> = s.tool_params_json
+        ? (() => { try { return JSON.parse(s.tool_params_json!); } catch { return {}; } })()
+        : {};
+      const sourcesText = s.tool_sources_json
+        ? (() => { try { return (JSON.parse(s.tool_sources_json!) as string[]).join("\n"); } catch { return ""; } })()
+        : "";
+      const isTavilyExtract = s.tool_slug === "tavily" && s.tool_op === "extract";
+      return `
+        <details class="card px-5 py-4">
           <summary class="cursor-pointer list-none flex flex-wrap justify-between items-baseline gap-3">
             <span>
               <strong class="font-medium">${escapeHtml(s.name)}</strong>
               <span class="badge badge-${s.author} ml-2">${s.author}</span>
+              ${s.tool_slug ? `<span class="label-muted ml-2">${escapeHtml(s.tool_slug)} / ${escapeHtml(s.tool_op ?? "")}</span>` : `<span class="label-muted ml-2">writer only</span>`}
               <a href="/skill/${escapeHtml(s.slug)}" class="ml-2 text-xs text-zee-primary">public →</a>
             </span>
             <span class="label-muted">used ${s.used_count}× · ${escapeHtml(timeAgo(s.updated_at))}</span>
@@ -1680,8 +1610,40 @@ export async function renderAdminSkills(env: Env): Promise<string> {
               <label>Description</label>
               <input name="description" value="${escapeHtml(s.description ?? "")}" maxlength="200">
             </div>
+
+            <div class="row gap-4 mb-4">
+              <div class="field flex-1 mb-0">
+                <label>Tool</label>
+                <select name="tool_slug">${toolOptions(s.tool_slug)}</select>
+              </div>
+              <div class="field flex-1 mb-0">
+                <label>Operation</label>
+                <select name="tool_op">${opOptionsFor(s.tool_slug, s.tool_op)}</select>
+              </div>
+            </div>
+
+            <div class="row gap-4 mb-4">
+              <div class="field flex-1 mb-0">
+                <label>Search topic</label>
+                <select name="topic">${topicOptions(params.topic ?? "general")}</select>
+              </div>
+              <div class="field flex-1 mb-0">
+                <label>Time range</label>
+                <select name="time_range">${timeRangeOptions(params.time_range ?? "")}</select>
+              </div>
+              <div class="field flex-1 mb-0">
+                <label>Depth</label>
+                <select name="depth">${depthOptions(params.depth ?? "basic")}</select>
+              </div>
+            </div>
+
+            <details class="mb-4"${isTavilyExtract ? " open" : ""}>
+              <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
+              <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line. Lines starting with # are ignored.">${escapeHtml(sourcesText)}</textarea>
+            </details>
+
             <div class="field">
-              <label>Procedure (markdown)</label>
+              <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
               <textarea name="procedure_md" class="min-h-[280px] font-mono text-[13px]">${escapeHtml(s.procedure_md)}</textarea>
             </div>
             <div class="row">
@@ -1690,18 +1652,19 @@ export async function renderAdminSkills(env: Env): Promise<string> {
             </div>
           </form>
         </details>
-      `).join("");
+      `;
+    }).join("");
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="label">Admin</p>
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>Skills</p>
       <h1 class="headline mt-2 text-[32px]">Skills.</h1>
-      <p class="subhead">The agent's library of reusable research procedures. Each skill is a markdown document — write it yourself or let the agent synthesise one from a brief.</p>
+      <p class="subhead">The agent's library of reusable research procedures. Each skill picks a tool, configures it, and writes the instructions the LLM uses to plan + author the report. WYSIWYG — no hidden parsing.</p>
     </section>
 
     <div class="card">
       <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the procedure document for you and pick which <a href="/admin/tools" class="text-zee-primary">tools</a> to use (Tavily web search, HM Land Registry sold prices, ONS postcode context, data.police.uk crime stats, Companies House) based on what the brief implies.</p>
+      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the writer-instruction markdown for you (defaults to <code>tavily / search</code>; you can change the tool config after).</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="synthesize">
         <div class="field">
@@ -1718,7 +1681,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
     <div class="card">
       <div class="h3-row"><h3>Write a skill by hand</h3></div>
-      <p class="field-help mb-3">Optional tool headers you can declare in the markdown (all defaults are sensible). A skill may declare one or more tools (one of each): <code>**Tavily op:** search|extract</code>, <code>**Land Registry op:** sold-prices</code>, <code>**ONS op:** context</code>, <code>**Police op:** crimes</code>, <code>**Companies House op:** search|by-postcode</code>. Per-tool params (e.g. <code>**Months:** 6</code>, <code>**Search topic:** news</code>) live underneath. Full catalog with every header: <a href="/admin/tools" class="text-zee-primary">/admin/tools</a>.</p>
+      <p class="field-help mb-3">Pick a tool + op, set its params, then write the instructions. The agent feeds the instructions verbatim into the planner (to generate queries) and the writer (to author the report).</p>
       <form method="post" action="/admin/skills">
         <input type="hidden" name="mode" value="write">
         <div class="field">
@@ -1729,13 +1692,46 @@ export async function renderAdminSkills(env: Env): Promise<string> {
           <label>Description</label>
           <input name="description" maxlength="200">
         </div>
-        <div class="field">
-          <label>Procedure (markdown)</label>
-          <textarea name="procedure_md" required class="min-h-[240px] font-mono text-[13px]" placeholder="# Skill name
 
-**Purpose:** ...
-**Search queries:**
-- {target} ...
+        <div class="row gap-4 mb-4">
+          <div class="field flex-1 mb-0">
+            <label>Tool</label>
+            <select name="tool_slug">${toolOptions("tavily")}</select>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Operation</label>
+            <select name="tool_op">${opOptionsFor("tavily", "search")}</select>
+          </div>
+        </div>
+
+        <div class="row gap-4 mb-4">
+          <div class="field flex-1 mb-0">
+            <label>Search topic</label>
+            <select name="topic">${topicOptions("general")}</select>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Time range</label>
+            <select name="time_range">${timeRangeOptions("")}</select>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Depth</label>
+            <select name="depth">${depthOptions("basic")}</select>
+          </div>
+        </div>
+
+        <details class="mb-4">
+          <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
+          <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line."></textarea>
+        </details>
+
+        <div class="field">
+          <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
+          <textarea name="procedure_md" required class="min-h-[240px] font-mono text-[13px]" placeholder="**Purpose:** ...
+
+**When to use:** ...
+
+**Approach:** ...
+
 **Output structure:**
 - Heading: ...
 "></textarea>
@@ -1750,13 +1746,122 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Admin: dedicated /admin/targets page — list + add form (lifted off the
+// main admin console so /admin is just status + settings).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderAdminTargetsList(env: Env): Promise<string> {
+  const [targets, skills] = await Promise.all([listTargets(env), listSkills(env)]);
+  const active = targets.filter((t) => t.status === "active");
+  const dueNow = active.filter((t) => t.next_run_at && t.next_run_at <= Date.now() && t.primary_skill_id);
+  const statusRank: Record<string, number> = { active: 0, paused: 1, archived: 2 };
+  const sortedTargets = [...targets].sort((a, b) => {
+    const sa = statusRank[a.status] ?? 3;
+    const sb = statusRank[b.status] ?? 3;
+    if (sa !== sb) return sa - sb;
+    return (a.next_run_at ?? Infinity) - (b.next_run_at ?? Infinity);
+  });
+  const skillOptions = skills.length === 0
+    ? `<option value="">(no skills yet — use Skills tab to create one)</option>`
+    : `<option value="">(none — attach later)</option>` + skills.map((s) =>
+        `<option value="${escapeHtml(s.slug)}">${escapeHtml(s.name)}</option>`,
+      ).join("");
+
+  const targetRows = sortedTargets.length === 0
+    ? `<div class="empty">No targets yet. Add one above.</div>`
+    : `<ul class="list-none">${sortedTargets.map((t) => {
+        const isActive = t.status === "active";
+        const meta = isActive
+          ? `${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"} · every ${t.cadence_hours}h`
+          : `every ${t.cadence_hours}h`;
+        return `
+        <li class="py-2.5 border-b border-[rgba(232,228,222,0.6)]">
+          <div class="flex flex-wrap justify-between items-baseline gap-3">
+            <a href="/admin/targets/${escapeHtml(t.slug)}" class="font-medium ${isActive ? "text-zee-text" : "text-zee-muted"}">
+              ${escapeHtml(t.name)}
+              ${t.kind ? `<span class="label-muted ml-2">${escapeHtml(t.kind)}</span>` : ""}
+              <span class="badge badge-${escapeHtml(t.status)} ml-2">${escapeHtml(t.status)}</span>
+            </a>
+            <span class="tt text-xs text-zee-muted">${meta}</span>
+          </div>
+        </li>`;
+      }).join("")}</ul>`;
+
+  const body = `
+    <section class="pt-6 pb-3">
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>Targets</p>
+      <h1 class="headline mt-2 text-[32px]">Targets.</h1>
+      <p class="subhead"><strong class="text-zee-text">${active.length}</strong> active${sortedTargets.length > active.length ? ` · <strong class="text-zee-muted">${sortedTargets.length - active.length}</strong> paused/archived` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""}.</p>
+    </section>
+
+    <details class="card" open>
+      <summary>
+        <div class="h3-row">
+          <h3>Targets</h3>
+          <span class="label-muted">${sortedTargets.length} total<span class="chev">▾</span></span>
+        </div>
+      </summary>
+      ${targetRows}
+    </details>
+
+    <details class="card">
+      <summary>
+        <div class="h3-row">
+          <h3>Add a target</h3>
+          <span class="text-xs">
+            <a href="/admin/skills" class="text-zee-primary" onclick="event.stopPropagation()">Manage skills →</a>
+            <span class="chev">▾</span>
+          </span>
+        </div>
+      </summary>
+      <form method="post" action="/admin/targets">
+        <div class="field">
+          <label>Name</label>
+          <input name="name" placeholder="SW1A 1AA, Bhutan, OpenAI, etc." required maxlength="200">
+        </div>
+        <div class="field">
+          <label>Kind <span class="font-normal normal-case tracking-normal">(optional)</span></label>
+          <input name="kind" placeholder="postcode / place / topic / person / company">
+        </div>
+        <div class="field">
+          <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
+          <input name="description" maxlength="400">
+        </div>
+        <div class="row gap-4 mb-4">
+          <div class="field flex-1 mb-0">
+            <label>Cadence</label>
+            <select name="cadence_hours">
+              <option value="1">every hour</option>
+              <option value="6">every 6 hours</option>
+              <option value="12">every 12 hours</option>
+              <option value="24" selected>every 24 hours</option>
+              <option value="72">every 3 days</option>
+              <option value="168">every week</option>
+            </select>
+          </div>
+          <div class="field flex-[2] mb-0">
+            <label>Skill to apply</label>
+            <select name="skill_slug">${skillOptions}</select>
+          </div>
+        </div>
+        <label class="flex items-center gap-2 mb-3.5 text-[13px] text-zee-muted">
+          <input type="checkbox" name="run_now" value="1"> Run once now
+        </label>
+        <button class="btn" type="submit">Add target</button>
+      </form>
+    </details>
+  `;
+  return shell("Targets · Admin · WatchOMacho", body, { activeNav: "targets", adminFooter: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Admin: target edit page
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminTargetEdit(env: Env, slug: string, queued = false): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
-    return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { adminFooter: true });
+    return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { activeNav: "targets", adminFooter: true });
   }
   const skills = await listSkills(env);
   const activityRows = await env.DB.prepare(
@@ -1789,79 +1894,66 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     `<option value="${h}"${target.cadence_hours === h ? " selected" : ""}>${h === 1 ? "every hour" : h < 24 ? `every ${h} hours` : h === 24 ? "every 24 hours" : h === 72 ? "every 3 days" : "every week"}</option>`,
   ).join("");
 
-  /** Wraps a meta item as a proper flex child so gap-x spacing applies.
-   *  Each entry becomes a <span>; the joiner is a faint "·" with its own
-   *  margin so adjacent items don't visually glue together. */
-  const metaSep = `<span class="text-zee-border" aria-hidden="true">·</span>`;
-  const wrapMeta = (inner: string, extraClass = "") =>
-    `<span class="${extraClass}">${inner}</span>`;
+  /** Middot separator between meta items on the same line. */
+  const metaSep = `<span class="mx-2.5 text-zee-border" aria-hidden="true">·</span>`;
 
   const activityList = (activityRows.results ?? []).length === 0
     ? `<div class="empty">No activity yet.</div>`
-    : `<ul class="list-none divide-y divide-[rgba(232,228,222,0.6)]">${(activityRows.results ?? []).map((r: any) => {
+    : `<ul class="list-none">${(activityRows.results ?? []).map((r: any) => {
         const isSuccess = r.status === "success" && r.report_id;
-        const skillLabel = r.skill_name
-          ? `<a href="/skill/${escapeHtml(r.skill_slug)}" class="text-zee-primary hover:underline" onclick="event.stopPropagation()">${escapeHtml(r.skill_name)}</a>`
-          : `<span class="label-muted">(deleted skill)</span>`;
 
-        const metaParts: string[] = [
-          wrapMeta(escapeHtml(timeAgo(r.created_at)), "tt"),
-          wrapMeta(skillLabel),
-          wrapMeta(escapeHtml(r.triggered_by)),
+        // ─── Line 1 — when/how: time, trigger, duration. The title above is
+        //     already the report link, so no redundant "view report →" here.
+        const lineRunParts: string[] = [
+          `<span class="tt">${escapeHtml(timeAgo(r.created_at))}</span>`,
+          escapeHtml(r.triggered_by),
         ];
-        if (isSuccess) {
-          if (r.report_word_count != null) {
-            metaParts.push(wrapMeta(`${r.report_word_count.toLocaleString()} words`));
-          }
-          if (r.report_chat_model) {
-            metaParts.push(wrapMeta(escapeHtml(chatModelShortLabel(r.report_chat_model))));
-          }
-          // Visibility into what context the writer had: count web sources
-          // vs archive (prior-report) sources from the persisted citations.
-          if (r.report_sources_json) {
-            try {
-              const cites = JSON.parse(r.report_sources_json) as Array<{ kind?: string }>;
-              if (Array.isArray(cites) && cites.length > 0) {
-                const archive = cites.filter((c) => c?.kind === "archive").length;
-                const web = cites.length - archive;
-                const parts: string[] = [];
-                if (web > 0) parts.push(`${web} web`);
-                if (archive > 0) parts.push(`${archive} 📚`);
-                if (parts.length) metaParts.push(wrapMeta(parts.join(" + ") + " sources"));
-              }
-            } catch { /* malformed JSON — just skip */ }
-          }
+        if (r.duration_ms) lineRunParts.push(`<span class="tt">${escapeHtml(fmtDuration(r.duration_ms))}</span>`);
+
+        // ─── Line 2 — what was produced: words, model, sources. Skill name
+        //     is in the title ("World News — World news briefing") already;
+        //     no need to repeat it here.
+        const lineReportParts: string[] = [];
+        if (isSuccess && r.report_word_count != null) {
+          lineReportParts.push(`<strong class="font-medium text-zee-text">${r.report_word_count.toLocaleString()}</strong> words`);
         }
-        if (r.duration_ms) metaParts.push(wrapMeta(escapeHtml(fmtDuration(r.duration_ms)), "tt"));
-        if (isSuccess) {
-          metaParts.push(
-            `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary hover:underline">view report →</a>`,
-          );
+        if (isSuccess && r.report_chat_model) {
+          lineReportParts.push(escapeHtml(chatModelShortLabel(r.report_chat_model)));
+        }
+        if (isSuccess && r.report_sources_json) {
+          try {
+            const cites = JSON.parse(r.report_sources_json) as Array<{ kind?: string }>;
+            if (Array.isArray(cites) && cites.length > 0) {
+              const archive = cites.filter((c) => c?.kind === "archive").length;
+              const web = cites.length - archive;
+              const bits: string[] = [];
+              if (web > 0) bits.push(`${web} web`);
+              if (archive > 0) bits.push(`${archive} 📚`);
+              if (bits.length) lineReportParts.push(bits.join(" + ") + " sources");
+            }
+          } catch { /* malformed JSON — skip */ }
         }
 
-        const metaLine = `
-          <div class="field-help mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1">
-            ${metaParts.join(metaSep)}
-          </div>`;
-
-        // Per-row gather funnel — populated from runs.gather_stats_json (new
-        // in migration v9). Empty for historical rows from before the
-        // migration; the helper returns "" so we render nothing extra.
+        // ─── Line 3 — gather funnel (only when populated) ───
         const funnelHtml = renderGatherFunnel(r.gather_stats_json);
-        const funnelLine = funnelHtml
-          ? `<div class="field-help mt-1.5">${funnelHtml}</div>`
-          : "";
+
+        // No flex on the sub-lines — natural inline-text flow keeps the
+        // whitespace around middots/arrows visible (flex can collapse it).
+        const metaBlock = `
+          <div class="mt-2 text-sm text-zee-muted">${lineRunParts.join(metaSep)}</div>
+          ${lineReportParts.length ? `<div class="mt-1.5 text-sm text-zee-muted">${lineReportParts.join(metaSep)}</div>` : ""}
+          ${funnelHtml ? `<div class="mt-1.5 text-sm text-zee-muted">${funnelHtml}</div>` : ""}
+        `;
 
         if (isSuccess) {
           return `
-            <li class="py-4 flex items-start gap-3.5">
+            <li class="py-5 px-1 flex items-start gap-3.5 border-b border-zee-border last:border-b-0">
               <span class="activity-dot activity-dot--ok" aria-hidden="true">✓</span>
               <div class="flex-1 min-w-0">
-                <a href="/report/${escapeHtml(r.report_id)}" class="text-sm font-medium text-zee-text hover:text-zee-primary block leading-snug">
+                <a href="/report/${escapeHtml(r.report_id)}" class="text-sm font-medium text-zee-text block leading-snug">
                   ${escapeHtml(r.report_title ?? "Untitled report")}
                 </a>
-                ${metaLine}
-                ${funnelLine}
+                ${metaBlock}
               </div>
               <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline shrink-0" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
                 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
@@ -1880,12 +1972,11 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           ? `Run failed at <code class="tt font-mono text-[rgb(180,60,60)]">${failedStep}</code>`
           : `Run failed`;
         return `
-          <li class="py-4 flex items-start gap-3.5">
+          <li class="py-5 px-1 flex items-start gap-3.5 border-b border-zee-border last:border-b-0">
             <span class="activity-dot activity-dot--err" aria-hidden="true">✕</span>
             <div class="flex-1 min-w-0">
               <div class="text-sm font-medium text-zee-text leading-snug">${titleLine}</div>
-              ${metaLine}
-              ${funnelLine}
+              ${metaBlock}
               <div class="field-help mt-2 text-[rgb(180,60,60)] break-words leading-relaxed" title="${escapeHtml(errFull)}">
                 ${escapeHtml(errShort)}
               </div>
@@ -1895,7 +1986,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="label"><a href="/admin" class="text-inherit">← Admin</a></p>
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span><a href="/admin/targets" class="text-zee-primary hover:underline">Targets</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>${escapeHtml(target.name)}</p>
       <h1 class="headline mt-2">${escapeHtml(target.name)}</h1>
       <p class="subhead">${target.description ? escapeHtml(target.description) : `<em class="text-zee-muted">No description</em>`}</p>
       <div class="flex flex-wrap items-center gap-3 mt-3.5">
@@ -1915,11 +2006,11 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     </div>
     ` : ""}
 
-    <details class="card" open>
+    <details class="card">
       <summary>
         <div class="h3-row">
           <h3>Configure</h3>
-          <span class="chev">▾</span>
+          <span class="label-muted">${target.cadence_hours}h cadence${target.primary_skill_id ? "" : " · no skill"}<span class="chev">▾</span></span>
         </div>
       </summary>
       <form id="update-target-form" method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
@@ -1931,7 +2022,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <label>Description</label>
           <input name="description" value="${escapeHtml(target.description ?? "")}" maxlength="400">
         </div>
-        <div class="row gap-4">
+        <div class="row gap-4 mb-4">
           <div class="field flex-1 mb-0">
             <label>Status</label>
             <select name="status">
@@ -1947,6 +2038,31 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <div class="field flex-[2] mb-0">
             <label>Primary skill</label>
             <select name="skill_slug">${skillOptions}</select>
+          </div>
+        </div>
+
+        <div class="label-muted mt-2 mb-2">Tavily knobs <span class="font-normal normal-case tracking-normal text-zee-muted">(blank = use the global default)</span></div>
+        <div class="row gap-4">
+          <div class="field flex-1 mb-0">
+            <label>Queries per run</label>
+            <input type="number" name="queries_per_run" min="1" max="20" step="1"
+                   value="${target.queries_per_run ?? ""}"
+                   placeholder="10 (default)">
+            <div class="field-help mt-1.5">How many distinct search queries the planner produces. World-news-style skills want 10; a focused postcode dossier wants 2–3.</div>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Tavily min score</label>
+            <input type="number" name="tavily_min_score" min="0" max="1" step="0.05"
+                   value="${target.tavily_min_score != null ? target.tavily_min_score.toFixed(2) : ""}"
+                   placeholder="0.40 (default)">
+            <div class="field-help mt-1.5">Drops Tavily hits below this relevance score. 0 = keep everything (noisy). 1 = strict.</div>
+          </div>
+          <div class="field flex-1 mb-0">
+            <label>Max final sources</label>
+            <input type="number" name="tavily_max_final_sources" min="1" max="200" step="1"
+                   value="${target.tavily_max_final_sources ?? ""}"
+                   placeholder="100 (default)">
+            <div class="field-help mt-1.5">Hard cap on how many sources reach the writer after dedupe.</div>
           </div>
         </div>
       </form>
@@ -1976,7 +2092,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
       ${activityList}
     </details>
   `;
-  return shell(`${target.name} · Admin`, body, { activeNav: "admin", adminFooter: true });
+  return shell(`${target.name} · Admin`, body, { activeNav: "targets", adminFooter: true });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1987,18 +2103,11 @@ export function renderAdminTools(): string {
   const cards = Object.values(TOOLS).map((tool) => {
     const opRows = Object.entries(tool.operations).map(([opName, op]) => `
       <tr>
-        <td class="whitespace-nowrap align-top pr-3 py-2 font-mono text-[13px] text-zee-primary">${escapeHtml(tool.slug)} (${escapeHtml(opName)})</td>
+        <td class="whitespace-nowrap align-top pr-3 py-2 font-mono text-[13px] text-zee-primary">${escapeHtml(tool.slug)} / ${escapeHtml(opName)}</td>
         <td class="align-top py-2 text-sm text-zee-text">
           <div>${escapeHtml(op.description)}</div>
           <div class="field-help mt-1"><em>When to use:</em> ${escapeHtml(op.when_to_use)}</div>
         </td>
-      </tr>
-    `).join("");
-
-    const headerRows = tool.headers.map((h) => `
-      <tr>
-        <td class="whitespace-nowrap align-top pr-3 py-1 font-mono text-[13px] text-zee-primary">**${escapeHtml(h.key)}:**</td>
-        <td class="align-top py-1 text-sm text-zee-text">${escapeHtml(h.values)}</td>
       </tr>
     `).join("");
 
@@ -2008,17 +2117,15 @@ export function renderAdminTools(): string {
         <p class="field-help mb-3">${escapeHtml(tool.summary)}</p>
         <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-2 mb-1">Operations</h4>
         <table class="w-full border-collapse"><tbody>${opRows}</tbody></table>
-        <h4 class="text-[13px] uppercase tracking-wider text-zee-muted mt-4 mb-1">Skill markdown headers</h4>
-        <table class="w-full border-collapse"><tbody>${headerRows}</tbody></table>
       </div>
     `;
   }).join("");
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="label">Admin</p>
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted"><a href="/admin" class="text-zee-primary hover:underline">Admin</a><span class="mx-2 text-zee-border" aria-hidden="true">·</span>Tools</p>
       <h1 class="headline mt-2 text-[32px]">Tools.</h1>
-      <p class="subhead">What skills can call. The agent uses this registry when synthesising new skills. A skill may declare one or more tools (one of each) via headers in its procedure markdown. To add a tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together so they can't drift apart.</p>
+      <p class="subhead">What skills can call. Today: Tavily only. Each skill picks one tool + one operation on its edit page. To add another tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together.</p>
     </section>
 
     ${cards}

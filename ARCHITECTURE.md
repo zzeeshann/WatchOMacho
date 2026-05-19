@@ -1,6 +1,6 @@
 # Architecture
 
-Fast reference. For narrative explanation, read [BOOK.md](BOOK.md). For setup, [README.md](README.md).
+Fast reference. For setup + the high-level picture, read [README.md](README.md).
 
 ---
 
@@ -33,20 +33,19 @@ Fast reference. For narrative explanation, read [BOOK.md](BOOK.md). For setup, [
       ┌──────────────┐ ┌─────────┐  ┌──────┐  ┌──────────────┐
       │ TOOLS:       │ │ Workers │  │ D1   │  │ Vectorize    │
       │  tavily      │ │   AI    │  │      │  │   (memory)   │
-      │  land_reg    │ │ Llama+  │  │      │  │              │
-      │  ons         │ │ bge-base│  │      │  │              │
-      │  police      │ │         │  │      │  │              │
-      │  companies   │ │         │  │      │  │              │
+      │  (search +   │ │ bge-base│  │      │  │              │
+      │   extract)   │ │ +chat   │  │      │  │              │
+      │              │ │  fallback│ │      │  │              │
       └──────────────┘ └─────────┘  └──────┘  └──────────────┘
           │                          │
           │                          ▼
           │                      ┌──────┐
           └──────────────────────►  R2  │ (full markdown of each report
-                                 └──────┘   + /static/tailwind.v1.css)
+                                 └──────┘   + /static/tailwind.v2.css)
 ```
 
-External: Tavily (web search + extract), HM Land Registry SPARQL, postcodes.io (ONS area data), data.police.uk, Companies House.
-Internal: Workers AI (chat + embeddings), D1, R2, Vectorize.
+External: Tavily (web search + extract) — the only web tool. Anthropic via Cloudflare AI Gateway when the active chat model is `anthropic/...`.
+Internal: Workers AI (embeddings always; chat fallback), D1, R2, Vectorize, Durable Objects.
 
 ---
 
@@ -57,14 +56,14 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | # | Step | Calls | Cost |
 | --- | --- | --- | --- |
 | 1 | **Budget check** | D1 read | ~free |
-| 2 | **Parse skill** — scan procedure_md for any registered tool's `**<Tool> op:**` header; collect each tool's per-tool params into a `SkillToolCall[]`. Default to one Tavily search if none declared. | local | free |
-| 3 | **Plan** — LLM picks **exactly 10** search queries (only if at least one tool call is Tavily search) | 1 chat call | ~150–300 neurons (Llama) / ~$0.001 (Haiku) |
-| 4 | **Gather** — dispatch over the `SkillToolCall[]`. Each tool's handler fetches and flattens to markdown `{ title, url, content }`. Tavily passes through 4 filters (see "Gather pipeline" below). | N HTTP calls across the tools | Tavily: 1 credit/query; everything else: free |
+| 2 | **Build tool call** — read `skill.tool_slug`, `skill.tool_op`, `skill.tool_params_json`, `skill.tool_sources_json` directly from the row (no markdown parsing). NULL tool_slug = writer-only skill. | local | free |
+| 3 | **Plan** — LLM picks **N** search queries where N = `target.queries_per_run` (NULL falls back to global default 10). Planner prompt scales with N. Skipped if the tool call isn't Tavily/search. | 1 chat call | ~150–300 neurons (Llama) / ~$0.001 (Haiku) |
+| 4 | **Gather** — dispatch the tool call. Today always Tavily. Results pass through 3 filters (see "Gather pipeline" below). | N HTTP calls (one per query) | Tavily: 1 credit/query |
 | 5 | **Recall** — Vectorize semantic + D1 same-target recents, layered & deduped | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
 | 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context | 1 chat call | ~$0.013–0.026 (Haiku) |
 | 7 | **Persist** — R2 put + D1 inserts + embed + Vectorize upsert + update target.next_run_at + runs audit row + heartbeat setting | 1 R2 put + ~4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
 
-**Total per run (Haiku default):** ~2 chat calls + 1 embedding + (~10 Tavily calls) + (0–N typed-tool HTTP calls) → roughly **$0.013–0.026 + 10 Tavily credits**. At 2 runs/day = **~$10–20/year + 600 Tavily credits/month** (free tier is 1000).
+**Total per run (Haiku default):** ~2 chat calls + 1 embedding + N Tavily calls (default N=10) → roughly **$0.013–0.026 + N Tavily credits**. At 2 runs/day = **~$10–20/year + 600 Tavily credits/month** (free tier is 1000).
 
 ---
 
@@ -105,19 +104,15 @@ For each `runResearch(target, skill, triggeredBy)` call:
    Tavily score                                      │
               │                                      │
               ▼                                      │
-   Truncate each source's content to                 │
-   MAX_CHARS_PER_SOURCE (4000 chars ≈ 1000 toks)     │
-              │                                      │
-              ▼                                      │
-   Cap at 100 final sources (safety ceiling;         │
-   natural ceiling is ~30–40)                        │
-              │                                      ▼
-              │                            Other tools' output
-              │                            (Land Registry rows,
-              │                             ONS context, etc.)
-              │                                      │
-              └──────────────────┬──────────────────┘
-                                 ▼
+   Truncate each source's content to
+   max_chars_per_source (default 4000 ≈ 1000 toks).
+   Global setting (CPU lever).
+              │
+              ▼
+   Cap at target.tavily_max_final_sources (default 100).
+   Per-target — natural ceiling is ~30–40.
+              │
+              ▼
                        Passed to Recall step
 ```
 
@@ -166,30 +161,31 @@ Recall is **best-effort** — if the embed call fails or Vectorize is empty, the
 Every run writes one settings row (`last_run_attempt`) that's read on each admin page load. Combined with the `runs` table, this gives four signals visible at a glance:
 
 ```
-┌─ Maintenance ─────────────────────────────────────────────────────────┐
-│                                                                        │
-│  STORED REPORT FILES (R2)                                              │
-│  4 files · no orphans                              [Sweep orphans now] │
-│                                                                        │
-│  ─────────────────────                                                 │
-│                                                                        │
-│  ACTIVITY HEARTBEAT                                                    │
-│  Cron last ran        37 min ago                       (green)         │
-│  Last attempt         success · world-news · 30s ago · manual          │
-│  Last completed run   success · 30s ago · 21.5s                        │
-│  Last run gather      Tavily 10q · 166 raw → 10 (score)               │
-│                       → 10 (URL) → 10 (story) → 10 final               │
-│                                                                        │
-│  ─────────────────────                                                 │
-│                                                                        │
-│  RECALL MEMORY (VECTORIZE)                                             │
-│  Guardrails: layer 2 same-target recents · top-10 semantic ·          │
-│              threshold 0.65 · cap 5 per run                            │
-│                                                                        │
-│  EMBEDDING STATUS                                                      │
-│  Last successful embed JUST NOW                        [Backfill memory] │
-│  8 reports in D1.                                                      │
-└────────────────────────────────────────────────────────────────────────┘
+┌─ System heartbeat ───────────────────────────────────── cron 37m ago ▾ ┐
+│                                                                         │
+│  [in-flight banner — only when a run is currently running]              │
+│                                                                         │
+│  Cron        37m ago · next within the hour                             │
+│  Last 24h    7 runs · 7 ✓ · avg 28s                                     │
+│                                                                         │
+│  Recent runs                                                            │
+│    ✓  World News    2m ago · 14:23 · 19 May · 32.0s                     │
+│    ✓  World News    1h ago · 13:21 · 19 May · 28.0s                     │
+│    ...                                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─ Memory & cleanup ──────── 11 R2 files · no orphans ──────────────── ▾ ┐
+│                                                                         │
+│  Stored report files (R2)                                               │
+│  11 files · no orphans                              [Sweep orphans now] │
+│                                                                         │
+│  Recall memory (Vectorize)                                              │
+│  Guardrails: layer 2 same-target recents · top-10 semantic ·            │
+│              threshold 0.65 · cap 5 per run                             │
+│                                                                         │
+│  Embedding status                                                       │
+│  Last successful embed 12h ago                        [Backfill memory] │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 State sources:
@@ -197,9 +193,10 @@ State sources:
 | Field | Read from | Refresh frequency |
 |---|---|---|
 | Cron last ran | `settings.last_cron_run` | once per cron tick |
-| Last attempt | `settings.last_run_attempt.{started_at, outcome, last_step}` | every step boundary |
-| Last completed run | most recent `runs` row | on each runResearch persist |
-| Last run gather | `settings.last_run_attempt.gather_stats` | overwritten each run |
+| In-flight banner | `settings.last_run_attempt` when `outcome === "in_flight"` | every step boundary |
+| Last 24h digest | `SELECT COUNT/SUM/AVG FROM runs WHERE created_at > now-24h` | every admin page load |
+| Recent runs mini-list | `SELECT runs JOIN targets ORDER BY created_at DESC LIMIT 6` | every admin page load |
+| Per-row gather funnel (Activity card) | `runs.gather_stats_json` (added v9) | written on every persist |
 | R2 stats | live `env.REPORTS.list()` | every admin page load |
 | Embedding status | `settings.embed_last_ok_at` / `embed_last_error` | every embedReport call |
 
@@ -334,10 +331,10 @@ The full markdown of every report. `text/markdown; charset=utf-8`. Never queried
 
 | File | Lines | What's in it |
 | --- | --- | --- |
-| [src/apis.ts](src/apis.ts) | ~540 | Five tool integrations (Tavily search/extract, Land Registry SPARQL, ONS via postcodes.io, data.police.uk, Companies House) + `TOOLS` registry. All fetches accept an optional `AbortSignal`. |
-| [src/agent.ts](src/agent.ts) | ~1880 | Targets / skills / reports CRUD, `runChat()` dispatcher (Workers AI + Anthropic via AI Gateway, signal-aware), `parseSkillTools` (multi-tool), `gatherSources` dispatch + per-tool gatherers (with Tavily score filter), `runResearch` loop (now signal-threaded for guardrails), `cronTick` (with `reapStalledRun` watchdog), budget gates, and the `ResearchRunner` Durable Object class wrapping manual runs in a 15-min alarm budget |
-| [src/index.ts](src/index.ts) | ~545 | HTTP routing (incl. `/static/tailwind.v1.css` from R2 + `/admin/targets/:slug/run` which now hands off to the ResearchRunner DO via `stub.scheduleManualRun(...)`), auth/cookie, `readForm`, `scheduled` handler, security headers, re-export of `ResearchRunner` for Cloudflare's runtime to find |
-| [src/dashboard.ts](src/dashboard.ts) | ~1430 | All HTML rendering: public pages + admin pages (incl. `/admin/tools`), markdown renderer with `<sup class="cite">` citation rewriter, canonical Sources footer from D1, `stripMarkdown()` helper for snippets, shared `renderGatherFunnel()` helper used by the heartbeat, per-row Activity, and report page |
+| [src/apis.ts](src/apis.ts) | ~150 | Tavily integration (search + extract) and the `TOOLS` registry. All fetches accept an optional `AbortSignal`. |
+| [src/agent.ts](src/agent.ts) | ~1900 | Targets (with per-target Tavily knobs) / skills (with explicit `tool_slug` etc. columns) / reports CRUD, `runChat()` dispatcher (Workers AI + Anthropic via AI Gateway, signal-aware), `skillToolCalls(skill)` (column-based), `gatherSources` (Tavily only today), `planResearch(n)` with N-scaling prompt, `runResearch` loop (signal-threaded for guardrails), `cronTick` (with `reapStalledRun` watchdog), budget gates, and the `ResearchRunner` Durable Object class wrapping manual runs in a 15-min alarm budget |
+| [src/index.ts](src/index.ts) | ~660 | HTTP routing (public pages, gated `/api/*` JSON endpoints with `requireApiKey()`, `/static/tailwind.v2.css` from R2, admin CRUD, `/admin/targets/:slug/run` → ResearchRunner DO), auth/cookie, `readForm`, `scheduled` handler, security headers, re-export of `ResearchRunner` |
+| [src/dashboard.ts](src/dashboard.ts) | ~2100 | All HTML rendering: public pages + admin pages (Console, dedicated `/admin/targets`, skills, tools, target edit), markdown renderer with `<sup class="cite">` citation rewriter, canonical Sources footer from D1, shared `renderGatherFunnel()` helper, the `renderHeartbeatCard` (24h digest + recent-runs mini-list) |
 
 Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run build:css` and served from R2 (not bundled into the Worker).
 
@@ -345,16 +342,25 @@ Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 
 ## HTTP API surface
 
-### Public (no auth)
+### Public HTML (no auth)
 
 | Method | Path | Returns |
 | --- | --- | --- |
 | GET | `/` | Home — list of active targets |
 | GET | `/target/:slug` | Target page with all reports |
-| GET | `/skill/:slug` | Skill detail with procedure |
-| GET | `/report/:id` | Single report |
-| GET | `/api/targets` | Active targets (JSON) |
-| GET | `/api/skills` | Skills (JSON, without `procedure_md`) |
+| GET | `/skill/:slug` | Skill detail with writer instructions |
+| GET | `/report/:id` | Single report (date + word count only on header — no admin info) |
+
+### JSON API (gated by `X-API-Key: <WATCHOMACHO_API_KEY>`)
+
+`requireApiKey()` runs before every `/api/*` GET. Missing secret → 503. Missing/wrong header → 401. Constant-time compare.
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/targets` | Active targets |
+| GET | `/api/skills` | Skill list |
+| GET | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Slim — summary + source_count, no body. |
+| GET | `/api/reports/:id` | Full report — D1 metadata + R2 `body_markdown` + `sources[]` with `kind: "web" \| "archive"` |
 
 ### Admin (cookie auth, set via `/admin/login`)
 
@@ -363,20 +369,24 @@ Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 | GET | `/admin/login` | Login page |
 | POST | `/admin/login` | Set admin cookie. IP-throttled. |
 | POST | `/admin/logout` | Clear cookie |
-| GET | `/admin` | Overview |
+| GET | `/admin` | Console — heartbeat + settings + cleanup + diagnostics |
+| GET | `/admin/targets` | Dedicated targets list + add form |
+| GET | `/admin/targets/:slug` | Target edit page (Configure + Activity) |
+| POST | `/admin/targets` | Create target |
+| POST | `/admin/targets/:slug/update` | Patch target (incl. per-target Tavily knobs) |
+| POST | `/admin/targets/:slug/run` | Run immediately (routes through DO) |
+| POST | `/admin/targets/:slug/delete` | Delete target + reports |
 | GET | `/admin/skills` | Skill library |
-| GET | `/admin/tools` | Read-only catalog of all five tools and their skill-markdown headers |
-| POST | `/admin/skills` | Create skill — `mode=synthesize&brief=…` OR `mode=write&name&procedure_md` |
+| POST | `/admin/skills` | Create skill — `mode=synthesize&brief=…` OR `mode=write` with `tool_slug`, `tool_op`, `topic`, `time_range`, `depth`, `procedure_md` |
 | POST | `/admin/skills/:slug/update` | Edit skill |
 | POST | `/admin/skills/:slug/delete` | Delete skill |
-| POST | `/admin/targets` | Create target — `name`, optional `kind`, `description`, `cadence_hours`, `skill_slug`, `run_now` |
-| GET | `/admin/targets/:slug` | Edit page |
-| POST | `/admin/targets/:slug/update` | Patch target |
-| POST | `/admin/targets/:slug/run` | Run immediately |
-| POST | `/admin/targets/:slug/delete` | Delete target + reports |
+| GET | `/admin/tools` | Read-only catalog (Tavily only today) |
 | GET | `/admin/settings` | Current settings + usage (JSON) |
-| POST | `/admin/settings` | Update budgets |
+| POST | `/admin/settings` | Update budgets + run guardrails |
 | POST | `/admin/cron/tick` | Run a cron tick now (testing) |
+| POST | `/admin/storage/gc` | Sweep R2 orphans |
+| POST | `/admin/memory/backfill` | Re-embed every report into Vectorize |
+| POST | `/admin/reports/:id/delete` | Delete a single report |
 
 ---
 
@@ -463,8 +473,8 @@ Daily budget gates stop early on `BudgetExceeded`.
 | Secret | Required? | Purpose |
 | --- | --- | --- |
 | `ADMIN_SECRET` | yes | Admin panel password. Generate with `openssl rand -hex 32`. |
-| `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search/extract is skipped — reports rely on LLM general knowledge + whichever typed tools the skill declares. |
-| `CH_API_KEY` | optional | Companies House developer API key (free, register at developer.company-information.service.gov.uk). Only needed if a skill calls the `companies_house` tool. Without it that one tool short-circuits to no results; everything else keeps working. |
+| `TAVILY_API_KEY` | recommended | Tavily Researcher Free plan key (1000 credits/month). Without it, web search/extract is skipped — reports rely on LLM general knowledge only. |
+| `WATCHOMACHO_API_KEY` | required for `/api/*` | Read-only key callers (daylila etc.) send in the `X-API-Key` header. Generate with `openssl rand -hex 32`. Unset → all `/api/*` endpoints return 503. |
 | `AI_GATEWAY_ACCOUNT_ID` | optional | Cloudflare account ID (hex string in any dashboard URL). Required if you use `anthropic/...` chat models via AI Gateway. |
 | `AI_GATEWAY_NAME` | optional | The gateway name you created in CF dashboard → AI → AI Gateway (e.g. `watchomacho`). Same requirement as `AI_GATEWAY_ACCOUNT_ID`. |
 | `CF_AIG_TOKEN` | one of these two | Cloudflare API token with `AI Gateway: Run` scope. Enables Unified Billing — Cloudflare pays Anthropic on your behalf via prepaid credits loaded into your CF account. Single invoice. |

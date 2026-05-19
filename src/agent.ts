@@ -11,10 +11,6 @@
 
 import { DurableObject } from "cloudflare:workers";
 import {
-  companiesHouseSearch,
-  landRegSoldPrices,
-  onsContext,
-  policeCrimes,
   tavilyExtract,
   tavilySearch,
   TOOLS,
@@ -27,6 +23,11 @@ export interface Env {
   REPORTS: R2Bucket;
   MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
+  /** Read-only API key for /api/reports/* endpoints. Set via:
+   *    wrangler secret put WATCHOMACHO_API_KEY
+   *  Callers send it in the `X-API-Key` header. If unset, all /api/*
+   *  endpoints return 401 — read-only access stays explicitly gated. */
+  WATCHOMACHO_API_KEY?: string;
   TAVILY_API_KEY?: string;
   CH_API_KEY?: string;                 // Companies House developer API key (optional)
   // ─── AI Gateway (optional; enables `anthropic/...` chat models) ──────────
@@ -292,6 +293,12 @@ export interface Target {
   primary_skill_id: string | null;
   last_run_at: number | null;
   next_run_at: number | null;
+  // Per-target Tavily knobs (v11). NULL = use the global default. The
+  // planner reads queries_per_run to decide how many queries to ask for;
+  // gather reads the two scoring/cap knobs.
+  queries_per_run: number | null;
+  tavily_min_score: number | null;
+  tavily_max_final_sources: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -372,7 +379,19 @@ export async function listTargets(env: Env, status?: string): Promise<Target[]> 
 export async function updateTarget(
   env: Env,
   id: string,
-  patch: Partial<Pick<Target, "kind" | "description" | "status" | "cadence_hours" | "primary_skill_id">>,
+  patch: Partial<
+    Pick<
+      Target,
+      | "kind"
+      | "description"
+      | "status"
+      | "cadence_hours"
+      | "primary_skill_id"
+      | "queries_per_run"
+      | "tavily_min_score"
+      | "tavily_max_final_sources"
+    >
+  >,
 ): Promise<void> {
   const sets: string[] = [];
   const args: any[] = [];
@@ -396,6 +415,25 @@ export async function updateTarget(
     sets.push("primary_skill_id = ?");
     args.push(patch.primary_skill_id);
   }
+  // The three Tavily knobs accept NULL ("use the global default") explicitly.
+  if (patch.queries_per_run !== undefined) {
+    sets.push("queries_per_run = ?");
+    args.push(patch.queries_per_run === null
+      ? null
+      : Math.max(1, Math.min(20, Math.floor(patch.queries_per_run))));
+  }
+  if (patch.tavily_min_score !== undefined) {
+    sets.push("tavily_min_score = ?");
+    args.push(patch.tavily_min_score === null
+      ? null
+      : Math.max(0, Math.min(1, Math.round(patch.tavily_min_score * 100) / 100)));
+  }
+  if (patch.tavily_max_final_sources !== undefined) {
+    sets.push("tavily_max_final_sources = ?");
+    args.push(patch.tavily_max_final_sources === null
+      ? null
+      : Math.max(1, Math.min(200, Math.floor(patch.tavily_max_final_sources))));
+  }
   if (sets.length === 0) return;
   sets.push("updated_at = ?");
   args.push(Date.now());
@@ -407,7 +445,10 @@ export async function updateTarget(
 
 /** R2 keys that aren't reports and must never be considered orphans. Bump
  *  this set when adding new static assets. */
-const R2_STATIC_KEEP: ReadonlySet<string> = new Set(["static/tailwind.v1.css"]);
+const R2_STATIC_KEEP: ReadonlySet<string> = new Set([
+  "static/tailwind.v1.css",   // legacy, kept for any still-cached pages
+  "static/tailwind.v2.css",   // current
+]);
 
 /** Scan R2 once, returning total object count and the keys not referenced by
  *  any `reports.r2_key`. Shared by the count-only admin display and the
@@ -639,60 +680,40 @@ export interface Skill {
   slug: string;
   name: string;
   description: string | null;
+  /** The writer instructions, free-text markdown. Goes verbatim into the
+   *  planner + writer system prompts. NO magic header parsing — tool
+   *  selection lives in tool_slug/tool_op/tool_params_json. */
   procedure_md: string;
+  /** Tool selection (v10). NULL = writer-only skill, no data gathering. */
+  tool_slug: string | null;
+  tool_op: string | null;
+  tool_params_json: string | null;
+  tool_sources_json: string | null;
   author: "user" | "agent";
   used_count: number;
   created_at: number;
   updated_at: number;
 }
 
-/** Build the synthesis prompt by rendering the TOOLS catalog dynamically.
- *  Called once per synthesizeSkill invocation. When a new tool is added to
- *  apis.ts it shows up here automatically — no manual prompt update needed. */
+/** System prompt used when the agent synthesises a brand-new skill from a
+ *  one-line brief. Produces just the writer instructions — the caller picks
+ *  the tool config separately via the form (default: tavily/search). */
 function buildSkillTemplate(): string {
-  const toolBlocks = Object.values(TOOLS).map((tool) => {
-    const ops = Object.entries(tool.operations)
-      .map(
-        ([opName, op]) =>
-          `  - ${opName}: ${op.description}\n      When to use: ${op.when_to_use}`,
-      )
-      .join("\n");
-    const headers = tool.headers
-      .map((h) => `    **${h.key}:** ${h.values}`)
-      .join("\n");
-    return `${tool.display} — ${tool.summary}\n  Operations:\n${ops}\n  Headers:\n${headers}`;
-  }).join("\n\n");
+  return `You are designing the writer instructions for a reusable research skill. Output a plain markdown document that will be fed verbatim to two LLM steps:
+  1. The PLANNER — turns these instructions into web search queries.
+  2. The WRITER — turns the gathered sources into the final report.
 
-  return `You are designing a reusable research skill for an AI agent that produces markdown reports.
-
-Available tools you can call from a skill:
-
-${toolBlocks}
-
-A skill can declare ONE OR MORE tools (one of each). Each tool is declared by its op header (e.g. **Tavily op:** search or **Land Registry op:** sold-prices). Headers are case-sensitive. Only add tool headers the brief actually justifies — don't over-declare.
-
-Given the skill brief below, write a procedure document with these sections, in plain markdown:
-
-# {Skill Name}
+Required sections:
 
 **Purpose:** one sentence describing what this skill researches.
 
 **When to use:** the kind of target this works on (postcodes, companies, people, topics, places).
 
-(Optional tool headers here — see catalog above. Examples:
-  • "hourly news on X" → **Tavily op:** search + **Search topic:** news + **Time range:** day
-  • "UK postcode dossier" → **Tavily op:** search + **Land Registry op:** sold-prices + **ONS op:** context + **Police op:** crimes
-  • "specific RSS feeds" → **Tavily op:** extract + **Sources:** bulleted URL list
-Don't add headers you don't need.)
-
 **Approach:** 3–6 sentences. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
 
-**Search queries:** 4–8 web search queries to run, each using the placeholder \`{target}\` for the target name. Each on its own bulleted line. Skip this section if no Tavily search op is declared (extract uses **Sources:** instead, and pure typed-tool skills don't need search queries).
+**Output structure:** the headings the final report should use, with one sentence each describing what goes under each heading. Do not include a "Sources" heading — the page renders one automatically.
 
-**Output structure:** the headings the final report should use, with one sentence each describing what goes under each heading. End with a "Sources" section.
-
-Be specific. The agent will execute this procedure literally. Do not include any preamble or commentary outside the document.
-`;
+Do NOT include "Tool:" or "Search topic:" headers — tool selection happens in the skill form, not in the markdown. Do not include any preamble or commentary outside the document.`;
 }
 
 export async function listSkills(env: Env): Promise<Skill[]> {
@@ -728,28 +749,68 @@ async function uniqueSkillSlug(env: Env, base: string): Promise<string> {
   }
 }
 
-/** Save a skill the user wrote by hand. The full procedure_md is supplied. */
+/** Sensible defaults for a brand-new Tavily/search skill. Centralised so the
+ *  hand-write path, synth path, and migration backfill all stay aligned. */
+const DEFAULT_TOOL_SLUG = "tavily";
+const DEFAULT_TOOL_OP = "search";
+
+/** Validate a tool/op pair against the live TOOLS registry. Returns the
+ *  normalised pair, or throws. NULL tool_slug = writer-only skill (no
+ *  gather step). */
+function normaliseToolConfig(input: { tool_slug?: string | null; tool_op?: string | null }):
+  { tool_slug: string | null; tool_op: string | null }
+{
+  if (!input.tool_slug) return { tool_slug: null, tool_op: null };
+  const tool = TOOLS[input.tool_slug];
+  if (!tool) throw new Error(`unknown tool slug: ${input.tool_slug}`);
+  const op = (input.tool_op ?? "").toLowerCase();
+  if (!op || !(op in tool.operations)) {
+    throw new Error(`unknown op "${op}" for tool ${input.tool_slug}`);
+  }
+  return { tool_slug: input.tool_slug, tool_op: op };
+}
+
+/** Save a skill the user wrote by hand. */
 export async function createSkillFromMarkdown(
   env: Env,
-  input: { name: string; description?: string; procedure_md: string },
+  input: {
+    name: string;
+    description?: string;
+    procedure_md: string;
+    tool_slug?: string | null;
+    tool_op?: string | null;
+    tool_params?: Record<string, string>;
+    tool_sources?: string[];
+  },
 ): Promise<Skill> {
   const name = input.name.trim();
   if (!name) throw new Error("name required");
   const procedure_md = input.procedure_md.trim();
   if (procedure_md.length < 30) throw new Error("procedure_md too short");
+
+  const { tool_slug, tool_op } = normaliseToolConfig({
+    tool_slug: input.tool_slug === undefined ? DEFAULT_TOOL_SLUG : input.tool_slug,
+    tool_op: input.tool_op === undefined ? DEFAULT_TOOL_OP : input.tool_op,
+  });
+  const tool_params_json = input.tool_params ? JSON.stringify(input.tool_params) : null;
+  const tool_sources_json = input.tool_sources?.length
+    ? JSON.stringify(input.tool_sources)
+    : null;
+
   const slug = await uniqueSkillSlug(env, name);
   const id = uid();
   const now = Date.now();
   await env.DB.prepare(
-    `INSERT INTO skills (id, slug, name, description, procedure_md, author, used_count, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'user', 0, ?, ?)`,
+    `INSERT INTO skills (id, slug, name, description, procedure_md, tool_slug, tool_op, tool_params_json, tool_sources_json, author, used_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', 0, ?, ?)`,
   )
-    .bind(id, slug, name, input.description ?? null, procedure_md, now, now)
+    .bind(id, slug, name, input.description ?? null, procedure_md, tool_slug, tool_op, tool_params_json, tool_sources_json, now, now)
     .run();
   return (await getSkillById(env, id))!;
 }
 
-/** Ask the LLM to write a fresh skill from a one-line brief. */
+/** Ask the LLM to write a fresh skill from a one-line brief. Tool selection
+ *  defaults to tavily/search (the user can change it on the skill page). */
 export async function synthesizeSkill(
   env: Env,
   input: { name?: string; brief: string },
@@ -767,14 +828,12 @@ export async function synthesizeSkill(
   const procedure_md = res.response.trim();
   if (procedure_md.length < 60) throw new Error("LLM returned an empty / too-short skill document");
 
-  // Pull a name out of the first H1 if the brief didn't supply one.
   const heading = procedure_md.match(/^#\s+(.+?)\s*$/m);
   const inferredName = (input.name ?? heading?.[1] ?? brief).trim().slice(0, 80) || "Untitled skill";
   const slug = await uniqueSkillSlug(env, inferredName);
   const id = uid();
   const now = Date.now();
 
-  // One-line description: first non-empty line that isn't the H1.
   const description = procedure_md
     .split("\n")
     .map((l) => l.trim())
@@ -783,10 +842,10 @@ export async function synthesizeSkill(
     .slice(0, 200) ?? null;
 
   await env.DB.prepare(
-    `INSERT INTO skills (id, slug, name, description, procedure_md, author, used_count, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'agent', 0, ?, ?)`,
+    `INSERT INTO skills (id, slug, name, description, procedure_md, tool_slug, tool_op, tool_params_json, tool_sources_json, author, used_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'agent', 0, ?, ?)`,
   )
-    .bind(id, slug, inferredName, description, procedure_md, now, now)
+    .bind(id, slug, inferredName, description, procedure_md, DEFAULT_TOOL_SLUG, DEFAULT_TOOL_OP, now, now)
     .run();
   return (await getSkillById(env, id))!;
 }
@@ -794,7 +853,12 @@ export async function synthesizeSkill(
 export async function updateSkill(
   env: Env,
   id: string,
-  patch: Partial<Pick<Skill, "name" | "description" | "procedure_md">>,
+  patch: Partial<
+    Pick<Skill, "name" | "description" | "procedure_md" | "tool_slug" | "tool_op">
+  > & {
+    tool_params?: Record<string, string> | null;
+    tool_sources?: string[] | null;
+  },
 ): Promise<void> {
   const sets: string[] = [];
   const args: any[] = [];
@@ -809,6 +873,22 @@ export async function updateSkill(
   if (patch.procedure_md !== undefined) {
     sets.push("procedure_md = ?");
     args.push(patch.procedure_md);
+  }
+  if (patch.tool_slug !== undefined || patch.tool_op !== undefined) {
+    const { tool_slug, tool_op } = normaliseToolConfig({
+      tool_slug: patch.tool_slug,
+      tool_op: patch.tool_op,
+    });
+    sets.push("tool_slug = ?", "tool_op = ?");
+    args.push(tool_slug, tool_op);
+  }
+  if (patch.tool_params !== undefined) {
+    sets.push("tool_params_json = ?");
+    args.push(patch.tool_params ? JSON.stringify(patch.tool_params) : null);
+  }
+  if (patch.tool_sources !== undefined) {
+    sets.push("tool_sources_json = ?");
+    args.push(patch.tool_sources?.length ? JSON.stringify(patch.tool_sources) : null);
   }
   if (sets.length === 0) return;
   sets.push("updated_at = ?");
@@ -867,21 +947,42 @@ interface SourceCitation {
   url: string;
 }
 
-/** Step 1: ask the LLM what to search for. Returns an array of queries with
- *  {target} placeholders already expanded. */
-async function planResearch(env: Env, skill: Skill, target: Target, model: string, signal?: AbortSignal): Promise<ResearchPlan> {
+/** Build the planner's system prompt for a target asking for N queries.
+ *  Scales: N=1 says "the single most important query"; N=2-3 says "EXACTLY
+ *  N focused queries"; N≥5 also coaches angles + outlet diversity. */
+function plannerSystemPrompt(n: number): string {
+  const intro =
+    `You are the planning step of a research agent.\n` +
+    `You are given a SKILL (the writer instructions) and a TARGET (the thing being researched).\n` +
+    `Return ONLY a JSON object: { "queries": [string, ...] }.`;
+  const placeholder =
+    `Replace any "{target}" placeholder in the skill with the target's name. Use specific, narrow queries — not "everything about X". No extra text outside the JSON.`;
+
+  if (n <= 1) {
+    return `${intro}\nReturn exactly ONE query — the single most important angle for this target + skill combination.\n${placeholder}`;
+  }
+  if (n <= 4) {
+    return `${intro}\nReturn EXACTLY ${n} focused web search queries — distinct angles, no duplicates.\n${placeholder}`;
+  }
+  return `${intro}
+Return EXACTLY ${n} concrete web search queries — always ${n}, never fewer.
+If you can't think of ${n} obviously distinct angles, broaden the net: cover different regions, different outlets (Reuters, AP, BBC, Al Jazeera, Le Monde, Deutsche Welle, Nikkei Asia, etc.), different sectors (politics, conflicts, markets, science, society, climate, sports). It is far better to produce ${n} queries of varying angle than to under-plan.
+${placeholder}`;
+}
+
+/** Step 1: ask the LLM what to search for. Returns up to N queries with
+ *  {target} placeholders already expanded. N comes from the target. */
+async function planResearch(
+  env: Env,
+  skill: Skill,
+  target: Target,
+  n: number,
+  model: string,
+  signal?: AbortSignal,
+): Promise<ResearchPlan> {
   const res = await runChat(env, model, {
     messages: [
-      {
-        role: "system",
-        content:
-          `You are the planning step of a research agent.
-You are given a SKILL (a procedure document) and a TARGET (the thing being researched).
-Return ONLY a JSON object: { "queries": [string, ...] }
-with EXACTLY 10 concrete web search queries — always 10, never fewer.
-If you can't think of 10 obviously distinct angles, broaden the net: cover different regions, different outlets (Reuters, AP, BBC, Al Jazeera, Le Monde, Deutsche Welle, Nikkei Asia, etc.), different sectors (politics, conflicts, markets, science, society, climate, sports). It is far better to produce 10 queries of varying angle than to under-plan.
-Replace any "{target}" placeholder in the skill with the target's name. Use specific, narrow queries — not "everything about X". No extra text outside the JSON.`,
-      },
+      { role: "system", content: plannerSystemPrompt(n) },
       {
         role: "user",
         content: `SKILL\n=====\n${skill.procedure_md}\n\nTARGET\n======\nName: ${target.name}\nKind: ${target.kind ?? "(unspecified)"}\nDescription: ${target.description ?? "(none)"}\n\nReturn the JSON plan now.`,
@@ -898,7 +999,7 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
         const queries = parsed.queries
           .map((q: any) => String(q).trim())
           .filter((q: string) => q && q.length <= 250)
-          .slice(0, 10);
+          .slice(0, n);
         if (queries.length > 0) return { queries };
       }
     } catch {
@@ -906,7 +1007,7 @@ Replace any "{target}" placeholder in the skill with the target's name. Use spec
     }
   }
   // Fallback: a generic query so the run doesn't die.
-  return { queries: [`${target.name}`, `${target.name} ${skill.name}`] };
+  return { queries: [`${target.name}`, `${target.name} ${skill.name}`].slice(0, Math.max(1, n)) };
 }
 
 // One row of gathered evidence — same shape regardless of whether it came
@@ -941,79 +1042,47 @@ const DEFAULT_MAX_RUN_SECONDS = 90;
 // Default; can be overridden per-run via the `max_final_sources` setting.
 const DEFAULT_MAX_FINAL_SOURCES = 100;
 
-// A skill can declare ONE OR MORE tool calls. Each call records which tool
-// slug, which op, and the per-tool parameters parsed from the skill's
-// markdown headers (e.g. "Months" → "6"). `sources` is Tavily-extract-only.
+// A skill declares one tool call (or none, for writer-only skills). Built
+// from the skill's explicit columns (v10+) rather than parsed from markdown.
 export interface SkillToolCall {
   tool: string;                       // TOOLS slug, e.g. "tavily"
-  op: string;                         // op name, e.g. "search" | "sold-prices"
-  params: Record<string, string>;     // header key → raw value
+  op: string;                         // op name, e.g. "search" | "extract"
+  params: Record<string, string>;     // op-specific knobs (topic, time_range…)
   sources?: string[];                 // Tavily extract URL list
 }
 
-// Each tool's op header key. Convention: "<display> op", but a few diverge
-// (e.g. "Tavily op" not "Tavily op"). Source of truth lives here so the
-// parser doesn't have to guess from `display`.
-const OP_HEADER_BY_TOOL: Record<string, string> = {
-  tavily: "Tavily op",
-  land_registry: "Land Registry op",
-  ons: "ONS op",
-  police: "Police op",
-  companies_house: "Companies House op",
-};
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Parse all tool declarations in a skill's procedure markdown. A skill may
- *  declare any subset of the registered tools (one of each). Returns a list
- *  of tool calls; an empty list of declarations defaults to a single Tavily
- *  search call so existing skills keep working unchanged. */
-export function parseSkillTools(procedureMd: string): SkillToolCall[] {
-  const calls: SkillToolCall[] = [];
-
-  for (const tool of Object.values(TOOLS)) {
-    const opHeader = OP_HEADER_BY_TOOL[tool.slug];
-    if (!opHeader) continue;
-    const opPattern = new RegExp(`\\*\\*${escapeRegex(opHeader)}:\\*\\*\\s*([A-Za-z0-9_-]+)`, "i");
-    const opMatch = procedureMd.match(opPattern);
-    if (!opMatch) continue;
-
-    const op = opMatch[1].toLowerCase();
-    const validOps = Object.keys(tool.operations).map((o) => o.toLowerCase());
-    if (!validOps.includes(op)) continue;
-
-    const params: Record<string, string> = {};
-    for (const h of tool.headers) {
-      if (h.key === opHeader) continue;
-      if (h.key === "Sources") continue;     // parsed specially below
-      const p = new RegExp(`\\*\\*${escapeRegex(h.key)}:\\*\\*\\s*(.+)`, "i");
-      const m = procedureMd.match(p);
-      if (m) params[h.key] = m[1].trim();
-    }
-
-    let sources: string[] | undefined;
-    if (tool.slug === "tavily" && op === "extract") {
-      const block = procedureMd.match(
-        /\*\*Sources:\*\*\s*\n([\s\S]*?)(?:\n\s*\n|\n\*\*|\n#|$)/i,
-      );
-      if (block) {
-        sources = block[1]
-          .split("\n")
-          .map((l) => l.replace(/^\s*[-*]\s+/, "").trim())
-          .filter((l) => /^https?:\/\//i.test(l));
+/** Build the run-time tool-call list from a skill's explicit columns.
+ *  Returns [] if the skill is writer-only (no tool_slug set). */
+export function skillToolCalls(skill: Skill): SkillToolCall[] {
+  if (!skill.tool_slug || !skill.tool_op) return [];
+  const tool = TOOLS[skill.tool_slug];
+  if (!tool || !(skill.tool_op in tool.operations)) {
+    console.warn(`skillToolCalls: skill "${skill.slug}" references unknown ${skill.tool_slug}/${skill.tool_op}`);
+    return [];
+  }
+  let params: Record<string, string> = {};
+  if (skill.tool_params_json) {
+    try {
+      const parsed = JSON.parse(skill.tool_params_json);
+      if (parsed && typeof parsed === "object") {
+        params = Object.fromEntries(
+          Object.entries(parsed).map(([k, v]) => [k, String(v ?? "")]),
+        );
       }
+    } catch (e) {
+      console.warn(`skillToolCalls: bad tool_params_json for skill ${skill.slug}:`, e);
     }
-
-    calls.push({ tool: tool.slug, op, params, sources });
   }
-
-  // Default: no tool declared → single Tavily search (backwards-compat).
-  if (calls.length === 0) {
-    calls.push({ tool: "tavily", op: "search", params: {} });
+  let sources: string[] | undefined;
+  if (skill.tool_sources_json) {
+    try {
+      const parsed = JSON.parse(skill.tool_sources_json);
+      if (Array.isArray(parsed)) sources = parsed.map((s) => String(s));
+    } catch (e) {
+      console.warn(`skillToolCalls: bad tool_sources_json for skill ${skill.slug}:`, e);
+    }
   }
-  return calls;
+  return [{ tool: skill.tool_slug, op: skill.tool_op, params, sources }];
 }
 
 /** Funnel stats from a single Tavily search batch, surfaced to the admin
@@ -1061,11 +1130,10 @@ function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
   return union === 0 ? 0 : intersect / union;
 }
 
-/** Step 2: gather evidence by dispatching each tool call to its handler.
- *  Each handler returns zero or more GatheredSource rows in the common
- *  `{ title, url, content }` shape; typed tools flatten their structured
- *  output to markdown so the writer LLM doesn't need to know the shape.
- *  Returns the stats funnel alongside the sources so admin can surface
+/** Step 2: gather evidence by dispatching the skill's tool call. Today
+ *  the only tool is Tavily. Adding a new one means: write the fetcher in
+ *  apis.ts, add a case here, add the registry entry. The funnel stats are
+ *  surfaced to the admin Maintenance heartbeat as
  *  "Tavily 142 → 87 (score) → 71 (URL) → 34 (story) → 30 final". */
 async function gatherSources(
   env: Env,
@@ -1090,7 +1158,7 @@ async function gatherSources(
     try {
       switch (c.tool) {
         case "tavily": {
-          const { sources, stats: tavilyStats } = await gatherTavily(env, queries, c, signal);
+          const { sources, stats: tavilyStats } = await gatherTavily(env, queries, target, c, signal);
           stats.tavily_queries += tavilyStats.tavily_queries;
           stats.tavily_raw += tavilyStats.tavily_raw;
           stats.after_score_filter += tavilyStats.after_score_filter;
@@ -1099,18 +1167,6 @@ async function gatherSources(
           out.push(...sources);
           break;
         }
-        case "land_registry":
-          out.push(...(await gatherLandRegistry(c, target)));
-          break;
-        case "ons":
-          out.push(...(await gatherOns(c, target)));
-          break;
-        case "police":
-          out.push(...(await gatherPolice(c, target)));
-          break;
-        case "companies_house":
-          out.push(...(await gatherCompaniesHouse(env, c, target)));
-          break;
         default:
           console.warn(`gatherSources: unknown tool slug "${c.tool}"`);
       }
@@ -1119,15 +1175,15 @@ async function gatherSources(
     }
   }
 
-  // Both caps are read from settings on every run so they can be tuned
-  // live from the Search tuning admin card without redeploying. The writer
-  // prompt size = finalSourcesCap × maxCharsPerSource — that string is the
-  // dominant CPU spend, so these two knobs are how you stay under the
-  // Workers Free 10ms CPU cap.
-  const [finalSourcesCap, maxCharsPerSource] = await Promise.all([
-    readIntSetting(env, "max_final_sources", DEFAULT_MAX_FINAL_SOURCES, 1, 200),
-    readIntSetting(env, "max_chars_per_source", DEFAULT_MAX_CHARS_PER_SOURCE, 200, 8000),
-  ]);
+  // max_final_sources is per-target (NULL = global default). max_chars per
+  // source is a global CPU lever — same prompt-size pressure across every
+  // run, so it stays in settings.
+  const finalSourcesCap = target.tavily_max_final_sources != null
+    ? Math.max(1, Math.min(200, Math.floor(target.tavily_max_final_sources)))
+    : await readIntSetting(env, "max_final_sources", DEFAULT_MAX_FINAL_SOURCES, 1, 200);
+  const maxCharsPerSource = await readIntSetting(
+    env, "max_chars_per_source", DEFAULT_MAX_CHARS_PER_SOURCE, 200, 8000,
+  );
   const finalSources = out.slice(0, finalSourcesCap).map((s) => ({
     ...s,
     content: s.content.slice(0, maxCharsPerSource),
@@ -1155,6 +1211,7 @@ async function readIntSetting(
 async function gatherTavily(
   env: Env,
   queries: string[],
+  target: Target,
   c: SkillToolCall,
   signal?: AbortSignal,
 ): Promise<{ sources: GatheredSource[]; stats: GatherStats }> {
@@ -1176,14 +1233,17 @@ async function gatherTavily(
     };
   }
 
-  // Ask Tavily for max_results=20 per query (Tavily's hard upper bound).
-  // Cost is per-request (1 credit), not per-result — so 20 results costs the
-  // same as 5. Wider candidate pool = better signal post-filter.
+  // Tavily op params live in tool_params_json as a flat lowercase object
+  // ({ topic, time_range, depth }). Old keys ("Search topic" etc.) are
+  // still recognised for any unbackfilled skill.
+  const p = c.params;
+  const pickLower = (k1: string, k2?: string) =>
+    (p[k1] ?? (k2 ? p[k2] : undefined))?.toLowerCase();
   const opts: TavilySearchOptions = {
-    topic: (c.params["Search topic"]?.toLowerCase() as TavilySearchOptions["topic"]) ?? "general",
-    time_range: c.params["Time range"]?.toLowerCase() as TavilySearchOptions["time_range"],
-    search_depth: (c.params["Depth"]?.toLowerCase() as TavilySearchOptions["search_depth"]) ?? "basic",
-    max_results: 20,
+    topic: (pickLower("topic", "Search topic") as TavilySearchOptions["topic"]) ?? "general",
+    time_range: pickLower("time_range", "Time range") as TavilySearchOptions["time_range"],
+    search_depth: (pickLower("depth", "Depth") as TavilySearchOptions["search_depth"]) ?? "basic",
+    max_results: 20,                  // Tavily's documented hard maximum
   };
   const results = await Promise.all(
     queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts, signal).catch(() => [])),
@@ -1201,15 +1261,16 @@ async function gatherTavily(
 
   const stats: GatherStats = { ...emptyStats, tavily_queries: queries.length, tavily_raw: allRaw.length };
 
-  // Step 1 — drop low-relevance hits. Tavily's `news` topic lets through
-  // off-topic content (Facebook posts, local fluff) with score < ~0.4;
-  // Reuters / AP / BBC primary reporting on the actual query typically
-  // scores 0.7+. 0.4 is the Tavily-documented bottom rail. Admin-editable
-  // via /admin/settings → "Search tuning" card → tavily_min_score.
-  const minScoreRaw = await getSetting(env, "tavily_min_score", "0.4");
-  let MIN_SCORE = parseFloat(minScoreRaw);
+  // Per-target minimum score (NULL = use the global default). Different
+  // targets want different strictness — a news brief tolerates noise,
+  // a postcode dossier doesn't.
+  let MIN_SCORE = target.tavily_min_score ?? null;
+  if (MIN_SCORE == null) {
+    const raw = await getSetting(env, "tavily_min_score", "0.4");
+    MIN_SCORE = parseFloat(raw);
+  }
   if (!Number.isFinite(MIN_SCORE) || MIN_SCORE < 0 || MIN_SCORE > 1) MIN_SCORE = 0.4;
-  const scored = allRaw.filter((r) => r.score >= MIN_SCORE);
+  const scored = allRaw.filter((r) => r.score >= MIN_SCORE!);
   stats.after_score_filter = scored.length;
 
   // Sort by score desc — both dedupe passes below favour higher-scored
@@ -1259,119 +1320,6 @@ async function gatherTavily(
     sources: titleDeduped.map((r) => ({ title: r.title, url: r.url, content: r.content })),
     stats,
   };
-}
-
-async function gatherLandRegistry(c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
-  const postcode = target.name;
-  const months = Math.max(1, Math.min(120, Number(c.params["Months"] ?? 12) || 12));
-  const limit = Math.max(1, Math.min(100, Number(c.params["Limit"] ?? 50) || 50));
-  const rows = await landRegSoldPrices(postcode, { months, limit });
-  if (rows.length === 0) return [];
-  const lines = [
-    `| Date | Address | Type | Paid |`,
-    `|---|---|---|---|`,
-    ...rows.map(
-      (r) =>
-        `| ${r.date} | ${[r.paon, r.saon, r.street, r.town].filter(Boolean).join(", ") || "—"} | ${r.type} | ${r.paid_display} |`,
-    ),
-  ];
-  return [
-    {
-      title: `HM Land Registry — sold prices in ${postcode} (last ${months} months, ${rows.length} transactions)`,
-      url: `https://landregistry.data.gov.uk/app/qonsole`,
-      content: lines.join("\n"),
-    },
-  ];
-}
-
-async function gatherOns(_c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
-  const postcode = target.name;
-  const ctx = await onsContext(postcode);
-  if (!ctx) return [];
-  const lines = [
-    `**Postcode:** ${ctx.postcode}`,
-    `**Country:** ${ctx.country}`,
-    ctx.region ? `**Region:** ${ctx.region}` : null,
-    ctx.admin_district ? `**Council district:** ${ctx.admin_district}` : null,
-    ctx.admin_ward ? `**Ward:** ${ctx.admin_ward}` : null,
-    ctx.parliamentary_constituency ? `**Constituency:** ${ctx.parliamentary_constituency}` : null,
-    ctx.lsoa ? `**LSOA:** ${ctx.lsoa}` : null,
-    ctx.msoa ? `**MSOA:** ${ctx.msoa}` : null,
-    ctx.parish ? `**Parish:** ${ctx.parish}` : null,
-  ].filter(Boolean);
-  return [
-    {
-      title: `ONS / postcodes.io context for ${ctx.postcode}`,
-      url: `https://api.postcodes.io/postcodes/${encodeURIComponent(ctx.postcode)}`,
-      content: lines.join("\n"),
-    },
-  ];
-}
-
-async function gatherPolice(c: SkillToolCall, target: Target): Promise<GatheredSource[]> {
-  const postcode = target.name;
-  const months = Math.max(1, Math.min(12, Number(c.params["Months"] ?? 3) || 3));
-  const summary = await policeCrimes(postcode, { months });
-  if (!summary) return [];
-  const catLines = summary.by_category.map((row) => `| ${row.category} | ${row.count} |`);
-  const sampleLines = summary.sample.map(
-    (s) =>
-      `- ${s.month}: ${s.category}${s.street ? ` on ${s.street}` : ""}${s.outcome ? ` — ${s.outcome}` : ""}`,
-  );
-  const lines = [
-    `**Total incidents across ${summary.months_returned.join(", ")}:** ${summary.total}`,
-    ``,
-    `| Category | Count |`,
-    `|---|---|`,
-    ...catLines,
-    ``,
-    `**Recent incidents (sample):**`,
-    ...sampleLines,
-  ];
-  return [
-    {
-      title: `data.police.uk — crime stats near ${postcode} (${summary.months_returned.length} months)`,
-      url: `https://www.police.uk/pu/your-area/?q=${encodeURIComponent(postcode)}`,
-      content: lines.join("\n"),
-    },
-  ];
-}
-
-async function gatherCompaniesHouse(
-  env: Env,
-  c: SkillToolCall,
-  target: Target,
-): Promise<GatheredSource[]> {
-  const limit = Math.max(1, Math.min(50, Number(c.params["Limit"] ?? 10) || 10));
-  let query = target.name;
-  let postcode: string | undefined;
-  if (c.op === "by-postcode") {
-    postcode = (c.params["Postcode"] ?? target.name).trim();
-    query = postcode;
-  }
-  const hits = await companiesHouseSearch(env.CH_API_KEY, query, { limit, postcode });
-  if (hits.length === 0) return [];
-  const lines = [
-    `| Name | Number | Status | Type | Incorporated | Address |`,
-    `|---|---|---|---|---|---|`,
-    ...hits.map(
-      (h) =>
-        `| ${h.name} | ${h.number} | ${h.status} | ${h.type} | ${h.incorporated ?? "?"} | ${h.address} |`,
-    ),
-  ];
-  const opLabel =
-    c.op === "by-postcode" ? `companies at postcode ${postcode}` : `search "${query}"`;
-  const searchUrl =
-    c.op === "by-postcode"
-      ? `https://find-and-update.company-information.service.gov.uk/advanced-search/get-results?registeredOfficeAddress=${encodeURIComponent(postcode ?? "")}`
-      : `https://find-and-update.company-information.service.gov.uk/search/companies?q=${encodeURIComponent(query)}`;
-  return [
-    {
-      title: `Companies House — ${opLabel} (${hits.length} hits)`,
-      url: searchUrl,
-      content: lines.join("\n"),
-    },
-  ];
 }
 
 /** A past report surfaced by the recall layer. Both chronological "what
@@ -1696,16 +1644,21 @@ export async function runResearch(
     // the same model and the persisted report records exactly that model.
     chatModel = await getChatModel(env);
 
-    const calls = parseSkillTools(skill.procedure_md);
-    // Only Tavily search needs LLM-planned queries. Tavily extract uses
-    // explicit URLs; typed tools (Land Registry, ONS, Police, Companies
-    // House) derive their inputs from the target.
+    const calls = skillToolCalls(skill);
+    // Only Tavily search needs LLM-planned queries — extract uses an
+    // explicit URL list, and a writer-only skill has no calls at all.
     const needsQueries = calls.some(
       (c) => c.tool === "tavily" && c.op === "search",
     );
+    // Per-target query count (NULL = global default 10). Plumbs through
+    // to plannerSystemPrompt(n) so the prompt scales with N rather than
+    // shouting "EXACTLY 10".
+    const n = target.queries_per_run != null
+      ? Math.max(1, Math.min(20, Math.floor(target.queries_per_run)))
+      : await readIntSetting(env, "default_queries_per_run", 10, 1, 20);
     await markStep(env, attempt, "plan");
     const queries = needsQueries
-      ? (await planResearch(env, skill, target, chatModel, signal)).queries
+      ? (await planResearch(env, skill, target, n, chatModel, signal)).queries
       : [];
 
     await markStep(env, attempt, "gather");
