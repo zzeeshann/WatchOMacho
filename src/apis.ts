@@ -40,50 +40,68 @@ export interface TavilySearchOptions {
   time_range?: "day" | "week" | "month" | "year";
   search_depth?: "basic" | "advanced";   // basic = 1 credit, advanced = 2
   max_results?: number;                  // default 5
+  include_domains?: string[];            // allow-list (≤300)
+  exclude_domains?: string[];            // block-list (≤150)
+  country?: string;                      // boosts results from this country (general topic only)
 }
 
-/** One Tavily search. Returns up to `max_results` results, each with the
- *  page's extracted content. Returns [] if no key is configured or the API
- *  errored — calling skill will write a thinner report. */
+export interface TavilySearchResponse {
+  results: TavilySearchResult[];
+  credits: number;                       // actual credits charged by Tavily for this call
+}
+
+/** One Tavily search. Returns up to `max_results` results plus the credits
+ *  Tavily charged for the call. Returns empty results / 0 credits if no key
+ *  is configured or the API errored — calling skill will write a thinner
+ *  report. */
 export async function tavilySearch(
   apiKey: string | undefined,
   query: string,
   options: TavilySearchOptions = {},
   signal?: AbortSignal,
-): Promise<TavilySearchResult[]> {
+): Promise<TavilySearchResponse> {
   if (!apiKey) {
     console.warn("tavilySearch: TAVILY_API_KEY not set, skipping query:", query);
-    return [];
+    return { results: [], credits: 0 };
   }
   const q = query.slice(0, 400).trim();
-  if (!q) return [];
+  if (!q) return { results: [], credits: 0 };
+  const body: Record<string, unknown> = {
+    api_key: apiKey,
+    query: q,
+    search_depth: options.search_depth ?? "basic",
+    topic: options.topic ?? "general",
+    time_range: options.time_range,
+    max_results: options.max_results ?? 5,
+    include_raw_content: true,        // we want the page text
+    include_usage: true,              // surface real credit cost in the funnel
+  };
+  if (options.include_domains?.length) body.include_domains = options.include_domains.slice(0, 300);
+  if (options.exclude_domains?.length) body.exclude_domains = options.exclude_domains.slice(0, 150);
+  if (options.country && options.topic !== "news" && options.topic !== "finance") {
+    body.country = options.country;
+  }
   const r = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": UA },
-    body: JSON.stringify({
-      api_key: apiKey,
-      query: q,
-      search_depth: options.search_depth ?? "basic",
-      topic: options.topic ?? "general",
-      time_range: options.time_range,
-      max_results: options.max_results ?? 5,
-      include_raw_content: true,        // we want the page text
-    }),
+    body: JSON.stringify(body),
     signal,
   });
   if (!r.ok) {
-    const body = await r.text().catch(() => "");
-    console.warn(`tavilySearch ${r.status} for "${q}": ${body.slice(0, 200)}`);
-    return [];
+    const errBody = await r.text().catch(() => "");
+    console.warn(`tavilySearch ${r.status} for "${q}": ${errBody.slice(0, 200)}`);
+    return { results: [], credits: 0 };
   }
   const data: any = await r.json();
-  return (data.results ?? []).map((h: any) => ({
+  const results: TavilySearchResult[] = (data.results ?? []).map((h: any) => ({
     title: String(h.title ?? "").trim(),
     url: String(h.url ?? "").trim(),
     content: String(h.raw_content ?? h.content ?? ""),
     score: Number(h.score ?? 0),
     published_date: h.published_date,
   }));
+  const credits = Number(data?.usage?.credits ?? 0);
+  return { results, credits };
 }
 
 export interface TavilyExtractResult {
@@ -91,35 +109,51 @@ export interface TavilyExtractResult {
   raw_content: string;
 }
 
+export interface TavilyExtractResponse {
+  results: TavilyExtractResult[];
+  credits: number;
+}
+
 /** Read a list of URLs in full via Tavily's /extract endpoint. Up to 20 URLs
- *  per call. Returns [] on no key, empty input, or API error. */
+ *  per call. Passing `query` reranks the chunks inside each page against
+ *  intent (huge quality win — without it, results come back in raw page
+ *  order). Returns empty results / 0 credits on no key, empty input, or
+ *  API error. */
 export async function tavilyExtract(
   apiKey: string | undefined,
   urls: string[],
-  extract_depth: "basic" | "advanced" = "basic",
+  options: {
+    extract_depth?: "basic" | "advanced";
+    query?: string;
+  } = {},
   signal?: AbortSignal,
-): Promise<TavilyExtractResult[]> {
-  if (!apiKey || urls.length === 0) return [];
+): Promise<TavilyExtractResponse> {
+  if (!apiKey || urls.length === 0) return { results: [], credits: 0 };
+  const body: Record<string, unknown> = {
+    api_key: apiKey,
+    urls: urls.slice(0, 20),
+    extract_depth: options.extract_depth ?? "basic",
+    include_usage: true,
+  };
+  if (options.query?.trim()) body.query = options.query.trim().slice(0, 400);
   const r = await fetch("https://api.tavily.com/extract", {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": UA },
-    body: JSON.stringify({
-      api_key: apiKey,
-      urls: urls.slice(0, 20),
-      extract_depth,
-    }),
+    body: JSON.stringify(body),
     signal,
   });
   if (!r.ok) {
-    const body = await r.text().catch(() => "");
-    console.warn(`tavilyExtract ${r.status}: ${body.slice(0, 200)}`);
-    return [];
+    const errBody = await r.text().catch(() => "");
+    console.warn(`tavilyExtract ${r.status}: ${errBody.slice(0, 200)}`);
+    return { results: [], credits: 0 };
   }
   const data: any = await r.json();
-  return (data.results ?? []).map((res: any) => ({
+  const results: TavilyExtractResult[] = (data.results ?? []).map((res: any) => ({
     url: String(res.url ?? ""),
     raw_content: String(res.raw_content ?? ""),
   }));
+  const credits = Number(data?.usage?.credits ?? 0);
+  return { results, credits };
 }
 
 // ─── TOOLS registry ───────────────────────────────────────────────────────

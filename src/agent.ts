@@ -949,40 +949,65 @@ interface SourceCitation {
 
 /** Build the planner's system prompt for a target asking for N queries.
  *  Scales: N=1 says "the single most important query"; N=2-3 says "EXACTLY
- *  N focused queries"; N≥5 also coaches angles + outlet diversity. */
-function plannerSystemPrompt(n: number): string {
+ *  N focused queries"; N≥5 also coaches angles + outlet diversity. If
+ *  domain filters are active at the Tavily layer, the planner is told so
+ *  it doesn't waste tokens emitting site: operators. */
+function plannerSystemPrompt(
+  n: number,
+  filterHints: { include?: string[]; exclude?: string[]; country?: string } = {},
+): string {
   const intro =
     `You are the planning step of a research agent.\n` +
     `You are given a SKILL (the writer instructions) and a TARGET (the thing being researched).\n` +
     `Return ONLY a JSON object: { "queries": [string, ...] }.`;
   const placeholder =
     `Replace any "{target}" placeholder in the skill with the target's name. Use specific, narrow queries — not "everything about X". No extra text outside the JSON.`;
+  const filterLines: string[] = [];
+  if (filterHints.include?.length) {
+    filterLines.push(
+      `The search engine is already restricted to these domains: ${filterHints.include.join(", ")}. Do NOT add "site:" operators — the filter is API-side. Focus your queries on the topic, not the source.`,
+    );
+  }
+  if (filterHints.exclude?.length) {
+    filterLines.push(
+      `These domains are already blocked: ${filterHints.exclude.join(", ")}. Do not add exclude operators for them.`,
+    );
+  }
+  if (filterHints.country) {
+    filterLines.push(
+      `Results are already boosted for ${filterHints.country}. You don't need to add the country name to every query.`,
+    );
+  }
+  const filters = filterLines.length ? `\n\n${filterLines.join("\n")}` : "";
 
   if (n <= 1) {
-    return `${intro}\nReturn exactly ONE query — the single most important angle for this target + skill combination.\n${placeholder}`;
+    return `${intro}\nReturn exactly ONE query — the single most important angle for this target + skill combination.\n${placeholder}${filters}`;
   }
   if (n <= 4) {
-    return `${intro}\nReturn EXACTLY ${n} focused web search queries — distinct angles, no duplicates.\n${placeholder}`;
+    return `${intro}\nReturn EXACTLY ${n} focused web search queries — distinct angles, no duplicates.\n${placeholder}${filters}`;
   }
   return `${intro}
 Return EXACTLY ${n} concrete web search queries — always ${n}, never fewer.
 If you can't think of ${n} obviously distinct angles, broaden the net: cover different regions, different outlets (Reuters, AP, BBC, Al Jazeera, Le Monde, Deutsche Welle, Nikkei Asia, etc.), different sectors (politics, conflicts, markets, science, society, climate, sports). It is far better to produce ${n} queries of varying angle than to under-plan.
-${placeholder}`;
+${placeholder}${filters}`;
 }
 
 /** Step 1: ask the LLM what to search for. Returns up to N queries with
- *  {target} placeholders already expanded. N comes from the target. */
+ *  {target} placeholders already expanded. N comes from the target.
+ *  Filter hints come from the skill's Tavily params (include/exclude
+ *  domains, country) so the planner doesn't duplicate them in queries. */
 async function planResearch(
   env: Env,
   skill: Skill,
   target: Target,
   n: number,
   model: string,
+  filterHints: { include?: string[]; exclude?: string[]; country?: string },
   signal?: AbortSignal,
 ): Promise<ResearchPlan> {
   const res = await runChat(env, model, {
     messages: [
-      { role: "system", content: plannerSystemPrompt(n) },
+      { role: "system", content: plannerSystemPrompt(n, filterHints) },
       {
         role: "user",
         content: `SKILL\n=====\n${skill.procedure_md}\n\nTARGET\n======\nName: ${target.name}\nKind: ${target.kind ?? "(unspecified)"}\nDescription: ${target.description ?? "(none)"}\n\nReturn the JSON plan now.`,
@@ -1011,11 +1036,15 @@ async function planResearch(
 }
 
 // One row of gathered evidence — same shape regardless of whether it came
-// from a Tavily search or a Tavily extract.
+// from a Tavily search or a Tavily extract. score + published_date are
+// optional (extract op doesn't return them) and get surfaced to the writer
+// so it can weight recency and confidence per source.
 interface GatheredSource {
   title: string;
   url: string;
   content: string;
+  score?: number;
+  published_date?: string;
 }
 
 // Cap each source's text so the writer prompt stays bounded. With 20 sources
@@ -1088,7 +1117,9 @@ export function skillToolCalls(skill: Skill): SkillToolCall[] {
 /** Funnel stats from a single Tavily search batch, surfaced to the admin
  *  Maintenance heartbeat so you can see whether the gather pipeline is
  *  healthy or where it's choking. `final_kept` is the count of sources
- *  passed onward (after all tools, after the final cap), not just Tavily's. */
+ *  passed onward (after all tools, after the final cap), not just Tavily's.
+ *  `tavily_credits` is the real credit cost returned by Tavily (sum across
+ *  every search + extract call in this run). */
 export interface GatherStats {
   tavily_queries: number;
   tavily_raw: number;
@@ -1096,6 +1127,7 @@ export interface GatherStats {
   after_url_dedupe: number;
   after_title_dedupe: number;
   final_kept: number;
+  tavily_credits: number;
 }
 
 /** Normalise a headline for word-set comparison. Lowercase, strip
@@ -1139,6 +1171,7 @@ async function gatherSources(
   env: Env,
   queries: string[],
   target: Target,
+  skill: Skill,
   calls: SkillToolCall[],
   signal?: AbortSignal,
 ): Promise<{ sources: GatheredSource[]; stats: GatherStats }> {
@@ -1151,6 +1184,7 @@ async function gatherSources(
     after_url_dedupe: 0,
     after_title_dedupe: 0,
     final_kept: 0,
+    tavily_credits: 0,
   };
   const out: GatheredSource[] = [];
 
@@ -1158,12 +1192,13 @@ async function gatherSources(
     try {
       switch (c.tool) {
         case "tavily": {
-          const { sources, stats: tavilyStats } = await gatherTavily(env, queries, target, c, signal);
+          const { sources, stats: tavilyStats } = await gatherTavily(env, queries, target, skill, c, signal);
           stats.tavily_queries += tavilyStats.tavily_queries;
           stats.tavily_raw += tavilyStats.tavily_raw;
           stats.after_score_filter += tavilyStats.after_score_filter;
           stats.after_url_dedupe += tavilyStats.after_url_dedupe;
           stats.after_title_dedupe += tavilyStats.after_title_dedupe;
+          stats.tavily_credits += tavilyStats.tavily_credits;
           out.push(...sources);
           break;
         }
@@ -1212,6 +1247,7 @@ async function gatherTavily(
   env: Env,
   queries: string[],
   target: Target,
+  skill: Skill,
   c: SkillToolCall,
   signal?: AbortSignal,
 ): Promise<{ sources: GatheredSource[]; stats: GatherStats }> {
@@ -1222,44 +1258,83 @@ async function gatherTavily(
     after_url_dedupe: 0,
     after_title_dedupe: 0,
     final_kept: 0,
+    tavily_credits: 0,
   };
 
   if (c.op === "extract" && c.sources?.length) {
-    const extracted = await tavilyExtract(env.TAVILY_API_KEY, c.sources, "basic", signal).catch(() => []);
+    // Reranker query: tells Tavily what intent we're reading these pages
+    // for, so it surfaces the most relevant chunks per URL instead of raw
+    // page order. Made from target + skill so each extract op is
+    // intent-aware without extra config.
+    const rerankQuery = `${target.name} ${skill.name} ${target.description ?? ""}`.trim().slice(0, 400);
+    const { results: extracted, credits } = await tavilyExtract(
+      env.TAVILY_API_KEY,
+      c.sources,
+      { extract_depth: "basic", query: rerankQuery },
+      signal,
+    ).catch(() => ({ results: [], credits: 0 } as const));
     await bumpUsage(env, "searches", Math.max(1, Math.ceil(c.sources.length / 5)));
     return {
       sources: extracted.map((r) => ({ title: r.url, url: r.url, content: r.raw_content })),
-      stats: emptyStats,
+      stats: { ...emptyStats, tavily_credits: credits },
     };
   }
 
-  // Tavily op params live in tool_params_json as a flat lowercase object
-  // ({ topic, time_range, depth }). Old keys ("Search topic" etc.) are
-  // still recognised for any unbackfilled skill.
+  // Tavily op params live in tool_params_json as a flat lowercase object.
+  // Recognised keys: topic, time_range, depth, country, include_domains,
+  // exclude_domains. Old human-label keys ("Search topic") are still read
+  // for any unbackfilled skill.
   const p = c.params;
   const pickLower = (k1: string, k2?: string) =>
     (p[k1] ?? (k2 ? p[k2] : undefined))?.toLowerCase();
+  const pickList = (k: string): string[] => {
+    const raw = p[k];
+    if (!raw) return [];
+    return raw
+      .split(/[\s,]+/)
+      .map((d) => d.trim().toLowerCase())
+      .filter((d) => d && /^[a-z0-9.-]+$/.test(d));
+  };
+  const includeDomains = pickList("include_domains");
+  const excludeDomains = pickList("exclude_domains");
+  const country = (p.country ?? "").trim();
   const opts: TavilySearchOptions = {
     topic: (pickLower("topic", "Search topic") as TavilySearchOptions["topic"]) ?? "general",
     time_range: pickLower("time_range", "Time range") as TavilySearchOptions["time_range"],
     search_depth: (pickLower("depth", "Depth") as TavilySearchOptions["search_depth"]) ?? "basic",
     max_results: 20,                  // Tavily's documented hard maximum
+    include_domains: includeDomains.length ? includeDomains : undefined,
+    exclude_domains: excludeDomains.length ? excludeDomains : undefined,
+    country: country || undefined,
   };
-  const results = await Promise.all(
-    queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts, signal).catch(() => [])),
+  const responses = await Promise.all(
+    queries.map((q) => tavilySearch(env.TAVILY_API_KEY, q, opts, signal).catch(() => ({ results: [], credits: 0 } as const))),
   );
   await bumpUsage(env, "searches", queries.length);
 
-  type Scored = { title: string; url: string; content: string; score: number };
+  type Scored = { title: string; url: string; content: string; score: number; published_date?: string };
   const allRaw: Scored[] = [];
-  for (const list of results) {
-    for (const r of list) {
+  let creditsTotal = 0;
+  for (const resp of responses) {
+    creditsTotal += resp.credits;
+    for (const r of resp.results) {
       if (!r.url) continue;
-      allRaw.push({ title: r.title, url: r.url, content: r.content, score: r.score });
+      allRaw.push({
+        title: r.title,
+        url: r.url,
+        content: r.content,
+        score: r.score,
+        published_date: r.published_date,
+      });
     }
   }
 
-  const stats: GatherStats = { ...emptyStats, tavily_queries: queries.length, tavily_raw: allRaw.length };
+  const stats: GatherStats = {
+    ...emptyStats,
+    tavily_queries: queries.length,
+    tavily_raw: allRaw.length,
+    tavily_credits: creditsTotal,
+  };
 
   // Per-target minimum score (NULL = use the global default). Different
   // targets want different strictness — a news brief tolerates noise,
@@ -1317,7 +1392,13 @@ async function gatherTavily(
   stats.after_title_dedupe = titleDeduped.length;
 
   return {
-    sources: titleDeduped.map((r) => ({ title: r.title, url: r.url, content: r.content })),
+    sources: titleDeduped.map((r) => ({
+      title: r.title,
+      url: r.url,
+      content: r.content,
+      score: r.score,
+      published_date: r.published_date,
+    })),
     stats,
   };
 }
@@ -1414,12 +1495,16 @@ async function recallMemory(
 /** Unified citation row passed to the writer. Web hits and recalled past
  *  reports share the same shape so the LLM cites both with one [N]
  *  numbering scheme — and the rendered report's Sources footer can render
- *  them side by side. */
+ *  them side by side. `score` and `published_date` are optional metadata
+ *  the writer uses to weight recency and confidence; they don't affect
+ *  the rendered footer. */
 interface CitableSource {
   kind: "web" | "archive";
   title: string;
   url: string;
   content: string; // what the writer actually reads
+  score?: number;
+  published_date?: string;
 }
 
 /** Step 4: ask the LLM to write the report, given everything we gathered. */
@@ -1440,6 +1525,8 @@ async function writeReport(
       title: s.title,
       url: s.url,
       content: s.content,
+      score: s.score,
+      published_date: s.published_date,
     })),
     ...recalled.map<CitableSource>((r) => ({
       kind: "archive",
@@ -1449,11 +1536,30 @@ async function writeReport(
     })),
   ];
 
+  // Format a published_date string from Tavily into a short human label
+  // for the writer. Tavily returns either ISO ("2026-05-18T...") or
+  // RFC-ish ("Mon, 18 May 2026 ..."). Be lenient.
+  const fmtDate = (iso: string | undefined): string => {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+  };
+
   const sourceBlock = citations.length
     ? citations
         .map((c, i) => {
-          const tag = c.kind === "archive" ? " (PRIOR REPORT)" : "";
-          return `[${i + 1}]${tag} ${c.title}\n${c.url}\n${c.content}`;
+          if (c.kind === "archive") {
+            return `[${i + 1}] (PRIOR REPORT) ${c.title}\n${c.url}\n${c.content}`;
+          }
+          // Web source: surface score + published date as a metadata line
+          // so the writer can weight recency and trust per cite.
+          const metaBits: string[] = [];
+          const dateLabel = fmtDate(c.published_date);
+          if (dateLabel) metaBits.push(`published ${dateLabel}`);
+          if (typeof c.score === "number") metaBits.push(`relevance ${c.score.toFixed(2)}`);
+          const metaLine = metaBits.length ? `   ${metaBits.join(" · ")}\n` : "";
+          return `[${i + 1}] ${c.title}\n${c.url}\n${metaLine}${c.content}`;
         })
         .join("\n\n")
     : "(No sources gathered — write from general knowledge but explicitly say so.)";
@@ -1486,6 +1592,11 @@ Now write the report. Follow the output structure defined in the skill. Cite sou
         content: `You are a research agent that writes precise, scannable markdown reports.
 
 Tone: editorial, calm, intellectually honest. No hype, no filler phrases ("rich history", "fascinating place", "in conclusion"). Aim for ~500 words.
+
+Source weighting (each web source carries metadata after its title line — "published <date> · relevance <0-1>"):
+- Prefer recent sources over older ones for any time-sensitive claim (news, prices, status). If a fact comes from a source dated weeks ago and a newer source contradicts it, lead with the newer one.
+- Higher-relevance sources (score closer to 1.0) are more confident matches for the query. Cite them with more weight; use lower-relevance sources as corroboration, not primary backbone.
+- If a critical claim only appears in a single low-relevance or old source, hedge ("one outlet reports…") rather than asserting flatly.
 
 Markdown formatting rules (follow strictly — the rendering engine depends on them):
 - Do NOT write a top-level \`# Title\` heading at the start. The report title is rendered separately above the body. Start directly with your first section.
@@ -1657,12 +1768,29 @@ export async function runResearch(
       ? Math.max(1, Math.min(20, Math.floor(target.queries_per_run)))
       : await readIntSetting(env, "default_queries_per_run", 10, 1, 20);
     await markStep(env, attempt, "plan");
+    // Build filter hints from the Tavily search call's params so the
+    // planner knows what's already filtered API-side.
+    const tavilySearchCall = calls.find((c) => c.tool === "tavily" && c.op === "search");
+    const filterHints: { include?: string[]; exclude?: string[]; country?: string } = {};
+    if (tavilySearchCall) {
+      const splitDomains = (v: string | undefined): string[] =>
+        (v ?? "")
+          .split(/[\s,]+/)
+          .map((d) => d.trim().toLowerCase())
+          .filter((d) => d && /^[a-z0-9.-]+$/.test(d));
+      const inc = splitDomains(tavilySearchCall.params.include_domains);
+      const exc = splitDomains(tavilySearchCall.params.exclude_domains);
+      const country = (tavilySearchCall.params.country ?? "").trim();
+      if (inc.length) filterHints.include = inc;
+      if (exc.length) filterHints.exclude = exc;
+      if (country) filterHints.country = country;
+    }
     const queries = needsQueries
-      ? (await planResearch(env, skill, target, n, chatModel, signal)).queries
+      ? (await planResearch(env, skill, target, n, chatModel, filterHints, signal)).queries
       : [];
 
     await markStep(env, attempt, "gather");
-    const { sources, stats: gatherStats } = await gatherSources(env, queries, target, calls, signal);
+    const { sources, stats: gatherStats } = await gatherSources(env, queries, target, skill, calls, signal);
     attempt.gather_stats = gatherStats;
 
     await markStep(env, attempt, "recall");

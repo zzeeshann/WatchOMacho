@@ -80,12 +80,20 @@ function withSecurityHeaders(init: ResponseInit): ResponseInit {
 
 /** Pull the per-skill tool params from a form. Returns a flat object of
  *  whatever was set; blank values are dropped so they fall back to the
- *  tool's defaults at run time. */
+ *  tool's defaults at run time. Domain lists are normalised to comma-
+ *  separated lowercase tokens; gatherTavily re-splits them. */
 function collectSkillToolParams(form: Record<string, string>): Record<string, string> {
   const params: Record<string, string> = {};
-  for (const k of ["topic", "time_range", "depth"]) {
+  for (const k of ["topic", "time_range", "depth", "country"]) {
     const v = (form[k] ?? "").trim();
     if (v) params[k] = v;
+  }
+  for (const k of ["include_domains", "exclude_domains"]) {
+    const cleaned = (form[k] ?? "")
+      .split(/[\s,]+/)
+      .map((d) => d.trim().toLowerCase())
+      .filter((d) => d && /^[a-z0-9.-]+$/.test(d));
+    if (cleaned.length) params[k] = cleaned.join(", ");
   }
   return params;
 }

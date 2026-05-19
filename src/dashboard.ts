@@ -944,6 +944,7 @@ function renderGatherFunnel(json: string | null | undefined): string {
     const g = JSON.parse(json) as {
       tavily_queries?: number; tavily_raw?: number; after_score_filter?: number;
       after_url_dedupe?: number; after_title_dedupe?: number; final_kept?: number;
+      tavily_credits?: number;
     };
     if (!g.tavily_queries || g.tavily_queries === 0) {
       if (g.final_kept && g.final_kept > 0) {
@@ -955,7 +956,10 @@ function renderGatherFunnel(json: string | null | undefined): string {
     // visible whitespace even when the parent flex/wrap rules kick in.
     const sep = `<span class="mx-1.5 text-zee-border" aria-hidden="true">·</span>`;
     const arrow = `<span class="mx-1.5 text-zee-border" aria-hidden="true">→</span>`;
-    return `<span>Tavily <strong class="font-medium text-zee-text">${g.tavily_queries}q</strong></span>${sep}`
+    const creditsTag = g.tavily_credits && g.tavily_credits > 0
+      ? `${sep}<span class="tt text-zee-muted">${g.tavily_credits} credits</span>`
+      : "";
+    return `<span>Tavily <strong class="font-medium text-zee-text">${g.tavily_queries}q</strong></span>${creditsTag}${sep}`
       + `<span class="tt">${g.tavily_raw} raw</span>${arrow}`
       + `<span class="tt">${g.after_score_filter} (score)</span>${arrow}`
       + `<span class="tt">${g.after_url_dedupe} (URL)</span>${arrow}`
@@ -1292,7 +1296,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     embedLastErrorRaw ? (() => { try { return JSON.parse(embedLastErrorRaw); } catch { return null; } })() : null;
   const totalReports = totalReportsRow?.n ?? 0;
   const lastCronRun = parseInt(lastCronRunStr, 10) || 0;
-  type GatherStats = { tavily_queries: number; tavily_raw: number; after_score_filter: number; after_url_dedupe: number; after_title_dedupe: number; final_kept: number };
+  type GatherStats = { tavily_queries: number; tavily_raw: number; after_score_filter: number; after_url_dedupe: number; after_title_dedupe: number; final_kept: number; tavily_credits: number };
   type LastRunAttempt = { run_id: string; target_slug: string; triggered_by: "cron" | "manual"; started_at: number; last_step: string; completed_at: number | null; outcome: "in_flight" | "success" | "error"; error?: string; gather_stats?: GatherStats };
   const lastRunAttempt: LastRunAttempt | null = lastRunAttemptRaw
     ? (() => { try { return JSON.parse(lastRunAttemptRaw); } catch { return null; } })()
@@ -1579,6 +1583,19 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     ["basic", "advanced"].map((t) =>
       `<option value="${t}"${t === selected ? " selected" : ""}>${t}</option>`,
     ).join("");
+  // Country boost (general topic only — Tavily ignores it for news/finance).
+  // Short curated list of the boosts most likely to be useful here; "" = no
+  // boost. Add to the list if you need more — Tavily accepts any of the
+  // ~100 names from its docs.
+  const COUNTRY_CHOICES = [
+    "", "United Kingdom", "United States", "Ireland", "France", "Germany",
+    "Spain", "Italy", "Netherlands", "Canada", "Australia", "India",
+    "Japan", "Brazil", "South Africa",
+  ];
+  const countryOptions = (selected: string) =>
+    COUNTRY_CHOICES.map((c) =>
+      `<option value="${escapeHtml(c)}"${c === selected ? " selected" : ""}>${c === "" ? "(no boost)" : escapeHtml(c)}</option>`,
+    ).join("");
 
   const list = skills.length === 0
     ? `<div class="empty">No skills yet. Synthesise one below from a brief, or write one by hand.</div>`
@@ -1635,7 +1652,27 @@ export async function renderAdminSkills(env: Env): Promise<string> {
                 <label>Depth</label>
                 <select name="depth">${depthOptions(params.depth ?? "basic")}</select>
               </div>
+              <div class="field flex-1 mb-0">
+                <label>Country boost</label>
+                <select name="country">${countryOptions(params.country ?? "")}</select>
+              </div>
             </div>
+
+            <details class="mb-4">
+              <summary class="cursor-pointer text-xs text-zee-muted">Trusted / blocked domains <span class="font-normal normal-case tracking-normal">(comma or space separated, e.g. <code>bbc.co.uk reuters.com</code>)</span></summary>
+              <div class="row gap-4 mt-2">
+                <div class="field flex-1 mb-0">
+                  <label>Trusted only</label>
+                  <input name="include_domains" value="${escapeHtml(params.include_domains ?? "")}" placeholder="bbc.co.uk reuters.com apnews.com" class="font-mono text-[13px]">
+                  <p class="field-help mt-1">Tavily returns results ONLY from these. Leave empty for the open web.</p>
+                </div>
+                <div class="field flex-1 mb-0">
+                  <label>Blocked</label>
+                  <input name="exclude_domains" value="${escapeHtml(params.exclude_domains ?? "")}" placeholder="pinterest.com quora.com" class="font-mono text-[13px]">
+                  <p class="field-help mt-1">Always skipped, even if relevant.</p>
+                </div>
+              </div>
+            </details>
 
             <details class="mb-4"${isTavilyExtract ? " open" : ""}>
               <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
@@ -1717,7 +1754,27 @@ export async function renderAdminSkills(env: Env): Promise<string> {
             <label>Depth</label>
             <select name="depth">${depthOptions("basic")}</select>
           </div>
+          <div class="field flex-1 mb-0">
+            <label>Country boost</label>
+            <select name="country">${countryOptions("")}</select>
+          </div>
         </div>
+
+        <details class="mb-4">
+          <summary class="cursor-pointer text-xs text-zee-muted">Trusted / blocked domains <span class="font-normal normal-case tracking-normal">(comma or space separated)</span></summary>
+          <div class="row gap-4 mt-2">
+            <div class="field flex-1 mb-0">
+              <label>Trusted only</label>
+              <input name="include_domains" placeholder="bbc.co.uk reuters.com apnews.com" class="font-mono text-[13px]">
+              <p class="field-help mt-1">Tavily returns results ONLY from these. Leave empty for the open web.</p>
+            </div>
+            <div class="field flex-1 mb-0">
+              <label>Blocked</label>
+              <input name="exclude_domains" placeholder="pinterest.com quora.com" class="font-mono text-[13px]">
+              <p class="field-help mt-1">Always skipped, even if relevant.</p>
+            </div>
+          </div>
+        </details>
 
         <details class="mb-4">
           <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
