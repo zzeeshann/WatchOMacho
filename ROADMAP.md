@@ -126,6 +126,8 @@ Hobby use on Haiku stays well under $10/month. The Workers AI free path remains 
 
 ## "What to do next" — practical answer for future sessions
 
+If you hit "Run Now never completes for skill X" → **already solved.** Manual runs route through the `ResearchRunner` Durable Object alarm (15-min budget instead of the 30s `waitUntil` cap). Guarded by `max_run_seconds` + AbortController + watchdog cron. See [BOOK.md](BOOK.md) chapters 19–22 and the "Run Now path" section in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 If quality of reports is still the bottleneck after Tavily → check whether `MAX_CHARS_PER_SOURCE` (4000) is too aggressive a cap, or whether `**Depth:** advanced` would help (2 credits instead of 1, but more thorough extraction).
 
 If specific repeated research patterns emerge → **Level 3 typed tools** for those patterns. Add to `TOOLS` registry + `apis.ts`.

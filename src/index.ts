@@ -25,6 +25,7 @@ import {
   listReportsForTarget,
   listSkills,
   listTargets,
+  ResearchRunner,
   runResearch,
   setSetting,
   synthesizeSkill,
@@ -34,6 +35,11 @@ import {
   type Skill,
   type Target,
 } from "./agent";
+
+// Re-export the Durable Object class so Cloudflare's runtime can find it.
+// Wrangler's `class_name = "ResearchRunner"` binding looks it up on the
+// main entry module.
+export { ResearchRunner };
 import {
   renderAdminLogin,
   renderAdminPanel,
@@ -321,13 +327,14 @@ export default {
           cadence_hours: Number.isFinite(cadence) ? cadence : undefined,
           primary_skill_id: skillId,
         });
-        // If the form asked for an immediate run, kick one off in the background.
+        // If the form asked for an immediate run, schedule one through the
+        // ResearchRunner DO (15-min alarm budget) so the new target's first
+        // run gets the same headroom as a regular "Run now" click.
         if (form.run_now === "1" && skillId) {
           const sk = await getSkillById(env, skillId);
           if (sk) {
-            ctx.waitUntil(
-              runResearch(env, target, sk, "manual").catch((e) => console.error("first run failed", e)),
-            );
+            const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(target.slug));
+            await stub.scheduleManualRun(target.slug);
           }
         }
         return redirect(`/admin/targets/${target.slug}`);
@@ -367,11 +374,15 @@ export default {
         const target = await getTargetBySlug(env, slug);
         if (!target) return json({ error: "not found" }, { status: 404 });
         if (!target.primary_skill_id) return json({ error: "no skill attached" }, { status: 400 });
+        // We only need to verify the skill exists; the DO re-fetches both
+        // target and skill inside the alarm to ensure freshness at run time.
         const skill = await getSkillById(env, target.primary_skill_id);
         if (!skill) return json({ error: "skill missing" }, { status: 400 });
-        ctx.waitUntil(
-          runResearch(env, target, skill, "manual").catch((e) => console.error("manual run failed", e)),
-        );
+        // Schedule the work into the ResearchRunner DO's alarm (15-min wall
+        // budget) instead of ctx.waitUntil (30-second cap). One DO per target
+        // serialises back-to-back clicks on the same target.
+        const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(target.slug));
+        await stub.scheduleManualRun(target.slug);
         return redirect(`/admin/targets/${target.slug}?queued=1`);
       }
 
@@ -477,6 +488,19 @@ export default {
           daily_report_limit: [0, 10000],
           daily_search_limit: [0, 100000],
           cron_max_per_tick: [1, 20],
+          // Search-tuning CPU levers (Workers Free = 10ms CPU per
+          // invocation). max_final_sources caps how many sources reach the
+          // writer; max_chars_per_source caps each source's content. Writer
+          // prompt size = product of the two and is the dominant CPU spend.
+          max_final_sources: [1, 200],
+          max_chars_per_source: [200, 8000],
+          // Run guardrail. Aborts in-flight Tavily / Anthropic fetches when
+          // the run wall-clock exceeds this many seconds. Hard ceiling is
+          // the 15-min Durable Object alarm limit; this is the soft cap
+          // below it. Floor is 5s — low enough to deliberately trigger an
+          // abort during testing (every run will fail at 5s, but the error
+          // message names the cause so it's self-diagnostic).
+          max_run_seconds: [5, 600],
         };
         const updated: Record<string, string> = {};
         for (const [k, [lo, hi]] of Object.entries(numericKeys)) {

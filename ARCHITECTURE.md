@@ -121,7 +121,7 @@ For each `runResearch(target, skill, triggeredBy)` call:
                        Passed to Recall step
 ```
 
-Counters at each stage are persisted to `last_run_attempt.gather_stats` and surfaced in the admin Maintenance card so the funnel shape is auditable per run.
+Counters at each stage are persisted to `last_run_attempt.gather_stats` AND to the per-row `runs.gather_stats_json` column (added in migration v9). Three rendering sites use the same `renderGatherFunnel()` helper: the Maintenance heartbeat (live, most-recent run), the Activity card per row (any historical run), and the report page header (single-report view).
 
 ---
 
@@ -263,11 +263,12 @@ created_at
 id TEXT PRIMARY KEY
 target_id TEXT
 skill_id TEXT
-triggered_by TEXT                  -- 'cron' | 'manual'
-status TEXT                        -- 'success' | 'error'
+triggered_by TEXT                  -- 'cron' | 'manual' (CHECK constrained, v8)
+status TEXT                        -- 'success' | 'error' (CHECK constrained, v8)
 report_id TEXT                     -- if successful
 duration_ms INTEGER
-error TEXT
+error TEXT                         -- prefixed with failing step: "gather: …", "write: …", "watchdog: …"
+gather_stats_json TEXT             -- v9 — JSON snapshot of the Tavily funnel (queries/raw/score/url/title/final)
 created_at
 ```
 
@@ -333,12 +334,12 @@ The full markdown of every report. `text/markdown; charset=utf-8`. Never queried
 
 | File | Lines | What's in it |
 | --- | --- | --- |
-| [src/apis.ts](src/apis.ts) | ~540 | Five tool integrations (Tavily search/extract, Land Registry SPARQL, ONS via postcodes.io, data.police.uk, Companies House) + `TOOLS` registry |
-| [src/agent.ts](src/agent.ts) | ~1280 | Targets / skills / reports CRUD, `runChat()` dispatcher (Workers AI + Anthropic via AI Gateway), `parseSkillTools` (multi-tool), `gatherSources` dispatch + per-tool gatherers (with Tavily score filter), `runResearch` loop, `cronTick`, budget gates |
-| [src/index.ts](src/index.ts) | ~530 | HTTP routing (incl. `/static/tailwind.v1.css` from R2 + `/admin/targets/:slug/run` background invocation via `ctx.waitUntil`), auth/cookie, `readForm`, `scheduled` handler, security headers |
-| [src/dashboard.ts](src/dashboard.ts) | ~1360 | All HTML rendering: public pages + admin pages (incl. `/admin/tools` rendering any registered tool), markdown renderer with `<sup class="cite">` citation rewriter, canonical Sources footer from D1, `stripMarkdown()` helper for snippets |
+| [src/apis.ts](src/apis.ts) | ~540 | Five tool integrations (Tavily search/extract, Land Registry SPARQL, ONS via postcodes.io, data.police.uk, Companies House) + `TOOLS` registry. All fetches accept an optional `AbortSignal`. |
+| [src/agent.ts](src/agent.ts) | ~1880 | Targets / skills / reports CRUD, `runChat()` dispatcher (Workers AI + Anthropic via AI Gateway, signal-aware), `parseSkillTools` (multi-tool), `gatherSources` dispatch + per-tool gatherers (with Tavily score filter), `runResearch` loop (now signal-threaded for guardrails), `cronTick` (with `reapStalledRun` watchdog), budget gates, and the `ResearchRunner` Durable Object class wrapping manual runs in a 15-min alarm budget |
+| [src/index.ts](src/index.ts) | ~545 | HTTP routing (incl. `/static/tailwind.v1.css` from R2 + `/admin/targets/:slug/run` which now hands off to the ResearchRunner DO via `stub.scheduleManualRun(...)`), auth/cookie, `readForm`, `scheduled` handler, security headers, re-export of `ResearchRunner` for Cloudflare's runtime to find |
+| [src/dashboard.ts](src/dashboard.ts) | ~1430 | All HTML rendering: public pages + admin pages (incl. `/admin/tools`), markdown renderer with `<sup class="cite">` citation rewriter, canonical Sources footer from D1, `stripMarkdown()` helper for snippets, shared `renderGatherFunnel()` helper used by the heartbeat, per-row Activity, and report page |
 
-Total: ~3700 lines of TypeScript. Tailwind CSS is built locally via `npm run build:css` and served from R2 (not bundled into the Worker).
+Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run build:css` and served from R2 (not bundled into the Worker).
 
 ---
 
@@ -379,6 +380,49 @@ Total: ~3700 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 
 ---
 
+## Run Now path (Durable Object)
+
+Manual runs cannot use the HTTP handler's `ctx.waitUntil` directly — it caps at **30 seconds** of wall-clock after the response, which is below the steady-state pipeline duration for slower skills. The fix is to schedule the work into a `ResearchRunner` Durable Object, whose `alarm()` runs in the scheduled-handler context with a **15-minute** budget.
+
+```
+POST /admin/targets/:slug/run
+        │
+        ▼
+  stub = env.RESEARCH_RUNNER.get(idFromName(slug))   ← one DO per target
+        │  (serialises back-to-back clicks on the same target)
+        ▼
+  await stub.scheduleManualRun(slug)
+        │  · writes { targetSlug, triggeredBy } to DO storage
+        │  · ctx.storage.setAlarm(now + 1s)
+        ▼
+  return 302 → /admin/targets/:slug?queued=1
+        │
+        ▼   (~1s later)
+  ResearchRunner.alarm()  fires in scheduled context
+        │  · reads max_run_seconds setting (default 90s)
+        │  · creates AbortController, setTimeout(maxRunSeconds * 1000)
+        │  · re-fetches target + skill from D1
+        │  · runResearch(env, target, skill, "manual", controller.signal)
+        │  · clearTimeout, delete pending job from DO storage
+        ▼
+  DO becomes idle, Cloudflare hibernates it ~10s later (no further charges)
+```
+
+Guardrails inside the alarm handler:
+
+| Guardrail | Behaviour |
+|---|---|
+| **`max_run_seconds`** (default 90s, range 5–600s) | DO alarm's `setTimeout` calls `controller.abort()` when exceeded. All Tavily + Anthropic fetches downstream see the same signal and throw `AbortError`. The existing `runResearch` catch records `"<step>: max_run_seconds exceeded"` in the runs table. |
+| **AbortController plumbing** | Signal threads through `runResearch → planResearch / gatherSources / writeReport → runChat → runAnthropicChat → fetch(..., { signal })`. Tavily search/extract also accept the signal. |
+| **Watchdog (in `cronTick`)** | Once per hour, `reapStalledRun` scans `last_run_attempt`. If `outcome === 'in_flight'` and age > `max_run_seconds + 30s grace`, writes an error runs row and updates the heartbeat to `outcome: error` — catches the rare case where the DO alarm itself was killed before its catch could run. |
+| **Workers Logs** | `[observability] enabled=true` in wrangler.toml. 7-day retention of `console.log` + uncaught errors in the Cloudflare dashboard. Filter by run id to replay any failure after the fact. |
+
+Cost ceiling per stuck-but-aborted run: 90s × 0.128 GB = ~11.5 GB-seconds. Free quota is 13,000 GB-seconds/day. Unreachable from accidents.
+
+Cron does **not** route through the DO — it already runs in the scheduled context with 15 min wall-clock available, and `runResearch` accepts an optional signal (omitted by cron, since cron has no hard soft-cap of its own beyond Cloudflare's 15-min hard limit).
+
+---
+
 ## Cron behaviour
 
 Cron schedule: `0 * * * *` (hourly).
@@ -410,6 +454,9 @@ Daily budget gates stop early on `BudgetExceeded`.
 | `DB` | D1 | `env.DB.prepare(sql).bind(...).run()` |
 | `REPORTS` | R2 | `env.REPORTS.put(key, body)` / `.get(key)` |
 | `MEMORY` | Vectorize | `env.MEMORY.upsert([...])` / `.query(vec)` |
+| `RESEARCH_RUNNER` | Durable Object (SQLite backend) | `env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(targetSlug)).scheduleManualRun(slug)` — wraps `runResearch` in a 15-min DO alarm so manual "Run Now" isn't capped by the 30s `waitUntil` ceiling |
+
+`[observability] enabled = true` is also set in `wrangler.toml` so console + errors are retained 7 days in the Cloudflare dashboard.
 
 ## Secrets
 

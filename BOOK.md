@@ -622,6 +622,95 @@ The line we drew: **editorial knobs in the skill markdown, system knobs in admin
 
 ---
 
-That's the second half of the book — chapters 15–18 cover memory, observability, gather tuning, and admin knobs. Together with chapters 1–14 (the original v4 + Tavily + Level 3 typed tools narrative), it's the full picture of what WatchOMacho is now.
+That's the second half of the book — chapters 15–18 cover memory, observability, gather tuning, and admin knobs. Together with chapters 1–14 (the original v4 + Tavily + Level 3 typed tools narrative), it's the full picture of what WatchOMacho was.
 
-The shortest way to understand this project is still: add a target, attach a skill, watch a report appear. The shortest way to *trust* it is: open the Maintenance card and watch the funnel.
+---
+
+## Chapter 19 — The door, not the room (the Durable Object rewrite)
+
+A whole afternoon spent tuning knobs that didn't move the needle taught us a principle worth a chapter: **before tuning, find the wall.**
+
+The symptom was simple. Clicking "Run now" on certain skills (Money & Finance, AI News — the slow ones) would silently die. No row in `runs`. No error in tail. Heartbeat frozen at `write` or `persist`. The report would never land. Same skill via the hourly cron worked fine.
+
+The first diagnosis was wrong. Cloudflare's docs say Workers Free gives each invocation **10 ms of CPU**, and we assumed that was the constraint — string-encoding the writer prompt eats CPU, large prompts encode more, so the fix must be smaller prompts. Two admin knobs (`max_final_sources`, `max_chars_per_source`) shipped, and we started tuning. A few runs flipped from "stalled" to "succeeded". Looked like progress.
+
+It wasn't. Lowering `max_final_sources` from 27 to 19 made one Money & Finance run succeed; lowering it to 15 didn't help another; lowering to 10 didn't help a third. The knob *correlated* with success but didn't *cause* it. Meanwhile cron-triggered runs of the exact same skill kept working — at **37 seconds**, well past the 30-second mark where manual runs were dying.
+
+That asymmetry was the smoking gun. Cron and manual use different Cloudflare handlers:
+
+- **Manual "Run now"** returns a redirect immediately, then runs the work inside `ctx.waitUntil(...)`. Per the docs: that gives you up to **30 seconds of wall-clock** after the response is sent. Same on Free and Paid. Same forever.
+- **Cron** uses the `scheduled()` handler — up to **15 minutes wall-clock**. Same on Free.
+
+The wall wasn't CPU. The wall was 30-second `waitUntil`. Anything that crossed it died with no exception — runtime termination isn't a throwable, the isolate is just gone mid-await. Every silent stall was Cloudflare killing the worker. The knobs that "fixed" some runs were just shaving a few seconds off, enough to squeak under the cliff on those specific clicks.
+
+**This is the principle:** *if your pipeline takes 35 seconds and you're working inside a 30-second container, you don't need a faster pipeline. You need a bigger container.* Tuning to fit a 35s job into 29s is one bad day from the cliff. Moving the job out of `waitUntil` and into something with proper headroom solves it forever.
+
+The right container is a **Durable Object alarm**.
+
+```
+TODAY:                          AFTER:
+fetch handler                   fetch handler
+  → ctx.waitUntil(                → DO stub.scheduleManualRun()
+      runResearch(...)              (sets DO alarm for now+1s)
+    )                             → return redirect
+  → return redirect                                              
+  (30s cap)                     DO alarm handler fires
+                                  → runResearch(...)
+                                  (15 minute cap)
+                                  → DO hibernates when done
+```
+
+A Durable Object is a tiny stateful worker. Each instance is a single-threaded JavaScript context with its own SQLite, addressable by name (`idFromName("money-finance-briefing")`). Critically: a DO's `alarm()` callback runs in the scheduled-handler context — **15 minutes wall-clock**. That's 30× more headroom than `waitUntil`. And DOs are now on the Workers Free plan as long as you use the SQLite backend (the default for new DOs).
+
+The implementation is ~80 lines: a `ResearchRunner` class extending `DurableObject`, a `scheduleManualRun(slug)` method that records the pending job and sets `setAlarm(now+1s)`, and an `alarm()` method that re-fetches target + skill (so it sees fresh values) and calls `runResearch()`. The route changes from `ctx.waitUntil(runResearch(...))` to `await stub.scheduleManualRun(slug)` and returns the redirect immediately. Cron stays where it is — it already has the 15-min budget.
+
+Verification ran in one click. Money & Finance, the skill that had been failing all afternoon at exactly 30 seconds: **completed in 49 seconds**, status success, report landed. Then AI News with 100 sources × 4000 chars (a 400 KB writer payload): **39.5 seconds**, success. Skills the worker had been physically incapable of completing on the manual path now worked. No knob changed.
+
+---
+
+## Chapter 20 — Guardrails before you need them (the kill switch lesson)
+
+The DO rewrite created a new failure mode by removing the old one. *We just gave the agent 15 minutes of wall-clock.* That's plenty of time for a hung Tavily call or a wedged Anthropic stream to burn through Workers Free's daily DO compute quota (13,000 GB-seconds — at 128 MB per DO, ~115 GB-seconds per stuck 15-minute run).
+
+A second principle: **never raise a ceiling without putting a floor beneath it.**
+
+So before declaring victory, we wired in four guardrails together — derived from the architect's sister project's "System Guardrails" pattern, written after a 7-hour DO incident that taught them *exactly* why this matters:
+
+1. **`max_run_seconds` admin setting** — default 90s, range 5–600s. Below the 15-min hard cap but well above any successful run we've seen.
+2. **AbortController plumbing** — a signal threads from `runResearch` → `gatherSources` → `tavilySearch` and `runResearch` → `writeReport` → `runAnthropicChat`, all the way to `fetch(..., { signal })`. When the timer fires, in-flight fetches throw `AbortError`. The existing catch records `"<step>: ..."` into the runs table — silent stalls become loud failures.
+3. **Watchdog cron** — every hour, `cronTick` scans `last_run_attempt`. If it's still `in_flight` past `max_run_seconds + 30s grace`, the heartbeat is force-marked errored and a `runs` row is inserted. Catches the rare case where the DO alarm itself gets killed before its catch could fire.
+4. **Workers Logs (`[observability]` in `wrangler.toml`)** — 7-day retention of console + errors in the Cloudflare dashboard. `wrangler tail` only shows live logs going forward, useless after the fact. Now any failure is replayable by run id.
+
+We tested the abort by setting `max_run_seconds = 5` and clicking Run Now. The run aborted at exactly 5.6 seconds, wrote `write: max_run_seconds (5s) exceeded` to the runs table, updated the heartbeat to `outcome: error`. The mechanism was real, not theoretical.
+
+The guardrails are *boring*. They don't add user-visible features. The 7-hour-DO incident in the architect's other project had been preventable by exactly this kind of plumbing — and yet it took an actual incident to motivate building it. Trusting their instinct to package guardrails *with* the new capability (not in a follow-up commit, not "we'll add it later") was the lesson. The cost of building them now is half a screen of code. The cost of not having them is one unattended runaway.
+
+---
+
+## Chapter 21 — Per-run visibility everywhere (the gather funnel column)
+
+Adding the DO + guardrails left one rough edge. The Tavily funnel — `200 raw → 122 score → 111 url → 111 story → 100 final` — was only visible for the *most recent* run, because it was stored in `settings.last_run_attempt.gather_stats`. Open the next admin page after a fresh run and the previous funnel was gone.
+
+The fix was a small schema migration (v9): add a `gather_stats_json TEXT` column to `runs`. Save the funnel snapshot into the column on every persist (success, error, watchdog-reaped). Render it on every Activity row and at the top of every report page using a shared `renderGatherFunnel()` helper.
+
+Same data, three rendering sites — the Maintenance heartbeat (live), the Activity card per row (historical), and the report page header (single-report view). Now the funnel is *always* one click away regardless of how old the run is.
+
+This is the third principle: **observability data, once captured, should be available everywhere it's relevant.** Capturing it for one panel and forgetting other panels existed was the smaller bug. The 20-minute migration is worth it: every retro question ("why did this report only have 12 sources when others have 60?") now has an answer on the report page itself.
+
+---
+
+## Chapter 22 — One last fix: stop capping what you cite
+
+While reviewing the new per-report funnel rendering, an old bug surfaced: `reports.sources_json` had a `.slice(0, 20)` cap on persist. The writer was sent 100 sources, every `[N]` citation in the body assumed all 100 existed, but only [1]–[20] resolved to URLs in the footer. Citations [21]–[100] were dead links.
+
+The cap dated from a time when `max_final_sources` was effectively always < 20. After raising it to 100, the cap on the persisted citation list never moved with it. The two ceilings had drifted out of sync.
+
+Removed in one line. `sources_json` now stores everything the writer received — matching `max_final_sources`. The Activity meta line jumped from "20 web sources" to "100 web sources" and the report Sources footer suddenly contained all 100 links.
+
+Fourth principle: **when two limits should be the same number, prefer one limit.** The double-cap (cap-100 on the writer, cap-20 on the store) was a footgun waiting for the day someone raised one and not the other. Now there's just one cap; whatever the writer sees, the footer stores.
+
+---
+
+That's chapters 19–22 — the architectural fix to the silent-stall problem (DO + Alarm), the guardrails that came with it (AbortController + watchdog + Workers Logs), the funnel-per-row migration, and the citation-cap cleanup. Together they took manual "Run Now" from "works for fast skills, dies silently for slow ones" to "works for any skill we've thrown at it, fails loudly when it fails at all".
+
+The shortest way to understand this project is still: add a target, attach a skill, watch a report appear. The shortest way to *trust* it is: open the Maintenance card and watch the funnel. The shortest way to *operate* it is to know the soft cap (`max_run_seconds`) is yours to set, and the hard cap (the 15-minute DO alarm) is Cloudflare's.
