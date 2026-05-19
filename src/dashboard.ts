@@ -115,6 +115,17 @@ a { color: inherit; text-decoration: none; }
 .nav a:hover { color: var(--zee-primary); }
 .nav a.active { color: var(--zee-text); }
 
+/* Subhead-stat link: looks like plain text, turns teal on hover. Used by
+ * the /admin Console subhead "N active · M skills" links. */
+.stat-link { color: inherit; transition: color .12s ease; }
+.stat-link:hover { color: var(--zee-primary); }
+
+/* Breadcrumb row: faint separators, hover-teal on the linked crumbs. */
+.crumbs { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--zee-muted); }
+.crumbs a { color: var(--zee-primary); }
+.crumbs a:hover { text-decoration: underline; }
+.crumbs .sep { margin: 0 .5em; color: var(--zee-border); }
+
 /* category labels (the daylila "TODAY" pill) */
 .label {
   font-size: 11px;
@@ -1123,7 +1134,7 @@ interface HeartbeatInput {
       final_kept: number;
     };
   } | null;
-  lastCompletedRun: { status: string; error: string | null; duration_ms: number | null; created_at: number } | null;
+  lastCompletedRun: { status: string; error: string | null; duration_ms: number | null; created_at: number; target_slug: string | null; target_name: string | null } | null;
   /** Slugs of targets that currently exist. The `last_run_attempt` setting
    *  in D1 persists across target deletion, so a deleted target's slug can
    *  linger in the heartbeat forever. Used to render "(target gone)" rather
@@ -1173,7 +1184,12 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, lastCompletedRun, kn
     const status = lastCompletedRun.status === "success"
       ? `<span class="text-zee-primary">success</span>`
       : `<span class="text-[rgb(180,60,60)]">error: ${escapeHtml((lastCompletedRun.error ?? "unknown").slice(0, 60))}</span>`;
-    completedLine = `${status} · <span class="label-muted">${timeAgo(lastCompletedRun.created_at)}${dur ? ` · ${dur}` : ""}</span>`;
+    // Make the target a clickable link so "click takes me to the page".
+    const slug = lastCompletedRun.target_slug;
+    const targetRef = slug && knownTargetSlugs.has(slug)
+      ? `<a href="/admin/targets/${escapeHtml(slug)}" class="text-zee-primary">${escapeHtml(lastCompletedRun.target_name ?? slug)}</a> · `
+      : (slug ? `<span class="text-zee-muted">${escapeHtml(lastCompletedRun.target_name ?? slug)} <em>(deleted)</em></span> · ` : "");
+    completedLine = `${status} · ${targetRef}<span class="label-muted">${timeAgo(lastCompletedRun.created_at)}${dur ? ` · ${dur}` : ""}</span>`;
   }
 
   let gatherLine = `<span class="text-zee-muted">no gather data yet</span>`;
@@ -1233,7 +1249,13 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     env.DB.prepare("SELECT COUNT(*) AS n FROM reports").first<{ n: number }>(),
     getSetting(env, "last_cron_run", "0"),
     getSetting(env, "last_run_attempt", ""),
-    env.DB.prepare("SELECT status, error, duration_ms, created_at FROM runs ORDER BY created_at DESC LIMIT 1").first<{ status: string; error: string | null; duration_ms: number | null; created_at: number }>(),
+    env.DB.prepare(
+      `SELECT runs.status, runs.error, runs.duration_ms, runs.created_at,
+              targets.slug AS target_slug, targets.name AS target_name
+         FROM runs
+         LEFT JOIN targets ON targets.id = runs.target_id
+         ORDER BY runs.created_at DESC LIMIT 1`,
+    ).first<{ status: string; error: string | null; duration_ms: number | null; created_at: number; target_slug: string | null; target_name: string | null }>(),
     getSetting(env, "max_chars_per_source", "4000"),
     getSetting(env, "max_run_seconds", "90"),
   ]);
@@ -1269,7 +1291,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       <p class="label">Admin</p>
       <h1 class="headline mt-2 text-[32px]">Console.</h1>
       <p class="subhead">
-        <a href="/admin/targets" class="text-zee-text hover:text-zee-primary"><strong>${active.length}</strong> active</a>${otherCount > 0 ? ` · <a href="/admin/targets" class="text-zee-muted hover:text-zee-primary"><strong>${otherCount}</strong> paused/archived</a>` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <a href="/admin/skills" class="text-zee-text hover:text-zee-primary"><strong>${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}</a>.
+        <a href="/admin/targets" class="stat-link"><strong>${active.length}</strong> active</a>${otherCount > 0 ? ` · <a href="/admin/targets" class="stat-link" style="color:var(--zee-muted)"><strong>${otherCount}</strong> paused/archived</a>` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""} · <a href="/admin/skills" class="stat-link"><strong>${skills.length}</strong> ${skills.length === 1 ? "skill" : "skills"}</a>.
       </p>
     </section>
 
@@ -1615,7 +1637,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="label">Admin</p>
+      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span>Skills</p>
       <h1 class="headline mt-2 text-[32px]">Skills.</h1>
       <p class="subhead">The agent's library of reusable research procedures. Each skill picks a tool, configures it, and writes the instructions the LLM uses to plan + author the report. WYSIWYG — no hidden parsing.</p>
     </section>
@@ -1747,7 +1769,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
 
   const body = `
     <section class="pt-6 pb-3">
-      <p class="label">Admin · Targets</p>
+      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span>Targets</p>
       <h1 class="headline mt-2 text-[32px]">Targets.</h1>
       <p class="subhead"><strong class="text-zee-text">${active.length}</strong> active${sortedTargets.length > active.length ? ` · <strong class="text-zee-muted">${sortedTargets.length - active.length}</strong> paused/archived` : ""}${dueNow.length ? ` · <strong class="text-zee-primary">${dueNow.length}</strong> due now` : ""}.</p>
     </section>
@@ -1852,79 +1874,70 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     `<option value="${h}"${target.cadence_hours === h ? " selected" : ""}>${h === 1 ? "every hour" : h < 24 ? `every ${h} hours` : h === 24 ? "every 24 hours" : h === 72 ? "every 3 days" : "every week"}</option>`,
   ).join("");
 
-  /** Wraps a meta item as a proper flex child so gap-x spacing applies.
-   *  Each entry becomes a <span>; the joiner is a faint "·" with its own
-   *  margin so adjacent items don't visually glue together. */
-  const metaSep = `<span class="text-zee-border" aria-hidden="true">·</span>`;
-  const wrapMeta = (inner: string, extraClass = "") =>
-    `<span class="${extraClass}">${inner}</span>`;
+  /** Faint middot used between meta items on a single line. */
+  const metaSep = `<span class="text-zee-border mx-1.5" aria-hidden="true">·</span>`;
 
   const activityList = (activityRows.results ?? []).length === 0
     ? `<div class="empty">No activity yet.</div>`
     : `<ul class="list-none divide-y divide-[rgba(232,228,222,0.6)]">${(activityRows.results ?? []).map((r: any) => {
         const isSuccess = r.status === "success" && r.report_id;
-        const skillLabel = r.skill_name
-          ? `<a href="/skill/${escapeHtml(r.skill_slug)}" class="text-zee-primary hover:underline" onclick="event.stopPropagation()">${escapeHtml(r.skill_name)}</a>`
-          : `<span class="label-muted">(deleted skill)</span>`;
 
-        const metaParts: string[] = [
-          wrapMeta(escapeHtml(timeAgo(r.created_at)), "tt"),
-          wrapMeta(skillLabel),
-          wrapMeta(escapeHtml(r.triggered_by)),
+        // ─── Line 1 — the run: when, how, how long, link to the report ───
+        const lineRunParts: string[] = [
+          `<span class="tt">${escapeHtml(timeAgo(r.created_at))}</span>`,
+          escapeHtml(r.triggered_by),
         ];
+        if (r.duration_ms) lineRunParts.push(`<span class="tt">${escapeHtml(fmtDuration(r.duration_ms))}</span>`);
         if (isSuccess) {
-          if (r.report_word_count != null) {
-            metaParts.push(wrapMeta(`${r.report_word_count.toLocaleString()} words`));
-          }
-          if (r.report_chat_model) {
-            metaParts.push(wrapMeta(escapeHtml(chatModelShortLabel(r.report_chat_model))));
-          }
-          // Visibility into what context the writer had: count web sources
-          // vs archive (prior-report) sources from the persisted citations.
-          if (r.report_sources_json) {
-            try {
-              const cites = JSON.parse(r.report_sources_json) as Array<{ kind?: string }>;
-              if (Array.isArray(cites) && cites.length > 0) {
-                const archive = cites.filter((c) => c?.kind === "archive").length;
-                const web = cites.length - archive;
-                const parts: string[] = [];
-                if (web > 0) parts.push(`${web} web`);
-                if (archive > 0) parts.push(`${archive} 📚`);
-                if (parts.length) metaParts.push(wrapMeta(parts.join(" + ") + " sources"));
-              }
-            } catch { /* malformed JSON — just skip */ }
-          }
-        }
-        if (r.duration_ms) metaParts.push(wrapMeta(escapeHtml(fmtDuration(r.duration_ms)), "tt"));
-        if (isSuccess) {
-          metaParts.push(
-            `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary hover:underline">view report →</a>`,
+          lineRunParts.push(
+            `<a href="/report/${escapeHtml(r.report_id)}" class="text-zee-primary">view report →</a>`,
           );
         }
 
-        const metaLine = `
-          <div class="field-help mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1">
-            ${metaParts.join(metaSep)}
-          </div>`;
+        // ─── Line 2 — the report: words, model, sources, skill ───
+        const lineReportParts: string[] = [];
+        if (isSuccess && r.report_word_count != null) {
+          lineReportParts.push(`<strong class="font-medium">${r.report_word_count.toLocaleString()}</strong> words`);
+        }
+        if (isSuccess && r.report_chat_model) {
+          lineReportParts.push(escapeHtml(chatModelShortLabel(r.report_chat_model)));
+        }
+        if (isSuccess && r.report_sources_json) {
+          try {
+            const cites = JSON.parse(r.report_sources_json) as Array<{ kind?: string }>;
+            if (Array.isArray(cites) && cites.length > 0) {
+              const archive = cites.filter((c) => c?.kind === "archive").length;
+              const web = cites.length - archive;
+              const bits: string[] = [];
+              if (web > 0) bits.push(`${web} web`);
+              if (archive > 0) bits.push(`${archive} 📚`);
+              if (bits.length) lineReportParts.push(bits.join(" + ") + " sources");
+            }
+          } catch { /* malformed JSON — skip */ }
+        }
+        const skillLabel = r.skill_name
+          ? `<a href="/skill/${escapeHtml(r.skill_slug)}" class="text-zee-primary">${escapeHtml(r.skill_name)}</a>`
+          : `<span class="label-muted">(deleted skill)</span>`;
+        lineReportParts.push(`via ${skillLabel}`);
 
-        // Per-row gather funnel — populated from runs.gather_stats_json (new
-        // in migration v9). Empty for historical rows from before the
-        // migration; the helper returns "" so we render nothing extra.
+        // ─── Line 3 — gather funnel (only when populated) ───
         const funnelHtml = renderGatherFunnel(r.gather_stats_json);
-        const funnelLine = funnelHtml
-          ? `<div class="field-help mt-1.5">${funnelHtml}</div>`
-          : "";
+
+        const metaBlock = `
+          <div class="mt-1.5 field-help">${lineRunParts.join(metaSep)}</div>
+          ${lineReportParts.length ? `<div class="mt-1 field-help">${lineReportParts.join(metaSep)}</div>` : ""}
+          ${funnelHtml ? `<div class="mt-1 field-help">${funnelHtml}</div>` : ""}
+        `;
 
         if (isSuccess) {
           return `
             <li class="py-4 flex items-start gap-3.5">
               <span class="activity-dot activity-dot--ok" aria-hidden="true">✓</span>
               <div class="flex-1 min-w-0">
-                <a href="/report/${escapeHtml(r.report_id)}" class="text-sm font-medium text-zee-text hover:text-zee-primary block leading-snug">
+                <a href="/report/${escapeHtml(r.report_id)}" class="text-sm font-medium text-zee-text block leading-snug">
                   ${escapeHtml(r.report_title ?? "Untitled report")}
                 </a>
-                ${metaLine}
-                ${funnelLine}
+                ${metaBlock}
               </div>
               <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline shrink-0" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
                 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
@@ -1947,8 +1960,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             <span class="activity-dot activity-dot--err" aria-hidden="true">✕</span>
             <div class="flex-1 min-w-0">
               <div class="text-sm font-medium text-zee-text leading-snug">${titleLine}</div>
-              ${metaLine}
-              ${funnelLine}
+              ${metaBlock}
               <div class="field-help mt-2 text-[rgb(180,60,60)] break-words leading-relaxed" title="${escapeHtml(errFull)}">
                 ${escapeHtml(errShort)}
               </div>
@@ -1958,7 +1970,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="label"><a href="/admin" class="text-inherit">← Admin</a></p>
+      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span><a href="/admin/targets">Targets</a><span class="sep">·</span>${escapeHtml(target.name)}</p>
       <h1 class="headline mt-2">${escapeHtml(target.name)}</h1>
       <p class="subhead">${target.description ? escapeHtml(target.description) : `<em class="text-zee-muted">No description</em>`}</p>
       <div class="flex flex-wrap items-center gap-3 mt-3.5">
@@ -2095,7 +2107,7 @@ export function renderAdminTools(): string {
 
   const body = `
     <section class="pt-6 pb-2">
-      <p class="label">Admin</p>
+      <p class="crumbs"><a href="/admin">Admin</a><span class="sep">·</span>Tools</p>
       <h1 class="headline mt-2 text-[32px]">Tools.</h1>
       <p class="subhead">What skills can call. Today: Tavily only. Each skill picks one tool + one operation on its edit page. To add another tool, edit <code>TOOLS</code> in <code>src/apis.ts</code> — code + metadata live together.</p>
     </section>
