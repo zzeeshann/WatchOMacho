@@ -899,14 +899,11 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const target = await env.DB.prepare("SELECT slug, name FROM targets WHERE id = ?")
     .bind(report.target_id)
     .first<{ slug: string; name: string }>();
-  const skill = report.skill_id
-    ? await env.DB.prepare("SELECT slug, name FROM skills WHERE id = ?").bind(report.skill_id).first<{ slug: string; name: string }>()
-    : null;
 
   // Strip everything that would visually duplicate the page header:
   //  - leading H1 (title sits in our own header above)
   //  - italic "Target / Generated" frontmatter lines (now redundant with
-  //    the page header's date / skill / model row)
+  //    the page header's date row)
   //  - trailing "Sources" / "References" section the LLM may have written
   //    (we render the canonical numbered list ourselves)
   const bodyMd = stripTrailingSourcesSection(
@@ -918,28 +915,17 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const html = wrapSectionsInCards(renderMarkdown(bodyMd));
   const sourcesHtml = renderSourcesSection(report.sources_json);
 
-  // Pull the run row this report came from so we can render the gather
-  // funnel + duration on the report header. Reports written before
-  // migration v9 won't have gather_stats_json; the helper returns "".
-  const runRow = report.run_id
-    ? await env.DB.prepare(
-        "SELECT gather_stats_json, duration_ms FROM runs WHERE id = ?",
-      ).bind(report.run_id).first<{ gather_stats_json: string | null; duration_ms: number | null }>()
-    : null;
-  const funnelHtml = renderGatherFunnel(runRow?.gather_stats_json);
-
+  // Public report page meta is intentionally minimal — date + word count.
+  // Skill, model, runtime, and the Tavily gather funnel are admin-only
+  // diagnostics and live on /admin instead.
   const body = `
     <section class="pt-8 pb-4">
       <p class="label">${target ? `<a href="/target/${escapeHtml(target.slug)}" class="text-inherit">${escapeHtml(target.name)}</a>` : "Report"}</p>
       <h1 class="headline mt-2">${escapeHtml(report.title)}</h1>
       <div class="flex flex-wrap gap-3 mt-3.5">
         <span class="label-muted">${escapeHtml(formatDate(report.created_at))}</span>
-        ${skill ? `<span class="label-muted">skill: <a href="/skill/${escapeHtml(skill.slug)}" class="text-zee-primary">${escapeHtml(skill.name)}</a></span>` : ""}
         <span class="label-muted">${report.word_count ?? 0} words</span>
-        ${report.chat_model ? `<span class="label-muted" title="${escapeHtml(report.chat_model)}">written by <strong class="text-zee-text font-medium">${escapeHtml(chatModelShortLabel(report.chat_model))}</strong></span>` : ""}
-        ${runRow?.duration_ms ? `<span class="label-muted">${escapeHtml(fmtDuration(runRow.duration_ms))} runtime</span>` : ""}
       </div>
-      ${funnelHtml ? `<div class="field-help mt-2.5" style="max-width: 80ch;">${funnelHtml}</div>` : ""}
     </section>
     <article class="prose pt-6 pb-2">${html}</article>
     ${sourcesHtml}

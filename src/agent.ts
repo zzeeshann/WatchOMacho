@@ -23,6 +23,11 @@ export interface Env {
   REPORTS: R2Bucket;
   MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
+  /** Read-only API key for /api/reports/* endpoints. Set via:
+   *    wrangler secret put WATCHOMACHO_API_KEY
+   *  Callers send it in the `X-API-Key` header. If unset, all /api/*
+   *  endpoints return 401 — read-only access stays explicitly gated. */
+  WATCHOMACHO_API_KEY?: string;
   TAVILY_API_KEY?: string;
   CH_API_KEY?: string;                 // Companies House developer API key (optional)
   // ─── AI Gateway (optional; enables `anthropic/...` chat models) ──────────

@@ -114,6 +114,25 @@ function json(data: any, init: ResponseInit = {}): Response {
   }));
 }
 
+/** Gate /api/* endpoints behind the X-API-Key header (timing-safe compare
+ *  against the WATCHOMACHO_API_KEY secret). Returns null when the request
+ *  is authorised, or a 401 Response to short-circuit otherwise. If the
+ *  secret isn't configured at all the API is locked down entirely — that's
+ *  intentional (fail closed, not open). */
+function requireApiKey(req: Request, env: Env): Response | null {
+  if (!env.WATCHOMACHO_API_KEY) {
+    return json(
+      { error: "API not configured", hint: "Set WATCHOMACHO_API_KEY via `wrangler secret put`." },
+      { status: 503 },
+    );
+  }
+  const sent = req.headers.get("x-api-key") ?? "";
+  if (!sent || !timingSafeEqual(sent, env.WATCHOMACHO_API_KEY)) {
+    return json({ error: "unauthorised" }, { status: 401 });
+  }
+  return null;
+}
+
 function redirect(location: string, extraHeaders: Record<string, string> = {}): Response {
   return new Response(null, { status: 302, headers: { location, ...extraHeaders } });
 }
@@ -258,21 +277,114 @@ export default {
         return html(await renderReportPage(env, id));
       }
 
-      // ─── Public JSON API ─────────────────────────────────────────────────
-      if (path === "/api/targets" && req.method === "GET") {
-        const targets = await listTargets(env, "active");
-        return json({ targets });
-      }
+      // ─── JSON API ────────────────────────────────────────────────────────
+      // All /api/* endpoints are gated by the X-API-Key header. The secret
+      // is WATCHOMACHO_API_KEY (set via `wrangler secret put`). Callers
+      // (daylila dashboard etc.) include it on every request.
+      if (path.startsWith("/api/") && req.method === "GET") {
+        const denied = requireApiKey(req, env);
+        if (denied) return denied;
 
-      if (path === "/api/skills" && req.method === "GET") {
-        const skills = await listSkills(env);
-        return json({
-          skills: skills.map((s) => ({
-            id: s.id, slug: s.slug, name: s.name, description: s.description,
-            author: s.author, used_count: s.used_count,
-            created_at: s.created_at, updated_at: s.updated_at,
-          })),
-        });
+        if (path === "/api/targets") {
+          const targets = await listTargets(env, "active");
+          return json({
+            targets: targets.map((t) => ({
+              id: t.id, slug: t.slug, name: t.name, kind: t.kind,
+              description: t.description, cadence_hours: t.cadence_hours,
+              created_at: t.created_at, updated_at: t.updated_at,
+            })),
+          });
+        }
+
+        if (path === "/api/skills") {
+          const skills = await listSkills(env);
+          return json({
+            skills: skills.map((s) => ({
+              id: s.id, slug: s.slug, name: s.name, description: s.description,
+              author: s.author, used_count: s.used_count,
+              created_at: s.created_at, updated_at: s.updated_at,
+            })),
+          });
+        }
+
+        // GET /api/reports/recent?limit=N — cross-target latest reports for
+        // a "feed"-shaped consumer. Returns lightweight rows (no full body
+        // markdown) — pull individual reports for the full content.
+        if (path === "/api/reports/recent") {
+          const limitRaw = parseInt(url.searchParams.get("limit") ?? "10", 10);
+          const limit = Number.isFinite(limitRaw)
+            ? Math.max(1, Math.min(50, limitRaw))
+            : 10;
+          const origin = new URL(req.url).origin;
+          const rows = await env.DB.prepare(
+            `SELECT reports.id, reports.title, reports.snippet, reports.word_count,
+                    reports.sources_json, reports.created_at,
+                    targets.slug AS target_slug, targets.name AS target_name
+               FROM reports
+               LEFT JOIN targets ON targets.id = reports.target_id
+              ORDER BY reports.created_at DESC
+              LIMIT ?`,
+          ).bind(limit).all<any>();
+          const items = (rows.results ?? []).map((r) => ({
+            id: r.id,
+            title: r.title,
+            url: `${origin}/report/${r.id}`,
+            date: new Date(r.created_at).toISOString(),
+            summary: r.snippet,
+            word_count: r.word_count,
+            target: r.target_slug
+              ? { slug: r.target_slug, name: r.target_name }
+              : null,
+            source_count: r.sources_json
+              ? (() => { try { return JSON.parse(r.sources_json).length; } catch { return 0; } })()
+              : 0,
+          }));
+          return json({ reports: items });
+        }
+
+        // GET /api/reports/:id — full content of a single report. D1 row
+        // for metadata, R2 blob for the markdown body, sources_json for
+        // citations.
+        if (path.startsWith("/api/reports/")) {
+          const id = path.slice("/api/reports/".length);
+          if (!/^[a-z0-9-]+$/.test(id)) {
+            return json({ error: "bad id" }, { status: 400 });
+          }
+          const report = await getReportById(env, id);
+          if (!report) {
+            return json({ error: "not found" }, { status: 404 });
+          }
+          const obj = await env.REPORTS.get(report.r2_key);
+          const bodyMarkdown = obj ? await obj.text() : null;
+          const target = await getTargetById(env, report.target_id);
+          let sources: Array<{ title: string; url: string; kind: string }> = [];
+          if (report.sources_json) {
+            try {
+              const raw = JSON.parse(report.sources_json);
+              if (Array.isArray(raw)) {
+                sources = raw.map((s: any) => ({
+                  title: String(s?.title ?? ""),
+                  url: String(s?.url ?? ""),
+                  kind: String(s?.kind ?? "web"),
+                }));
+              }
+            } catch { /* corrupted JSON — return [] */ }
+          }
+          const origin = new URL(req.url).origin;
+          return json({
+            id: report.id,
+            title: report.title,
+            url: `${origin}/report/${report.id}`,
+            date: new Date(report.created_at).toISOString(),
+            summary: report.snippet,
+            word_count: report.word_count,
+            target: target ? { slug: target.slug, name: target.name } : null,
+            body_markdown: bodyMarkdown,
+            sources,
+          });
+        }
+
+        return json({ error: "unknown endpoint" }, { status: 404 });
       }
 
       // ─── Admin: auth ─────────────────────────────────────────────────────
