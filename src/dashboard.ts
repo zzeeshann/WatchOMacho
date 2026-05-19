@@ -502,6 +502,16 @@ function formatDate(ts: number): string {
   return new Date(ts).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }
 
+/** Compact "14:23 · 19 May" used in dense lists where you want both the
+ *  relative time AND the absolute clock. The full ISO timestamp is
+ *  available on hover via the parent element's `title` attribute. */
+function formatDateTime(ts: number): string {
+  const d = new Date(ts);
+  const hhmm = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const day = d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  return `${hhmm} · ${day}`;
+}
+
 function timeAgo(ts: number): string {
   const diff = Date.now() - ts;
   const mins = Math.floor(diff / 60000);
@@ -1203,13 +1213,16 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
         const errSnippet = r.status !== "success" && r.error
           ? ` · <span class="text-[rgb(180,60,60)]">${escapeHtml(r.error.replace(/^(init|plan|gather|recall|write|persist|done):\s*/, "").slice(0, 50))}</span>`
           : "";
+        const fullIso = new Date(r.created_at).toISOString();
         return `
           <li class="py-2.5 flex items-center gap-3">
             ${dot}
             <div class="flex-1 min-w-0">
               ${targetRef}
-              <span class="text-zee-muted text-sm ml-2">
-                <span class="tt">${timeAgo(r.created_at)}</span>${dur ? ` <span class="mx-1.5 text-zee-border">·</span> <span class="tt">${dur}</span>` : ""}${errSnippet}
+              <span class="text-zee-muted text-sm ml-2" title="${escapeHtml(fullIso)}">
+                <span class="tt">${timeAgo(r.created_at)}</span>
+                <span class="mx-1.5 text-zee-border">·</span>
+                <span class="tt">${formatDateTime(r.created_at)}</span>${dur ? ` <span class="mx-1.5 text-zee-border">·</span> <span class="tt">${dur}</span>` : ""}${errSnippet}
               </span>
             </div>
           </li>`;
