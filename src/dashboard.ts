@@ -1597,6 +1597,57 @@ export async function renderAdminSkills(env: Env): Promise<string> {
       `<option value="${escapeHtml(c)}"${c === selected ? " selected" : ""}>${c === "" ? "(no boost)" : escapeHtml(c)}</option>`,
     ).join("");
 
+  // Shared renderer for the Tavily-search settings block — used by both the
+  // create-by-hand form and every per-skill edit form. Groups the 4 dropdowns
+  // in a responsive 2-column grid (wraps to 1 on narrow screens) and gives
+  // the domain lists their own full-width textareas. params/{sourcesText}
+  // hold the saved values; defaults apply when blank.
+  const tavilySettings = (
+    params: Record<string, string>,
+    sourcesText: string,
+    isTavilyExtract: boolean,
+  ) => `
+    <div class="mt-6 pt-5 border-t border-zee-border">
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted mb-3">Tavily search settings</p>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-5">
+        <div class="field mb-0">
+          <label>Search topic</label>
+          <select name="topic">${topicOptions(params.topic ?? "general")}</select>
+        </div>
+        <div class="field mb-0">
+          <label>Time range</label>
+          <select name="time_range">${timeRangeOptions(params.time_range ?? "")}</select>
+        </div>
+        <div class="field mb-0">
+          <label>Depth</label>
+          <select name="depth">${depthOptions(params.depth ?? "basic")}</select>
+        </div>
+        <div class="field mb-0">
+          <label>Country boost <span class="font-normal normal-case tracking-normal text-zee-muted">(general topic only)</span></label>
+          <select name="country">${countryOptions(params.country ?? "")}</select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Trusted domains <span class="font-normal normal-case tracking-normal text-zee-muted">(one per line — leave empty for the open web)</span></label>
+        <textarea name="include_domains" class="font-mono text-[13px] min-h-[72px]" placeholder="bbc.co.uk&#10;reuters.com&#10;apnews.com&#10;theguardian.com">${escapeHtml(params.include_domains ?? "")}</textarea>
+        <p class="field-help mt-1">Tavily returns results ONLY from these domains.</p>
+      </div>
+
+      <div class="field">
+        <label>Blocked domains <span class="font-normal normal-case tracking-normal text-zee-muted">(one per line)</span></label>
+        <textarea name="exclude_domains" class="font-mono text-[13px] min-h-[56px]" placeholder="pinterest.com&#10;quora.com">${escapeHtml(params.exclude_domains ?? "")}</textarea>
+        <p class="field-help mt-1">Always skipped, even if relevant.</p>
+      </div>
+
+      <div class="field mb-0"${isTavilyExtract ? "" : ' style="display:none"'} data-extract-only>
+        <label>Source URLs <span class="font-normal normal-case tracking-normal text-zee-muted">(only used with <code>tavily / extract</code>)</span></label>
+        <textarea name="tool_sources" class="font-mono text-[13px] min-h-[100px]" placeholder="One URL per line. Lines starting with # are ignored.">${escapeHtml(sourcesText)}</textarea>
+      </div>
+    </div>
+  `;
+
   const list = skills.length === 0
     ? `<div class="empty">No skills yet. Synthesise one below from a brief, or write one by hand.</div>`
     : skills.map((s) => {
@@ -1628,58 +1679,20 @@ export async function renderAdminSkills(env: Env): Promise<string> {
               <input name="description" value="${escapeHtml(s.description ?? "")}" maxlength="200">
             </div>
 
-            <div class="row gap-4 mb-4">
-              <div class="field flex-1 mb-0">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-1">
+              <div class="field mb-0">
                 <label>Tool</label>
                 <select name="tool_slug">${toolOptions(s.tool_slug)}</select>
               </div>
-              <div class="field flex-1 mb-0">
+              <div class="field mb-0">
                 <label>Operation</label>
                 <select name="tool_op">${opOptionsFor(s.tool_slug, s.tool_op)}</select>
               </div>
             </div>
 
-            <div class="row gap-4 mb-4">
-              <div class="field flex-1 mb-0">
-                <label>Search topic</label>
-                <select name="topic">${topicOptions(params.topic ?? "general")}</select>
-              </div>
-              <div class="field flex-1 mb-0">
-                <label>Time range</label>
-                <select name="time_range">${timeRangeOptions(params.time_range ?? "")}</select>
-              </div>
-              <div class="field flex-1 mb-0">
-                <label>Depth</label>
-                <select name="depth">${depthOptions(params.depth ?? "basic")}</select>
-              </div>
-              <div class="field flex-1 mb-0">
-                <label>Country boost</label>
-                <select name="country">${countryOptions(params.country ?? "")}</select>
-              </div>
-            </div>
+            ${tavilySettings(params, sourcesText, isTavilyExtract)}
 
-            <details class="mb-4">
-              <summary class="cursor-pointer text-xs text-zee-muted">Trusted / blocked domains <span class="font-normal normal-case tracking-normal">(comma or space separated, e.g. <code>bbc.co.uk reuters.com</code>)</span></summary>
-              <div class="row gap-4 mt-2">
-                <div class="field flex-1 mb-0">
-                  <label>Trusted only</label>
-                  <input name="include_domains" value="${escapeHtml(params.include_domains ?? "")}" placeholder="bbc.co.uk reuters.com apnews.com" class="font-mono text-[13px]">
-                  <p class="field-help mt-1">Tavily returns results ONLY from these. Leave empty for the open web.</p>
-                </div>
-                <div class="field flex-1 mb-0">
-                  <label>Blocked</label>
-                  <input name="exclude_domains" value="${escapeHtml(params.exclude_domains ?? "")}" placeholder="pinterest.com quora.com" class="font-mono text-[13px]">
-                  <p class="field-help mt-1">Always skipped, even if relevant.</p>
-                </div>
-              </div>
-            </details>
-
-            <details class="mb-4"${isTavilyExtract ? " open" : ""}>
-              <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
-              <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line. Lines starting with # are ignored.">${escapeHtml(sourcesText)}</textarea>
-            </details>
-
-            <div class="field">
+            <div class="field mt-6">
               <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
               <textarea name="procedure_md" class="min-h-[280px] font-mono text-[13px]">${escapeHtml(s.procedure_md)}</textarea>
             </div>
@@ -1730,58 +1743,20 @@ export async function renderAdminSkills(env: Env): Promise<string> {
           <input name="description" maxlength="200">
         </div>
 
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-1">
+          <div class="field mb-0">
             <label>Tool</label>
             <select name="tool_slug">${toolOptions("tavily")}</select>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Operation</label>
             <select name="tool_op">${opOptionsFor("tavily", "search")}</select>
           </div>
         </div>
 
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
-            <label>Search topic</label>
-            <select name="topic">${topicOptions("general")}</select>
-          </div>
-          <div class="field flex-1 mb-0">
-            <label>Time range</label>
-            <select name="time_range">${timeRangeOptions("")}</select>
-          </div>
-          <div class="field flex-1 mb-0">
-            <label>Depth</label>
-            <select name="depth">${depthOptions("basic")}</select>
-          </div>
-          <div class="field flex-1 mb-0">
-            <label>Country boost</label>
-            <select name="country">${countryOptions("")}</select>
-          </div>
-        </div>
+        ${tavilySettings({}, "", false)}
 
-        <details class="mb-4">
-          <summary class="cursor-pointer text-xs text-zee-muted">Trusted / blocked domains <span class="font-normal normal-case tracking-normal">(comma or space separated)</span></summary>
-          <div class="row gap-4 mt-2">
-            <div class="field flex-1 mb-0">
-              <label>Trusted only</label>
-              <input name="include_domains" placeholder="bbc.co.uk reuters.com apnews.com" class="font-mono text-[13px]">
-              <p class="field-help mt-1">Tavily returns results ONLY from these. Leave empty for the open web.</p>
-            </div>
-            <div class="field flex-1 mb-0">
-              <label>Blocked</label>
-              <input name="exclude_domains" placeholder="pinterest.com quora.com" class="font-mono text-[13px]">
-              <p class="field-help mt-1">Always skipped, even if relevant.</p>
-            </div>
-          </div>
-        </details>
-
-        <details class="mb-4">
-          <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
-          <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line."></textarea>
-        </details>
-
-        <div class="field">
+        <div class="field mt-6">
           <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
           <textarea name="procedure_md" required class="min-h-[240px] font-mono text-[13px]" placeholder="**Purpose:** ...
 
@@ -1798,6 +1773,29 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     </div>
 
     ${list}
+
+    <script>
+      // Reveal the "Source URLs" textarea only when the operation dropdown
+      // is set to "extract". Saves the user from staring at a field that
+      // does nothing for the search op (which is 95%+ of skills).
+      function syncExtractFields(form) {
+        const op = form.querySelector('select[name="tool_op"]');
+        const tool = form.querySelector('select[name="tool_slug"]');
+        const extractField = form.querySelector('[data-extract-only]');
+        if (!op || !tool || !extractField) return;
+        const isExtract = tool.value === 'tavily' && op.value === 'extract';
+        extractField.style.display = isExtract ? '' : 'none';
+      }
+      document.querySelectorAll('form').forEach((form) => {
+        if (!form.querySelector('[data-extract-only]')) return;
+        syncExtractFields(form);
+        form.addEventListener('change', (e) => {
+          if (e.target.matches('select[name="tool_op"]') || e.target.matches('select[name="tool_slug"]')) {
+            syncExtractFields(form);
+          }
+        });
+      });
+    </script>
   `;
   return shell("Skills · WatchOMacho", body, { activeNav: "skills", adminFooter: true });
 }
