@@ -1658,7 +1658,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
   `;
 
   const list = skills.length === 0
-    ? `<div class="empty">No skills yet. Synthesise one below from a brief, or write one by hand.</div>`
+    ? `<div class="empty">No skills yet. Add one below.</div>`
     : skills.map((s) => {
       const params: Record<string, string> = s.tool_params_json
         ? (() => { try { return JSON.parse(s.tool_params_json!); } catch { return {}; } })()
@@ -1722,27 +1722,9 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     </section>
 
     <div class="card">
-      <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the writer-instruction markdown for you (defaults to <code>tavily / search</code>; you can change the tool config after).</p>
-      <form method="post" action="/admin/skills">
-        <input type="hidden" name="mode" value="synthesize">
-        <div class="field">
-          <label>Name <span class="font-normal normal-case tracking-normal">(optional)</span></label>
-          <input name="name" placeholder="e.g. Housing research" maxlength="120">
-        </div>
-        <div class="field">
-          <label>Brief</label>
-          <textarea name="brief" placeholder="What should this skill produce? Who is it for? What sources should it lean on?" required></textarea>
-        </div>
-        <button class="btn" type="submit">Synthesise skill</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <div class="h3-row"><h3>Write a skill by hand</h3></div>
+      <div class="h3-row"><h3>New skill</h3></div>
       <p class="field-help mb-3">Pick a tool + op, set its params, then write the instructions. The agent feeds the instructions verbatim into the planner (to generate queries) and the writer (to author the report).</p>
       <form method="post" action="/admin/skills">
-        <input type="hidden" name="mode" value="write">
         <div class="field">
           <label>Name</label>
           <input name="name" required maxlength="120">

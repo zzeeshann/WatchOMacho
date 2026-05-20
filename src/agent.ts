@@ -697,27 +697,6 @@ export interface Skill {
   updated_at: number;
 }
 
-/** System prompt used when the agent synthesises a brand-new skill from a
- *  one-line brief. Produces just the writer instructions — the caller picks
- *  the tool config separately via the form (default: tavily/search). */
-function buildSkillTemplate(): string {
-  return `You are designing the writer instructions for a reusable research skill. Output a plain markdown document that will be fed verbatim to two LLM steps:
-  1. The PLANNER — turns these instructions into web search queries.
-  2. The WRITER — turns the gathered sources into the final report.
-
-Required sections:
-
-**Purpose:** one sentence describing what this skill researches.
-
-**When to use:** the kind of target this works on (postcodes, companies, people, topics, places).
-
-**Approach:** 3–6 sentences. What kinds of sources to lean on, what to look for, what to avoid (hype, marketing, paywalls).
-
-**Output structure:** the headings the final report should use, with one sentence each describing what goes under each heading. Do not include a "Sources" heading — the page renders one automatically.
-
-Do NOT include "Tool:" or "Search topic:" headers — tool selection happens in the skill form, not in the markdown. Do not include any preamble or commentary outside the document.`;
-}
-
 export async function listSkills(env: Env): Promise<Skill[]> {
   const rows = await env.DB.prepare(
     "SELECT * FROM skills ORDER BY used_count DESC, updated_at DESC",
@@ -807,47 +786,6 @@ export async function createSkillFromMarkdown(
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', 0, ?, ?)`,
   )
     .bind(id, slug, name, input.description ?? null, procedure_md, tool_slug, tool_op, tool_params_json, tool_sources_json, now, now)
-    .run();
-  return (await getSkillById(env, id))!;
-}
-
-/** Ask the LLM to write a fresh skill from a one-line brief. Tool selection
- *  defaults to tavily/search (the user can change it on the skill page). */
-export async function synthesizeSkill(
-  env: Env,
-  input: { name?: string; brief: string },
-): Promise<Skill> {
-  const brief = input.brief.trim();
-  if (!brief) throw new Error("brief required");
-  const model = await getChatModel(env);
-  const res = await runChat(env, model, {
-    messages: [
-      { role: "system", content: buildSkillTemplate() },
-      { role: "user", content: `Skill brief: "${brief}"\n\nWrite the procedure document now.` },
-    ],
-    max_tokens: 900,
-  });
-  const procedure_md = res.response.trim();
-  if (procedure_md.length < 60) throw new Error("LLM returned an empty / too-short skill document");
-
-  const heading = procedure_md.match(/^#\s+(.+?)\s*$/m);
-  const inferredName = (input.name ?? heading?.[1] ?? brief).trim().slice(0, 80) || "Untitled skill";
-  const slug = await uniqueSkillSlug(env, inferredName);
-  const id = uid();
-  const now = Date.now();
-
-  const description = procedure_md
-    .split("\n")
-    .map((l) => l.trim())
-    .find((l) => l && !l.startsWith("#"))
-    ?.replace(/\*\*Purpose:\*\*\s*/i, "")
-    .slice(0, 200) ?? null;
-
-  await env.DB.prepare(
-    `INSERT INTO skills (id, slug, name, description, procedure_md, tool_slug, tool_op, tool_params_json, tool_sources_json, author, used_count, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'agent', 0, ?, ?)`,
-  )
-    .bind(id, slug, inferredName, description, procedure_md, DEFAULT_TOOL_SLUG, DEFAULT_TOOL_OP, now, now)
     .run();
   return (await getSkillById(env, id))!;
 }

@@ -28,7 +28,6 @@ import {
   ResearchRunner,
   runResearch,
   setSetting,
-  synthesizeSkill,
   updateSkill,
   updateTarget,
   type Env,
@@ -589,13 +588,6 @@ export default {
       if (path === "/admin/skills" && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
         const form = await readForm(req);
-        const mode = (form.mode ?? "write").trim();
-        if (mode === "synthesize") {
-          const brief = (form.brief ?? "").trim();
-          if (!brief) return json({ error: "brief required" }, { status: 400 });
-          const skill = await synthesizeSkill(env, { brief, name: form.name?.trim() });
-          return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
-        }
         const name = (form.name ?? "").trim();
         const md = (form.procedure_md ?? "").trim();
         if (!name) return json({ error: "name required" }, { status: 400 });
