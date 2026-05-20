@@ -448,7 +448,8 @@ export async function updateTarget(
 const R2_STATIC_KEEP: ReadonlySet<string> = new Set([
   "static/tailwind.v1.css",   // legacy, kept for any still-cached pages
   "static/tailwind.v2.css",   // legacy, kept for any still-cached pages
-  "static/tailwind.v3.css",   // current
+  "static/tailwind.v3.css",   // legacy, kept for any still-cached pages
+  "static/tailwind.v4.css",   // current
 ]);
 
 /** Scan R2 once, returning total object count and the keys not referenced by

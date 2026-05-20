@@ -649,7 +649,7 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<link rel="stylesheet" href="/static/tailwind.v3.css">
+<link rel="stylesheet" href="/static/tailwind.v4.css">
 </head>
 <body>
 <header class="site-header">
@@ -1147,19 +1147,18 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
     : cronAgeMin < 75 ? "text-zee-primary"
     : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
     : "text-[rgb(180,60,60)]";
-  // Cron fires at minute 0 of every hour (cron expression "0 * * * *"). Work
-  // out the minutes until the next tick from "now" so the line reads
-  // "32m ago · next in 28m" instead of the woolly "within the hour".
-  const minsToNextCron = (() => {
-    const d = new Date(now);
-    let mins = 60 - d.getMinutes();
-    if (mins === 60) mins = 0;
-    if (mins === 0) mins = 60;
-    return mins;
-  })();
+  // Cron fires at minute 0 of every hour (cron expression "0 * * * *").
+  // Compute the next fire clock-time AND minutes-until so the line reads
+  // "48m ago · next at 18:00 (in 12m)" — both anchored to the wall clock
+  // (so "12m" makes sense at a glance) and to the elapsed window.
+  const nextCronD = new Date(now);
+  nextCronD.setMinutes(0, 0, 0);
+  nextCronD.setHours(nextCronD.getHours() + 1);
+  const minsToNextCron = Math.max(1, Math.round((nextCronD.getTime() - now) / 60_000));
+  const nextCronClock = nextCronD.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
   const cronLine = cronAgeMin == null
     ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
-    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next in ${minsToNextCron}m</span>`;
+    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next at <span class="tt text-zee-text">${nextCronClock}</span> (in ${minsToNextCron}m)</span>`;
 
   // ─── In-flight banner (only when a run is currently running). The runs
   //     table only has completed rows, so this is the only signal that work
@@ -1344,18 +1343,18 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <select name="chat_model">${modelOptions}</select>
           <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
         </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4 mb-4">
+          <div class="field mb-0">
             <label>Reports / day</label>
             <input type="number" name="daily_report_limit" min="0" max="10000" value="${escapeHtml(reportLim)}">
             <div class="field-help">${usage.reports} used today</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Tavily credits / day</label>
             <input type="number" name="daily_search_limit" min="0" max="100000" value="${escapeHtml(searchLim)}">
             <div class="field-help">${usage.searches} used today</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Runs / hour</label>
             <input type="number" name="cron_max_per_tick" min="1" max="20" value="${escapeHtml(perTick)}">
             <div class="field-help">Cap per hourly cron firing</div>
@@ -1363,13 +1362,13 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         </div>
 
         <div class="label-muted mt-2 mb-2">Run guardrails <span class="font-normal normal-case tracking-normal text-zee-muted">(worker-wide CPU + kill switches)</span></div>
-        <div class="row gap-4 mb-2">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-2">
+          <div class="field mb-0">
             <label>Max chars per source</label>
             <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}">
             <div class="field-help mt-1.5">How much of each source's text is sent to the writer. Default <strong>4000</strong>. Drop to <strong>2000</strong> for Workers AI Llama (24k context).</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Max run seconds <span class="font-normal normal-case tracking-normal">(kill switch)</span></label>
             <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}">
             <div class="field-help mt-1.5">Soft ceiling on a single run's wall-clock. Aborts hung fetches. Default <strong>90&nbsp;s</strong>. Hard ceiling is the 15-min DO alarm limit.</div>
@@ -1892,8 +1891,8 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
           <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
           <input name="description" maxlength="400">
         </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-4 mb-4">
+          <div class="field mb-0">
             <label>Cadence</label>
             <select name="cadence_hours">
               <option value="1">every hour</option>
@@ -1904,7 +1903,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
               <option value="168">every week</option>
             </select>
           </div>
-          <div class="field flex-[2] mb-0">
+          <div class="field mb-0 sm:col-span-2">
             <label>Skill to apply</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
@@ -2087,8 +2086,8 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <label>Description</label>
           <input name="description" value="${escapeHtml(target.description ?? "")}" maxlength="400">
         </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-4 mb-4">
+          <div class="field mb-0">
             <label>Status</label>
             <select name="status">
               <option value="active"${target.status === "active" ? " selected" : ""}>active</option>
@@ -2096,33 +2095,33 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
               <option value="archived"${target.status === "archived" ? " selected" : ""}>archived</option>
             </select>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Cadence</label>
             <select name="cadence_hours">${cadenceOptions}</select>
           </div>
-          <div class="field flex-[2] mb-0">
+          <div class="field mb-0 md:col-span-2">
             <label>Primary skill</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
 
         <div class="label-muted mt-2 mb-2">Tavily knobs <span class="font-normal normal-case tracking-normal text-zee-muted">(blank = use the global default)</span></div>
-        <div class="row gap-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4">
+          <div class="field mb-0">
             <label>Queries per run</label>
             <input type="number" name="queries_per_run" min="1" max="20" step="1"
                    value="${target.queries_per_run ?? ""}"
                    placeholder="10 (default)">
             <div class="field-help mt-1.5">How many distinct search queries the planner produces. World-news-style skills want 10; a focused postcode dossier wants 2–3.</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Tavily min score</label>
             <input type="number" name="tavily_min_score" min="0" max="1" step="0.05"
                    value="${target.tavily_min_score != null ? target.tavily_min_score.toFixed(2) : ""}"
                    placeholder="0.40 (default)">
             <div class="field-help mt-1.5">Drops Tavily hits below this relevance score. 0 = keep everything (noisy). 1 = strict.</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Max final sources</label>
             <input type="number" name="tavily_max_final_sources" min="1" max="200" step="1"
                    value="${target.tavily_max_final_sources ?? ""}"
