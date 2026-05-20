@@ -246,8 +246,8 @@ export default {
       // ─── Static assets (served from R2 watchomacho-reports/static/) ──────
       // Versioned filenames are immutable: bump the filename version to bust
       // the edge cache.
-      if (path === "/static/tailwind.v2.css" && (req.method === "GET" || req.method === "HEAD")) {
-        const obj = await env.REPORTS.get("static/tailwind.v2.css");
+      if (path === "/static/tailwind.v3.css" && (req.method === "GET" || req.method === "HEAD")) {
+        const obj = await env.REPORTS.get("static/tailwind.v3.css");
         if (!obj) return new Response("Not found", { status: 404 });
         const headers = {
           "content-type": "text/css; charset=utf-8",

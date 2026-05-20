@@ -649,7 +649,7 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<link rel="stylesheet" href="/static/tailwind.v2.css">
+<link rel="stylesheet" href="/static/tailwind.v3.css">
 </head>
 <body>
 <header class="site-header">
@@ -1147,9 +1147,19 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
     : cronAgeMin < 75 ? "text-zee-primary"
     : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
     : "text-[rgb(180,60,60)]";
+  // Cron fires at minute 0 of every hour (cron expression "0 * * * *"). Work
+  // out the minutes until the next tick from "now" so the line reads
+  // "32m ago · next in 28m" instead of the woolly "within the hour".
+  const minsToNextCron = (() => {
+    const d = new Date(now);
+    let mins = 60 - d.getMinutes();
+    if (mins === 60) mins = 0;
+    if (mins === 0) mins = 60;
+    return mins;
+  })();
   const cronLine = cronAgeMin == null
     ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
-    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next within the hour</span>`;
+    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next in ${minsToNextCron}m</span>`;
 
   // ─── In-flight banner (only when a run is currently running). The runs
   //     table only has completed rows, so this is the only signal that work
