@@ -15,6 +15,7 @@ import {
   getReportById,
   getSetting,
   getSkillBySlug,
+  getSkillTargetCounts,
   getTargetBySlug,
   listReportsForTarget,
   listSkills,
@@ -1564,7 +1565,10 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminSkills(env: Env): Promise<string> {
-  const skills = await listSkills(env);
+  const [skills, targetCounts] = await Promise.all([
+    listSkills(env),
+    getSkillTargetCounts(env),
+  ]);
 
   // Centralised dropdown helpers — used by both the create form and every
   // edit form below. Same option lists, same semantics.
@@ -1667,6 +1671,10 @@ export async function renderAdminSkills(env: Env): Promise<string> {
         ? (() => { try { return (JSON.parse(s.tool_sources_json!) as string[]).join("\n"); } catch { return ""; } })()
         : "";
       const isTavilyExtract = s.tool_slug === "tavily" && s.tool_op === "extract";
+      const liveTargets = targetCounts[s.id] ?? 0;
+      const liveBadge = liveTargets > 0
+        ? `<span class="ml-2 text-xs text-zee-primary">in use on ${liveTargets} target${liveTargets === 1 ? "" : "s"}</span>`
+        : `<span class="ml-2 text-xs text-zee-muted">unassigned</span>`;
       return `
         <details class="card px-5 py-4">
           <summary class="cursor-pointer list-none flex flex-wrap justify-between items-baseline gap-3">
@@ -1674,6 +1682,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
               <strong class="font-medium">${escapeHtml(s.name)}</strong>
               <span class="badge badge-${s.author} ml-2">${s.author}</span>
               ${s.tool_slug ? `<span class="label-muted ml-2">${escapeHtml(s.tool_slug)} / ${escapeHtml(s.tool_op ?? "")}</span>` : `<span class="label-muted ml-2">writer only</span>`}
+              ${liveBadge}
               <a href="/skill/${escapeHtml(s.slug)}" class="ml-2 text-xs text-zee-primary">public →</a>
             </span>
             <span class="label-muted">used ${s.used_count}× · ${escapeHtml(timeAgo(s.updated_at))}</span>
@@ -1707,7 +1716,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
             </div>
             <div class="row">
               <button class="btn" type="submit">Save changes</button>
-              <button type="button" class="btn btn-danger" onclick="if(confirm('Delete this skill?')){fetch('/admin/skills/${escapeHtml(s.slug)}/delete',{method:'POST'}).then(()=>location.reload())}">Delete skill</button>
+              <button type="button" class="btn btn-danger" data-delete-skill data-slug="${escapeHtml(s.slug)}" data-name="${escapeHtml(s.name)}">Delete skill</button>
             </div>
           </form>
         </details>
@@ -1766,6 +1775,51 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     ${list}
 
     <script>
+      // Delete-skill safety check. Before firing the destructive POST we
+      // call GET /admin/skills/:slug/usage and show the user what's still
+      // referencing the skill. Server-side deleteSkill also blocks if any
+      // target points at it, so this is belt-and-braces — the inline check
+      // just gives a better message than a 409 response would.
+      document.querySelectorAll('[data-delete-skill]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const slug = btn.getAttribute('data-slug');
+          const name = btn.getAttribute('data-name') || slug;
+          btn.disabled = true;
+          try {
+            const r = await fetch('/admin/skills/' + encodeURIComponent(slug) + '/usage');
+            if (!r.ok) {
+              alert('Could not check skill usage. Try again.');
+              return;
+            }
+            const usage = await r.json();
+            const tList = (usage.targets || []).map((t) => '"' + t.name + '"').join(', ');
+            if ((usage.targets || []).length > 0) {
+              alert(
+                'Cannot delete "' + name + '" — it is still the primary skill for ' +
+                usage.targets.length + ' target' + (usage.targets.length === 1 ? '' : 's') + ': ' + tList +
+                '.\\n\\nReassign ' + (usage.targets.length === 1 ? 'that target' : 'those targets') +
+                ' to a different skill first, then come back.',
+              );
+              return;
+            }
+            const reportsNote = usage.reports > 0
+              ? '\\n\\nNote: ' + usage.reports + ' past report' + (usage.reports === 1 ? '' : 's') +
+                ' produced by this skill will stay in the archive but lose their skill link.'
+              : '';
+            if (!confirm('Delete skill "' + name + '"?' + reportsNote)) return;
+            const del = await fetch('/admin/skills/' + encodeURIComponent(slug) + '/delete', { method: 'POST' });
+            if (del.ok || del.redirected) {
+              location.reload();
+            } else {
+              const body = await del.json().catch(() => null);
+              alert(body?.error || ('Delete failed (HTTP ' + del.status + ')'));
+            }
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      });
+
       // Reveal the "Source URLs" textarea only when the operation dropdown
       // is set to "extract". Saves the user from staring at a field that
       // does nothing for the search op (which is 95%+ of skills).

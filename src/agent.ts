@@ -839,11 +839,55 @@ export async function updateSkill(
     .run();
 }
 
+/** What's still pointing at this skill? `targets` is the live list (a target
+ *  whose primary_skill_id matches), `reports` is historical (the archive
+ *  records which skill produced each report — these don't block delete but
+ *  the caller can warn about them). Used by the delete-skill safety check
+ *  and surfaced as "used by N targets" on the skill list. */
+export interface SkillUsage {
+  targets: Array<{ id: string; slug: string; name: string }>;
+  reports: number;
+}
+
+export async function countSkillUsage(env: Env, skillId: string): Promise<SkillUsage> {
+  const [targetsRes, reportsRes] = await Promise.all([
+    env.DB.prepare(
+      "SELECT id, slug, name FROM targets WHERE primary_skill_id = ? ORDER BY name",
+    ).bind(skillId).all<{ id: string; slug: string; name: string }>(),
+    env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM reports WHERE skill_id = ?",
+    ).bind(skillId).first<{ n: number }>(),
+  ]);
+  return {
+    targets: targetsRes.results ?? [],
+    reports: Number(reportsRes?.n ?? 0),
+  };
+}
+
+/** How many targets currently treat each skill as their primary? Used to
+ *  render an inline "used by N targets" hint on the skill list without
+ *  an N+1 query. Skills with 0 are omitted from the map. */
+export async function getSkillTargetCounts(env: Env): Promise<Record<string, number>> {
+  const rows = await env.DB.prepare(
+    "SELECT primary_skill_id AS sid, COUNT(*) AS n FROM targets WHERE primary_skill_id IS NOT NULL GROUP BY primary_skill_id",
+  ).all<{ sid: string; n: number }>();
+  const out: Record<string, number> = {};
+  for (const r of rows.results ?? []) out[r.sid] = Number(r.n);
+  return out;
+}
+
+/** Delete a skill, but ONLY if no live target still references it. Throws
+ *  a descriptive error otherwise — the caller must reassign the target(s)
+ *  first. Historical reports (reports.skill_id) keep their link; nothing
+ *  cascades into them. */
 export async function deleteSkill(env: Env, id: string): Promise<void> {
-  // Detach from any targets first.
-  await env.DB.prepare("UPDATE targets SET primary_skill_id = NULL WHERE primary_skill_id = ?")
-    .bind(id)
-    .run();
+  const usage = await countSkillUsage(env, id);
+  if (usage.targets.length > 0) {
+    const names = usage.targets.map((t) => `"${t.name}"`).join(", ");
+    throw new Error(
+      `Skill is still the primary skill for ${usage.targets.length} target${usage.targets.length === 1 ? "" : "s"}: ${names}. Reassign ${usage.targets.length === 1 ? "that target" : "those targets"} to a different skill first.`,
+    );
+  }
   await env.DB.prepare("DELETE FROM skills WHERE id = ?").bind(id).run();
 }
 

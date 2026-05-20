@@ -9,6 +9,7 @@ import {
   createSkillFromMarkdown,
   createTarget,
   backfillMemory,
+  countSkillUsage,
   deleteReport,
   deleteSkill,
   deleteTarget,
@@ -636,11 +637,30 @@ export default {
         }
       }
 
+      // Pre-flight: tell the UI where a skill is used so the delete button
+      // can show a meaningful warning instead of a blind confirm.
+      if (path.startsWith("/admin/skills/") && path.endsWith("/usage") && req.method === "GET") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const slug = path.slice("/admin/skills/".length, path.length - "/usage".length);
+        const skill = await getSkillBySlug(env, slug);
+        if (!skill) return json({ error: "not found" }, { status: 404 });
+        const usage = await countSkillUsage(env, skill.id);
+        return json(usage);
+      }
+
       if (path.startsWith("/admin/skills/") && path.endsWith("/delete") && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
         const slug = path.slice("/admin/skills/".length, path.length - "/delete".length);
         const skill = await getSkillBySlug(env, slug);
-        if (skill) await deleteSkill(env, skill.id);
+        if (!skill) return redirect("/admin/skills");
+        try {
+          await deleteSkill(env, skill.id);
+        } catch (e: any) {
+          // Most likely: target(s) still reference it. Return the usage so
+          // the UI can present the names of the blockers, not a stack trace.
+          const usage = await countSkillUsage(env, skill.id).catch(() => null);
+          return json({ error: e?.message ?? "delete failed", usage }, { status: 409 });
+        }
         return redirect("/admin/skills");
       }
 
