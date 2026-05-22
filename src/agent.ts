@@ -974,7 +974,7 @@ function plannerSystemPrompt(
   }
   return `${intro}
 Return EXACTLY ${n} concrete web search queries — always ${n}, never fewer.
-If you can't think of ${n} obviously distinct angles, broaden the net: cover different regions, different outlets (Reuters, AP, BBC, Al Jazeera, Le Monde, Deutsche Welle, Nikkei Asia, etc.), different sectors (politics, conflicts, markets, science, society, climate, sports). It is far better to produce ${n} queries of varying angle than to under-plan.
+If you can't think of ${n} obviously distinct angles, broaden the net across regions, outlets, and sectors. It is far better to produce ${n} queries of varying angle than to under-plan.
 ${placeholder}${filters}`;
 }
 
@@ -1042,6 +1042,10 @@ interface GatheredSource {
 // in Haiku 4.5's 200k context window. Note: if you switch the chat model
 // back to Workers AI Llama 3.3 70B (24k context), runs may fail at ~15+
 // sources — drop this to 2000 in that case (or add model-aware scaling).
+// Default; can be overridden per-run via the `writer_max_tokens` setting.
+// Sonnet 4.6 supports up to 64k output; we cap at 16k for safety / wall-clock.
+const DEFAULT_WRITER_MAX_TOKENS = 2200;
+
 // Default; can be overridden per-run via the `max_chars_per_source` setting
 // (Search tuning admin card).
 const DEFAULT_MAX_CHARS_PER_SOURCE = 4000;
@@ -1550,11 +1554,6 @@ async function writeReport(
         .join("\n\n")
     : "(No sources gathered — write from general knowledge but explicitly say so.)";
 
-  const archiveCount = citations.filter((c) => c.kind === "archive").length;
-  const archiveGuidance = archiveCount > 0
-    ? `\n\n${archiveCount} of the source${archiveCount === 1 ? " is a PRIOR REPORT" : "s are PRIOR REPORTS"} from this archive (marked above). Do NOT repeat what those said verbatim — instead build on them, surface what has changed since, and cite them with their [N] when the new report relies on or contradicts them.`
-    : "";
-
   const userMsg = `SKILL TO APPLY
 =====
 ${skill.procedure_md}
@@ -1567,9 +1566,13 @@ Description: ${target.description ?? "(none)"}
 
 SOURCES (cite inline with [n])
 ==============================
-${sourceBlock}${archiveGuidance}
+${sourceBlock}
 
-Now write the report. Follow the output structure defined in the skill. Cite sources inline by [n] (matching the numbered sources above — including PRIOR REPORTS) wherever you draw from a source or build on/contradict prior coverage. Do NOT write a "Sources" section at the end — the report page renders a canonical numbered source list automatically. Be concrete, not generic. If sources contradict, say so. If you don't have enough information for a section, say "Not enough source material yet" rather than padding.`;
+Now write the report. Follow the skill exactly. Cite sources inline by [n] matching the sources above. Do NOT write a "Sources" section at the end — the report page renders a canonical numbered source list automatically.`;
+
+  const writerMaxTokens = await readIntSetting(
+    env, "writer_max_tokens", DEFAULT_WRITER_MAX_TOKENS, 200, 16000,
+  );
 
   const res = await runChat(env, model, {
     messages: [
@@ -1577,12 +1580,7 @@ Now write the report. Follow the output structure defined in the skill. Cite sou
         role: "system",
         content: `You are a research agent that writes precise, scannable markdown reports.
 
-Tone: editorial, calm, intellectually honest. No hype, no filler phrases ("rich history", "fascinating place", "in conclusion"). Aim for ~500 words.
-
-Source weighting (each web source carries metadata after its title line — "published <date> · relevance <0-1>"):
-- Prefer recent sources over older ones for any time-sensitive claim (news, prices, status). If a fact comes from a source dated weeks ago and a newer source contradicts it, lead with the newer one.
-- Higher-relevance sources (score closer to 1.0) are more confident matches for the query. Cite them with more weight; use lower-relevance sources as corroboration, not primary backbone.
-- If a critical claim only appears in a single low-relevance or old source, hedge ("one outlet reports…") rather than asserting flatly.
+Apply the SKILL exactly — tone, structure, length, source weighting, and editorial posture all come from it. Each web source carries metadata after its title line ("published <date> · relevance <0-1>") that the skill can tell you how to use.
 
 Markdown formatting rules (follow strictly — the rendering engine depends on them):
 - Do NOT write a top-level \`# Title\` heading at the start. The report title is rendered separately above the body. Start directly with your first section.
@@ -1594,7 +1592,7 @@ Markdown formatting rules (follow strictly — the rendering engine depends on t
       },
       { role: "user", content: userMsg },
     ],
-    max_tokens: 2200,
+    max_tokens: writerMaxTokens,
   }, signal);
 
   const body = res.response.trim();

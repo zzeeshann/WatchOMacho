@@ -1258,7 +1258,7 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
 
 export async function renderAdminPanel(env: Env): Promise<string> {
   const cutoff24h = Date.now() - 24 * 3600 * 1000;
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1292,6 +1292,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     ).all<{ id: string; status: string; error: string | null; duration_ms: number | null; created_at: number; report_id: string | null; target_slug: string | null; target_name: string | null }>(),
     getSetting(env, "max_chars_per_source", "4000"),
     getSetting(env, "max_run_seconds", "90"),
+    getSetting(env, "writer_max_tokens", "2200"),
   ]);
   const maxCharsPerSource = (() => {
     const n = parseInt(maxCharsPerSourceStr, 10);
@@ -1300,6 +1301,10 @@ export async function renderAdminPanel(env: Env): Promise<string> {
   const maxRunSeconds = (() => {
     const n = parseInt(maxRunSecondsStr, 10);
     return Number.isFinite(n) && n >= 5 && n <= 600 ? n : 90;
+  })();
+  const writerMaxTokens = (() => {
+    const n = parseInt(writerMaxTokensStr, 10);
+    return Number.isFinite(n) && n >= 200 && n <= 16000 ? n : 2200;
   })();
   const embedLastOkAt = parseInt(embedLastOkStr, 10) || 0;
   const embedLastError: { message: string; at: number; report_id?: string } | null =
@@ -1363,11 +1368,16 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         </div>
 
         <div class="label-muted mt-2 mb-2">Run guardrails <span class="font-normal normal-case tracking-normal text-zee-muted">(worker-wide CPU + kill switches)</span></div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-2">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4 mb-2">
           <div class="field mb-0">
             <label>Max chars per source</label>
             <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}">
-            <div class="field-help mt-1.5">How much of each source's text is sent to the writer. Default <strong>4000</strong>. Drop to <strong>2000</strong> for Workers AI Llama (24k context).</div>
+            <div class="field-help mt-1.5">How much of each source's text is sent to the writer. Default <strong>4000</strong>. Sonnet's 200k context can take <strong>8000</strong> easily.</div>
+          </div>
+          <div class="field mb-0">
+            <label>Writer max tokens</label>
+            <input type="number" name="writer_max_tokens" min="200" max="16000" step="100" value="${writerMaxTokens}">
+            <div class="field-help mt-1.5">How long the report can be. Default <strong>2200</strong> (~1500 words). Raise for deeper reports — Sonnet 4.6 supports up to 16000 (~12000 words). Output tokens are the expensive half.</div>
           </div>
           <div class="field mb-0">
             <label>Max run seconds <span class="font-normal normal-case tracking-normal">(kill switch)</span></label>

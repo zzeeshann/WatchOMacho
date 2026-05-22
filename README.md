@@ -123,7 +123,7 @@ If you set a custom-domain route in `wrangler.toml`, wrangler handles DNS + SSL 
 | Card | Always-open | Contents |
 | --- | --- | --- |
 | System heartbeat | yes | Cron last ran · in-flight banner (when live) · last 24h digest (N runs, X✓ Y✕, avg duration) · clickable recent-runs list with relative + absolute timestamps |
-| Budgets & settings | collapsed | Chat model · daily report/Tavily caps · runs/hour · run guardrails (max chars per source, max run seconds) |
+| Budgets & settings | collapsed | Chat model · daily report/Tavily caps · runs/hour · run guardrails (max chars per source, writer max tokens, max run seconds) |
 | Memory & cleanup | collapsed | R2 orphan sweep · Vectorize recall status + Backfill memory button |
 | Diagnostics | collapsed | Link to Cloudflare Workers Observability dashboard |
 

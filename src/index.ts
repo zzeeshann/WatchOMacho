@@ -702,6 +702,7 @@ export default {
           // target columns (v11) so they're no longer here.
           max_chars_per_source: [200, 8000],
           max_run_seconds: [5, 600],
+          writer_max_tokens: [200, 16000],
         };
         const updated: Record<string, string> = {};
         for (const [k, [lo, hi]] of Object.entries(numericKeys)) {
