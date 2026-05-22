@@ -2,20 +2,21 @@
 
 Forward plan for WatchOMacho. Where v4 is, where it's going, and what's deliberately out of scope right now.
 
-> **Status (2026-05-18):**
+> **Status (2026-05-22):**
 > - Level 1+2 shipped via Tavily ([PLAN.md](PLAN.md))
-> - Level 3 partially shipped — first four UK typed tools (Land Registry, ONS, data.police.uk, Companies House) + multi-tool refactor ([PLAN_LEVEL3.md](PLAN_LEVEL3.md))
-> - **Memory loop shipped** — embed every report, recall similar prior reports as `[N]` archive citations alongside web sources, navigable graph via 📚 markers ([BOOK.md Ch 15](BOOK.md))
-> - **Observability shipped** — step-level heartbeat + per-run Tavily gather funnel visible in admin Maintenance card ([BOOK.md Ch 16](BOOK.md))
-> - **Gather tuning shipped** — Tavily max_results=20, planner cap 10, title-Jaccard dedupe, dynamic skill structure, MAX_CHARS_PER_SOURCE=4000 on Haiku ([BOOK.md Ch 17](BOOK.md))
-> - **Admin Search-tuning card shipped** — `tavily_min_score` editable from `/admin` ([BOOK.md Ch 18](BOOK.md))
+> - **Level 3 REVERTED 2026-05-19** — the four UK typed tools (Land Registry, ONS, data.police.uk, Companies House) shipped on 2026-05-17 but were rolled back in commit `1825402` ("Simplify: one tool, explicit skills"). `TOOLS` registry is now Tavily-only. The multi-tool refactor that supported them stayed in place; one explicit tool per skill is the current shape.
+> - **Memory loop shipped** — embed every report, recall similar prior reports as `[N]` archive citations alongside web sources, navigable graph via 📚 markers
+> - **Observability shipped** — step-level heartbeat + per-run Tavily gather funnel visible in admin Heartbeat card
+> - **Gather tuning shipped** — Tavily max_results=20, planner cap 10, title-Jaccard dedupe, dynamic skill structure, `max_chars_per_source` admin-tunable
+> - **Admin Search-tuning shipped** — `tavily_min_score` editable per-target (and globally) from `/admin`
+> - **Sonnet 4.6 + lean prompts shipped 2026-05-22** — default chat model is `anthropic/claude-sonnet-4-6`; hardcoded editorial controls stripped from writer/planner so the skill is the only voice; new `writer_max_tokens` setting tunable from admin (default 2200, range 200–16000)
 > - Level 4 (true agentic tool-use loop) still deferred — current pipeline is fully sufficient
 
 ## Where we are — v4 + Tavily (current)
 
 **One research agent. Targets get reports via reusable Skills, on a cadence.**
 
-Architecture: Cloudflare Workers + Workers AI (Llama 3.3 70B / Mistral 24B / etc. via admin dropdown) + Vectorize for memory + D1 for structure + R2 for report bodies + [Tavily](https://tavily.com) for web search **and** full-page extraction in one vendor. Single platform plus one search vendor, one bill.
+Architecture: Cloudflare Workers + Cloudflare AI Gateway → Anthropic Claude Sonnet 4.6 (Haiku 4.5 + ~8 Workers AI models selectable as fallbacks) + Vectorize for memory + D1 for structure + R2 for report bodies + [Tavily](https://tavily.com) for web search **and** full-page extraction in one vendor. Single platform plus one search vendor, one bill.
 
 The research loop is:
 1. **Plan** (LLM) — what to search for (skipped when the skill declares `**Tavily op:** extract` with explicit URLs)
@@ -44,35 +45,19 @@ Both shortcomings are addressed in a later level below.
 ### ~~Level 2~~ — DELIVERED by Tavily
 ~~After Brave returns URLs, our code fetches the top 3–5 pages and extracts text.~~ Tavily's `/search` does this in one HTTP call (no need for a separate `fetchPage()` step or Cloudflare Browser Rendering). Skip this level — the work is done.
 
-### Level 3 — Typed tools (specialist depth) — INITIAL FOUR DELIVERED 2026-05-17
+### Level 3 — Typed tools (specialist depth) — REVERTED 2026-05-19
 
-The first four UK-focused typed tools shipped on top of Tavily, alongside a multi-tool refactor that lets a skill declare any combination of tools (one of each). The agent's `gatherSources` dispatches over a `SkillToolCall[]`; each typed tool flattens its structured output to a markdown table or labelled block so the writer prompt stays uniform.
+> The first four UK typed tools (Land Registry, ONS, data.police.uk, Companies House) shipped on 2026-05-17 then were removed on 2026-05-19 in commit `1825402` ("Simplify: one tool, explicit skills"). The multi-tool dispatch shape stayed (skills still pick a tool via `tool_slug`/`tool_op` columns), but `TOOLS` is now Tavily-only. PLAN_LEVEL3.md kept as history of the shipped-then-reverted feature.
 
-**Delivered:**
-- **HM Land Registry Open Data** — sold-price history per postcode (SPARQL endpoint, keyless)
-- **ONS / postcodes.io** — UK postcode administrative geography (country, region, district, ward, constituency, LSOA, MSOA, parish)
-- **data.police.uk** — street-level crime aggregated by category, last N months (keyless, England/Wales/NI only — not Scotland)
-- **Companies House** — search by name or filter by registered-office postcode (free API key required)
+**Why reverted:** the typed tools added registry surface area without paying off in skill authorship — Tavily's full-page extraction covered the same research questions with less per-skill plumbing.
 
-Each is in `src/apis.ts` with a typed return shape, an entry in the `TOOLS` registry, and a dispatch case in `gatherSources` (in `agent.ts`). A skill declares a tool with a header like `**Land Registry op:** sold-prices` + optional per-tool params (`**Months:** 6`, `**Limit:** 25`, etc.). The synthesis prompt and `/admin/tools` page render the catalog dynamically, so future tools surface automatically.
+**If specialist depth becomes needed again**, the implementation pattern still works: write a fetch function in `apis.ts` returning typed data, add an entry to the `TOOLS` registry (slug, display, summary, operations, headers), and add a dispatch case in `gatherSources`. Each handler returns `GatheredSource[]` with `{ title, url, content }` — flatten structured data to a markdown table inside `content` so the writer LLM sees one shape.
 
-**Remaining UK candidates (not yet wired):**
-- **EPC Open Data** — energy performance certificates
-- **TfL Unified API** — London transport stops, departures
-- **OpenStreetMap Overpass** — amenities (shops, parks, schools)
-- **data.gov.uk** — schools, hospitals, flood zones
+Candidates worth re-considering if the use case appears:
+- **EPC Open Data**, **TfL Unified API**, **OSM Overpass**, **data.gov.uk** (UK)
+- **OpenAlex / arXiv**, **Wikidata SPARQL**, **Open-Meteo**, **GitHub API**, **GDELT** (global)
 
-**Global candidates (not yet wired):**
-- **OpenAlex** / arXiv — academic papers
-- **Wikidata SPARQL** — structured facts
-- **Open-Meteo** — weather + history
-- **GitHub API** — for company/person targets
-- **HackerNews API** — for topic targets
-- **GDELT** — global events
-
-**Implementation pattern** (same as the four delivered): write a fetch function in `apis.ts` returning typed data, add an entry to the `TOOLS` registry (slug, display, summary, operations, headers), and add a dispatch case in `gatherSources`. Each handler returns `GatheredSource[]` with `{ title, url, content }` — flatten structured data to a markdown table inside `content` so the writer LLM sees one shape.
-
-**Risk of overreach**: still applies. Pick 2–3 more tools that match your actual research targets, not every UK API in existence. More tools = more context for the LLM = more cost + cognitive load on the model.
+**Risk of overreach** still applies. Pick 2–3 tools that match your actual research targets, not every API in existence. More tools = more context for the LLM = more cost + cognitive load on the model.
 
 ### Level 4 — True agentic tool-use loop
 The LLM iteratively calls tools, sees results, decides next steps, calls more tools, then writes. Requires real function-calling support — Claude and GPT do this cleanly; Workers AI Llama is more limited.
@@ -126,7 +111,7 @@ Hobby use on Haiku stays well under $10/month. The Workers AI free path remains 
 
 ## "What to do next" — practical answer for future sessions
 
-If you hit "Run Now never completes for skill X" → **already solved.** Manual runs route through the `ResearchRunner` Durable Object alarm (15-min budget instead of the 30s `waitUntil` cap). Guarded by `max_run_seconds` + AbortController + watchdog cron. See [BOOK.md](BOOK.md) chapters 19–22 and the "Run Now path" section in [ARCHITECTURE.md](ARCHITECTURE.md).
+If you hit "Run Now never completes for skill X" → **already solved.** Manual runs route through the `ResearchRunner` Durable Object alarm (15-min budget instead of the 30s `waitUntil` cap). Guarded by `max_run_seconds` + AbortController + watchdog cron. See the "Run Now path" section in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 If quality of reports is still the bottleneck after Tavily → check whether `MAX_CHARS_PER_SOURCE` (4000) is too aggressive a cap, or whether `**Depth:** advanced` would help (2 credits instead of 1, but more thorough extraction).
 

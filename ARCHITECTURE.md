@@ -57,13 +57,13 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | --- | --- | --- | --- |
 | 1 | **Budget check** | D1 read | ~free |
 | 2 | **Build tool call** — read `skill.tool_slug`, `skill.tool_op`, `skill.tool_params_json`, `skill.tool_sources_json` directly from the row (no markdown parsing). NULL tool_slug = writer-only skill. | local | free |
-| 3 | **Plan** — LLM picks **N** search queries where N = `target.queries_per_run` (NULL falls back to global default 10). Planner prompt scales with N. Skipped if the tool call isn't Tavily/search. | 1 chat call | ~150–300 neurons (Llama) / ~$0.001 (Haiku) |
+| 3 | **Plan** — LLM picks **N** search queries where N = `target.queries_per_run` (NULL falls back to global default 10). Planner prompt scales with N. Skipped if the tool call isn't Tavily/search. | 1 chat call | ~$0.01 (Sonnet) / ~$0.003 (Haiku) / free (Workers AI) |
 | 4 | **Gather** — dispatch the tool call. Today always Tavily. Results pass through 3 filters (see "Gather pipeline" below). | N HTTP calls (one per query) | Tavily: 1 credit/query |
 | 5 | **Recall** — Vectorize semantic + D1 same-target recents, layered & deduped | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
-| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context | 1 chat call | ~$0.013–0.026 (Haiku) |
+| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context. Output capped by `writer_max_tokens` setting (default 2200, range 200–16000). | 1 chat call | ~$0.04–0.43 (Sonnet) / ~$0.013–0.036 (Haiku) — scales with sources kept |
 | 7 | **Persist** — R2 put + D1 inserts + embed + Vectorize upsert + update target.next_run_at + runs audit row + heartbeat setting | 1 R2 put + ~4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
 
-**Total per run (Haiku default):** ~2 chat calls + 1 embedding + N Tavily calls (default N=10) → roughly **$0.013–0.026 + N Tavily credits**. At 2 runs/day = **~$10–20/year + 600 Tavily credits/month** (free tier is 1000).
+**Total per run (Sonnet default):** ~2 chat calls + 1 embedding + N Tavily calls (default N=10) → roughly **$0.05/run with a tight min-score filter, up to $0.44/run with min-score=0 on a busy news skill** + N Tavily credits. At 1 run/day = **~$1.50–13/month + 300 Tavily credits/month** (free tier is 1000). Haiku 4.5 selectable as a ~5× cheaper fallback.
 
 ---
 
@@ -86,8 +86,8 @@ For each `runResearch(target, skill, triggeredBy)` call:
               ▼                                      │
    Filter 1: SCORE                                  │
    drop hits with score < tavily_min_score          │
-   (admin-editable, default 0.4 — Tavily's          │
-   bottom rail)                                      │
+   (per-target override; global default 0.35 —      │
+   Tavily's bottom rail. Set to 0 to keep all hits.)│
               │                                      │
               ▼                                      │
    ~10–60 survive (varies by news cycle)             │
@@ -495,7 +495,7 @@ The chat model is editable live from `/admin`. The dispatcher (`runChat()` in `a
 
 | Use | Default | Notes |
 | --- | --- | --- |
-| Chat (planning + report writing + skill synthesis) | `anthropic/claude-haiku-4-5-20251001` | ~$0.01/report via Unified Billing. Allow-listed via `ALLOWED_CHAT_MODELS` in `agent.ts` (8 Workers AI options + 1 AI Gateway option as of writing). |
+| Chat (planning + report writing + skill synthesis) | `anthropic/claude-sonnet-4-6` | ~$0.05–0.44/report via Unified Billing depending on min-score + max_final_sources. Allow-listed via `ALLOWED_CHAT_MODELS` in `agent.ts` (8 Workers AI options + 2 AI Gateway options — Sonnet 4.6 default, Haiku 4.5 fallback). |
 | Embeddings (memory) | `@cf/baai/bge-base-en-v1.5` | Always Workers AI. Tiny — fits comfortably in free pool. |
 
 `DEFAULT_CHAT_MODEL` in `agent.ts` is what the cron tick + new installs use when the `chat_model` setting is missing. Adding a new model: append to `ALLOWED_CHAT_MODELS`, add a human-readable label to `CHAT_MODEL_LABELS`, and (if it's a new provider prefix) extend `runAnthropicChat`-style handler. Reports record their model in the `chat_model` column so you can A/B retrospectively.

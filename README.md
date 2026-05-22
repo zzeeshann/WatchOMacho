@@ -33,7 +33,7 @@ For each `(target, skill)` execution:
 4. **Write** — the LLM writes a markdown report following the skill's output structure, citing every source (web + archive) inline by number.
 5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs` (incl. per-run gather funnel JSON), step-level heartbeat in `settings` so the admin System heartbeat shows what's happening live.
 
-Two LLM calls + one Tavily batch per run. Predictable cost (~$0.01–0.02 on Claude Haiku 4.5, free on Workers AI Llama), predictable structure, fully observable.
+Two LLM calls + one Tavily batch per run. Predictable cost (~$0.05/run on Claude Sonnet 4.6, ~$0.01 on Haiku 4.5, free on Workers AI), predictable structure, fully observable.
 
 ## Setup — about 10 minutes
 
@@ -90,7 +90,7 @@ npx wrangler secret put CF_AIG_TOKEN             # CF API token with "AI Gateway
 npx wrangler secret put ANTHROPIC_API_KEY
 ```
 
-Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only). Without `WATCHOMACHO_API_KEY` the JSON API returns 503 — public HTML pages keep working. Without the AI Gateway secrets the Haiku dropdown option errors; Workers AI models keep working.
+Without `TAVILY_API_KEY` the agent still runs but produces thinner reports (LLM general knowledge only). Without `WATCHOMACHO_API_KEY` the JSON API returns 503 — public HTML pages keep working. Without the AI Gateway secrets the Anthropic dropdown options (Sonnet 4.6, Haiku 4.5) error; Workers AI models keep working — flip the dropdown to one as a fallback.
 
 Build the Tailwind bundle and upload to R2:
 
@@ -136,10 +136,10 @@ Each target can override three Tavily defaults from its Configure card. NULL = u
 | Knob | Default | Range |
 | --- | --- | --- |
 | `queries_per_run` | 10 | 1–20 |
-| `tavily_min_score` | 0.4 | 0.0–1.0 |
+| `tavily_min_score` | 0.35 | 0.0–1.0 |
 | `tavily_max_final_sources` | 100 | 1–200 |
 
-So a "broad news brief" target can ask for 10 queries with min-score 0.4, while a "focused company watch" target asks for 2 queries with min-score 0.7 — without colliding on globals.
+So a "broad news brief" target can ask for 10 queries with min-score 0 (keep everything), while a "focused company watch" target asks for 2 queries with min-score 0.7 — without colliding on globals.
 
 ## Chat models
 
@@ -151,19 +151,20 @@ Editable live from Budgets & settings. Dispatcher (`runChat()` in `agent.ts`) ro
 - Mistral Small 3.1, Llama 4 Scout, Gemma 3, QwQ, DeepSeek R1 (full allow-list in `agent.ts`)
 
 **Anthropic via AI Gateway** (paid, bypasses Workers AI quota):
-- `anthropic/claude-haiku-4-5-20251001` — **default**. ~$0.01 per report.
+- `anthropic/claude-sonnet-4-6` — **default**. ~$0.05–0.45 per report depending on how many sources are kept (input tokens scale with `max_final_sources` × `max_chars_per_source`).
+- `anthropic/claude-haiku-4-5-20251001` — fallback. ~$0.01 per report. Pick this if cost matters more than quality.
 
 Every report records which model wrote it (`reports.chat_model`). Embeddings always go through Workers AI `@cf/baai/bge-base-en-v1.5` (free, tiny).
 
 ## Cost
 
-Hobby use (~5 reports/day on Haiku 4.5):
+Hobby use on **Sonnet 4.6** (1 target × 1 report/day):
 
-- **AI Gateway credits: ~$1.60/month**
-- Tavily: free (1000 credits/mo cap; ~25 credits/day at 5 basic searches each)
+- **AI Gateway: ~$1.50–13/month** depending on min-score (tight filter → ~$0.05/run, no filter → ~$0.44/run on a busy news skill)
+- Tavily: free (1000 credits/mo cap; ~30 credits/day per news-style run)
 - Everything else (Workers requests, Workers AI embeddings, Vectorize, R2, D1, Cron, Durable Objects): free
 
-At 20 reports/day on Haiku: ~$6/month. Switch the dropdown to a Workers AI model for $0 (thinner writing, same loop).
+On **Haiku 4.5** the same workload costs ~$0.30–1.20/month. Switch via the chat-model dropdown anytime — no redeploy needed. Workers AI options stay in the dropdown as the $0 fallback.
 
 ## API surface
 
