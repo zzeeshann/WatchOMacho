@@ -65,6 +65,7 @@ export const ALLOWED_CHAT_MODELS = [
   "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
   "@cf/qwen/qwq-32b",
   // ─── AI Gateway → Anthropic (pay-per-token, bypasses Workers AI quota) ─────
+  "anthropic/claude-sonnet-4-6",
   "anthropic/claude-haiku-4-5-20251001",
 ] as const;
 
@@ -77,10 +78,11 @@ export const CHAT_MODEL_LABELS: Record<string, string> = {
   "@cf/meta/llama-3.1-8b-instruct-fast": "Llama 3.1 8B (fast) — ~100 reports/day on free pool",
   "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b": "DeepSeek R1 Distill (32B) — reasoning",
   "@cf/qwen/qwq-32b": "Qwen QwQ (32B) — reasoning",
+  "anthropic/claude-sonnet-4-6": "Claude Sonnet 4.6 (AI Gateway) — paid, ~$0.05/report, best quality",
   "anthropic/claude-haiku-4-5-20251001": "Claude Haiku 4.5 (AI Gateway) — paid, ~$0.01/report, no Workers AI quota",
 };
 
-export const DEFAULT_CHAT_MODEL = "anthropic/claude-haiku-4-5-20251001";
+export const DEFAULT_CHAT_MODEL = "anthropic/claude-sonnet-4-6";
 
 export function isAllowedChatModel(m: string): boolean {
   return (ALLOWED_CHAT_MODELS as readonly string[]).includes(m);
