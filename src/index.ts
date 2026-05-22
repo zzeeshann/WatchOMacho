@@ -9,6 +9,7 @@ import {
   createSkillFromMarkdown,
   createTarget,
   backfillMemory,
+  countSkillUsage,
   deleteReport,
   deleteSkill,
   deleteTarget,
@@ -28,7 +29,6 @@ import {
   ResearchRunner,
   runResearch,
   setSetting,
-  synthesizeSkill,
   updateSkill,
   updateTarget,
   type Env,
@@ -80,12 +80,20 @@ function withSecurityHeaders(init: ResponseInit): ResponseInit {
 
 /** Pull the per-skill tool params from a form. Returns a flat object of
  *  whatever was set; blank values are dropped so they fall back to the
- *  tool's defaults at run time. */
+ *  tool's defaults at run time. Domain lists are normalised to comma-
+ *  separated lowercase tokens; gatherTavily re-splits them. */
 function collectSkillToolParams(form: Record<string, string>): Record<string, string> {
   const params: Record<string, string> = {};
-  for (const k of ["topic", "time_range", "depth"]) {
+  for (const k of ["topic", "time_range", "depth", "country"]) {
     const v = (form[k] ?? "").trim();
     if (v) params[k] = v;
+  }
+  for (const k of ["include_domains", "exclude_domains"]) {
+    const cleaned = (form[k] ?? "")
+      .split(/[\s,]+/)
+      .map((d) => d.trim().toLowerCase())
+      .filter((d) => d && /^[a-z0-9.-]+$/.test(d));
+    if (cleaned.length) params[k] = cleaned.join(", ");
   }
   return params;
 }
@@ -238,8 +246,8 @@ export default {
       // ─── Static assets (served from R2 watchomacho-reports/static/) ──────
       // Versioned filenames are immutable: bump the filename version to bust
       // the edge cache.
-      if (path === "/static/tailwind.v2.css" && (req.method === "GET" || req.method === "HEAD")) {
-        const obj = await env.REPORTS.get("static/tailwind.v2.css");
+      if (path === "/static/tailwind.v4.css" && (req.method === "GET" || req.method === "HEAD")) {
+        const obj = await env.REPORTS.get("static/tailwind.v4.css");
         if (!obj) return new Response("Not found", { status: 404 });
         const headers = {
           "content-type": "text/css; charset=utf-8",
@@ -581,13 +589,6 @@ export default {
       if (path === "/admin/skills" && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
         const form = await readForm(req);
-        const mode = (form.mode ?? "write").trim();
-        if (mode === "synthesize") {
-          const brief = (form.brief ?? "").trim();
-          if (!brief) return json({ error: "brief required" }, { status: 400 });
-          const skill = await synthesizeSkill(env, { brief, name: form.name?.trim() });
-          return redirect(`/admin/skills?focus=${encodeURIComponent(skill.slug)}`);
-        }
         const name = (form.name ?? "").trim();
         const md = (form.procedure_md ?? "").trim();
         if (!name) return json({ error: "name required" }, { status: 400 });
@@ -636,11 +637,30 @@ export default {
         }
       }
 
+      // Pre-flight: tell the UI where a skill is used so the delete button
+      // can show a meaningful warning instead of a blind confirm.
+      if (path.startsWith("/admin/skills/") && path.endsWith("/usage") && req.method === "GET") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const slug = path.slice("/admin/skills/".length, path.length - "/usage".length);
+        const skill = await getSkillBySlug(env, slug);
+        if (!skill) return json({ error: "not found" }, { status: 404 });
+        const usage = await countSkillUsage(env, skill.id);
+        return json(usage);
+      }
+
       if (path.startsWith("/admin/skills/") && path.endsWith("/delete") && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
         const slug = path.slice("/admin/skills/".length, path.length - "/delete".length);
         const skill = await getSkillBySlug(env, slug);
-        if (skill) await deleteSkill(env, skill.id);
+        if (!skill) return redirect("/admin/skills");
+        try {
+          await deleteSkill(env, skill.id);
+        } catch (e: any) {
+          // Most likely: target(s) still reference it. Return the usage so
+          // the UI can present the names of the blockers, not a stack trace.
+          const usage = await countSkillUsage(env, skill.id).catch(() => null);
+          return json({ error: e?.message ?? "delete failed", usage }, { status: 409 });
+        }
         return redirect("/admin/skills");
       }
 

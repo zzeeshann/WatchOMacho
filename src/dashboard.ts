@@ -15,6 +15,7 @@ import {
   getReportById,
   getSetting,
   getSkillBySlug,
+  getSkillTargetCounts,
   getTargetBySlug,
   listReportsForTarget,
   listSkills,
@@ -649,7 +650,7 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<link rel="stylesheet" href="/static/tailwind.v2.css">
+<link rel="stylesheet" href="/static/tailwind.v4.css">
 </head>
 <body>
 <header class="site-header">
@@ -944,6 +945,7 @@ function renderGatherFunnel(json: string | null | undefined): string {
     const g = JSON.parse(json) as {
       tavily_queries?: number; tavily_raw?: number; after_score_filter?: number;
       after_url_dedupe?: number; after_title_dedupe?: number; final_kept?: number;
+      tavily_credits?: number;
     };
     if (!g.tavily_queries || g.tavily_queries === 0) {
       if (g.final_kept && g.final_kept > 0) {
@@ -955,7 +957,10 @@ function renderGatherFunnel(json: string | null | undefined): string {
     // visible whitespace even when the parent flex/wrap rules kick in.
     const sep = `<span class="mx-1.5 text-zee-border" aria-hidden="true">·</span>`;
     const arrow = `<span class="mx-1.5 text-zee-border" aria-hidden="true">→</span>`;
-    return `<span>Tavily <strong class="font-medium text-zee-text">${g.tavily_queries}q</strong></span>${sep}`
+    const creditsTag = g.tavily_credits && g.tavily_credits > 0
+      ? `${sep}<span class="tt text-zee-muted">${g.tavily_credits} credits</span>`
+      : "";
+    return `<span>Tavily <strong class="font-medium text-zee-text">${g.tavily_queries}q</strong></span>${creditsTag}${sep}`
       + `<span class="tt">${g.tavily_raw} raw</span>${arrow}`
       + `<span class="tt">${g.after_score_filter} (score)</span>${arrow}`
       + `<span class="tt">${g.after_url_dedupe} (URL)</span>${arrow}`
@@ -1143,9 +1148,18 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
     : cronAgeMin < 75 ? "text-zee-primary"
     : cronAgeMin < 120 ? "text-[rgb(196,154,26)]"
     : "text-[rgb(180,60,60)]";
+  // Cron fires at minute 0 of every hour (cron expression "0 * * * *").
+  // Compute the next fire clock-time AND minutes-until so the line reads
+  // "48m ago · next at 18:00 (in 12m)" — both anchored to the wall clock
+  // (so "12m" makes sense at a glance) and to the elapsed window.
+  const nextCronD = new Date(now);
+  nextCronD.setMinutes(0, 0, 0);
+  nextCronD.setHours(nextCronD.getHours() + 1);
+  const minsToNextCron = Math.max(1, Math.round((nextCronD.getTime() - now) / 60_000));
+  const nextCronClock = nextCronD.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
   const cronLine = cronAgeMin == null
     ? `<span class="text-zee-muted">no cron tick recorded yet</span>`
-    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next within the hour</span>`;
+    : `<span class="${cronColor} font-medium">${timeAgo(lastCronRun)}</span> <span class="text-zee-muted">· next at <span class="tt text-zee-text">${nextCronClock}</span> (in ${minsToNextCron}m)</span>`;
 
   // ─── In-flight banner (only when a run is currently running). The runs
   //     table only has completed rows, so this is the only signal that work
@@ -1292,7 +1306,7 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     embedLastErrorRaw ? (() => { try { return JSON.parse(embedLastErrorRaw); } catch { return null; } })() : null;
   const totalReports = totalReportsRow?.n ?? 0;
   const lastCronRun = parseInt(lastCronRunStr, 10) || 0;
-  type GatherStats = { tavily_queries: number; tavily_raw: number; after_score_filter: number; after_url_dedupe: number; after_title_dedupe: number; final_kept: number };
+  type GatherStats = { tavily_queries: number; tavily_raw: number; after_score_filter: number; after_url_dedupe: number; after_title_dedupe: number; final_kept: number; tavily_credits: number };
   type LastRunAttempt = { run_id: string; target_slug: string; triggered_by: "cron" | "manual"; started_at: number; last_step: string; completed_at: number | null; outcome: "in_flight" | "success" | "error"; error?: string; gather_stats?: GatherStats };
   const lastRunAttempt: LastRunAttempt | null = lastRunAttemptRaw
     ? (() => { try { return JSON.parse(lastRunAttemptRaw); } catch { return null; } })()
@@ -1330,18 +1344,18 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <select name="chat_model">${modelOptions}</select>
           <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
         </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4 mb-4">
+          <div class="field mb-0">
             <label>Reports / day</label>
             <input type="number" name="daily_report_limit" min="0" max="10000" value="${escapeHtml(reportLim)}">
             <div class="field-help">${usage.reports} used today</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Tavily credits / day</label>
             <input type="number" name="daily_search_limit" min="0" max="100000" value="${escapeHtml(searchLim)}">
             <div class="field-help">${usage.searches} used today</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Runs / hour</label>
             <input type="number" name="cron_max_per_tick" min="1" max="20" value="${escapeHtml(perTick)}">
             <div class="field-help">Cap per hourly cron firing</div>
@@ -1349,13 +1363,13 @@ export async function renderAdminPanel(env: Env): Promise<string> {
         </div>
 
         <div class="label-muted mt-2 mb-2">Run guardrails <span class="font-normal normal-case tracking-normal text-zee-muted">(worker-wide CPU + kill switches)</span></div>
-        <div class="row gap-4 mb-2">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-2">
+          <div class="field mb-0">
             <label>Max chars per source</label>
             <input type="number" name="max_chars_per_source" min="200" max="8000" step="100" value="${maxCharsPerSource}">
             <div class="field-help mt-1.5">How much of each source's text is sent to the writer. Default <strong>4000</strong>. Drop to <strong>2000</strong> for Workers AI Llama (24k context).</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Max run seconds <span class="font-normal normal-case tracking-normal">(kill switch)</span></label>
             <input type="number" name="max_run_seconds" min="5" max="600" step="5" value="${maxRunSeconds}">
             <div class="field-help mt-1.5">Soft ceiling on a single run's wall-clock. Aborts hung fetches. Default <strong>90&nbsp;s</strong>. Hard ceiling is the 15-min DO alarm limit.</div>
@@ -1551,7 +1565,10 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderAdminSkills(env: Env): Promise<string> {
-  const skills = await listSkills(env);
+  const [skills, targetCounts] = await Promise.all([
+    listSkills(env),
+    getSkillTargetCounts(env),
+  ]);
 
   // Centralised dropdown helpers — used by both the create form and every
   // edit form below. Same option lists, same semantics.
@@ -1579,9 +1596,73 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     ["basic", "advanced"].map((t) =>
       `<option value="${t}"${t === selected ? " selected" : ""}>${t}</option>`,
     ).join("");
+  // Country boost (general topic only — Tavily ignores it for news/finance).
+  // Short curated list of the boosts most likely to be useful here; "" = no
+  // boost. Add to the list if you need more — Tavily accepts any of the
+  // ~100 names from its docs.
+  const COUNTRY_CHOICES = [
+    "", "United Kingdom", "United States", "Ireland", "France", "Germany",
+    "Spain", "Italy", "Netherlands", "Canada", "Australia", "India",
+    "Japan", "Brazil", "South Africa",
+  ];
+  const countryOptions = (selected: string) =>
+    COUNTRY_CHOICES.map((c) =>
+      `<option value="${escapeHtml(c)}"${c === selected ? " selected" : ""}>${c === "" ? "(no boost)" : escapeHtml(c)}</option>`,
+    ).join("");
+
+  // Shared renderer for the Tavily-search settings block — used by both the
+  // create-by-hand form and every per-skill edit form. Groups the 4 dropdowns
+  // in a responsive 2-column grid (wraps to 1 on narrow screens) and gives
+  // the domain lists their own full-width textareas. params/{sourcesText}
+  // hold the saved values; defaults apply when blank.
+  const tavilySettings = (
+    params: Record<string, string>,
+    sourcesText: string,
+    isTavilyExtract: boolean,
+  ) => `
+    <div class="mt-6 pt-5 border-t border-zee-border">
+      <p class="text-xs uppercase tracking-[0.12em] text-zee-muted mb-3">Tavily search settings</p>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-5">
+        <div class="field mb-0">
+          <label>Search topic</label>
+          <select name="topic">${topicOptions(params.topic ?? "general")}</select>
+        </div>
+        <div class="field mb-0">
+          <label>Time range</label>
+          <select name="time_range">${timeRangeOptions(params.time_range ?? "")}</select>
+        </div>
+        <div class="field mb-0">
+          <label>Depth</label>
+          <select name="depth">${depthOptions(params.depth ?? "basic")}</select>
+        </div>
+        <div class="field mb-0">
+          <label>Country boost <span class="font-normal normal-case tracking-normal text-zee-muted">(general topic only)</span></label>
+          <select name="country">${countryOptions(params.country ?? "")}</select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Trusted domains <span class="font-normal normal-case tracking-normal text-zee-muted">(one per line — leave empty for the open web)</span></label>
+        <textarea name="include_domains" class="font-mono text-[13px] min-h-[72px]" placeholder="bbc.co.uk&#10;reuters.com&#10;apnews.com&#10;theguardian.com">${escapeHtml(params.include_domains ?? "")}</textarea>
+        <p class="field-help mt-1">Tavily returns results ONLY from these domains.</p>
+      </div>
+
+      <div class="field">
+        <label>Blocked domains <span class="font-normal normal-case tracking-normal text-zee-muted">(one per line)</span></label>
+        <textarea name="exclude_domains" class="font-mono text-[13px] min-h-[56px]" placeholder="pinterest.com&#10;quora.com">${escapeHtml(params.exclude_domains ?? "")}</textarea>
+        <p class="field-help mt-1">Always skipped, even if relevant.</p>
+      </div>
+
+      <div class="field mb-0"${isTavilyExtract ? "" : ' style="display:none"'} data-extract-only>
+        <label>Source URLs <span class="font-normal normal-case tracking-normal text-zee-muted">(only used with <code>tavily / extract</code>)</span></label>
+        <textarea name="tool_sources" class="font-mono text-[13px] min-h-[100px]" placeholder="One URL per line. Lines starting with # are ignored.">${escapeHtml(sourcesText)}</textarea>
+      </div>
+    </div>
+  `;
 
   const list = skills.length === 0
-    ? `<div class="empty">No skills yet. Synthesise one below from a brief, or write one by hand.</div>`
+    ? `<div class="empty">No skills yet. Add one below.</div>`
     : skills.map((s) => {
       const params: Record<string, string> = s.tool_params_json
         ? (() => { try { return JSON.parse(s.tool_params_json!); } catch { return {}; } })()
@@ -1590,6 +1671,10 @@ export async function renderAdminSkills(env: Env): Promise<string> {
         ? (() => { try { return (JSON.parse(s.tool_sources_json!) as string[]).join("\n"); } catch { return ""; } })()
         : "";
       const isTavilyExtract = s.tool_slug === "tavily" && s.tool_op === "extract";
+      const liveTargets = targetCounts[s.id] ?? 0;
+      const liveBadge = liveTargets > 0
+        ? `<span class="ml-2 text-xs text-zee-primary">in use on ${liveTargets} target${liveTargets === 1 ? "" : "s"}</span>`
+        : `<span class="ml-2 text-xs text-zee-muted">unassigned</span>`;
       return `
         <details class="card px-5 py-4">
           <summary class="cursor-pointer list-none flex flex-wrap justify-between items-baseline gap-3">
@@ -1597,6 +1682,7 @@ export async function renderAdminSkills(env: Env): Promise<string> {
               <strong class="font-medium">${escapeHtml(s.name)}</strong>
               <span class="badge badge-${s.author} ml-2">${s.author}</span>
               ${s.tool_slug ? `<span class="label-muted ml-2">${escapeHtml(s.tool_slug)} / ${escapeHtml(s.tool_op ?? "")}</span>` : `<span class="label-muted ml-2">writer only</span>`}
+              ${liveBadge}
               <a href="/skill/${escapeHtml(s.slug)}" class="ml-2 text-xs text-zee-primary">public →</a>
             </span>
             <span class="label-muted">used ${s.used_count}× · ${escapeHtml(timeAgo(s.updated_at))}</span>
@@ -1611,44 +1697,26 @@ export async function renderAdminSkills(env: Env): Promise<string> {
               <input name="description" value="${escapeHtml(s.description ?? "")}" maxlength="200">
             </div>
 
-            <div class="row gap-4 mb-4">
-              <div class="field flex-1 mb-0">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-1">
+              <div class="field mb-0">
                 <label>Tool</label>
                 <select name="tool_slug">${toolOptions(s.tool_slug)}</select>
               </div>
-              <div class="field flex-1 mb-0">
+              <div class="field mb-0">
                 <label>Operation</label>
                 <select name="tool_op">${opOptionsFor(s.tool_slug, s.tool_op)}</select>
               </div>
             </div>
 
-            <div class="row gap-4 mb-4">
-              <div class="field flex-1 mb-0">
-                <label>Search topic</label>
-                <select name="topic">${topicOptions(params.topic ?? "general")}</select>
-              </div>
-              <div class="field flex-1 mb-0">
-                <label>Time range</label>
-                <select name="time_range">${timeRangeOptions(params.time_range ?? "")}</select>
-              </div>
-              <div class="field flex-1 mb-0">
-                <label>Depth</label>
-                <select name="depth">${depthOptions(params.depth ?? "basic")}</select>
-              </div>
-            </div>
+            ${tavilySettings(params, sourcesText, isTavilyExtract)}
 
-            <details class="mb-4"${isTavilyExtract ? " open" : ""}>
-              <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
-              <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line. Lines starting with # are ignored.">${escapeHtml(sourcesText)}</textarea>
-            </details>
-
-            <div class="field">
+            <div class="field mt-6">
               <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
               <textarea name="procedure_md" class="min-h-[280px] font-mono text-[13px]">${escapeHtml(s.procedure_md)}</textarea>
             </div>
             <div class="row">
               <button class="btn" type="submit">Save changes</button>
-              <button type="button" class="btn btn-danger" onclick="if(confirm('Delete this skill?')){fetch('/admin/skills/${escapeHtml(s.slug)}/delete',{method:'POST'}).then(()=>location.reload())}">Delete skill</button>
+              <button type="button" class="btn btn-danger" data-delete-skill data-slug="${escapeHtml(s.slug)}" data-name="${escapeHtml(s.name)}">Delete skill</button>
             </div>
           </form>
         </details>
@@ -1663,27 +1731,9 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     </section>
 
     <div class="card">
-      <div class="h3-row"><h3>Synthesise a skill</h3></div>
-      <p class="field-help mb-3">Describe what the skill should do in one paragraph. The agent will write the writer-instruction markdown for you (defaults to <code>tavily / search</code>; you can change the tool config after).</p>
-      <form method="post" action="/admin/skills">
-        <input type="hidden" name="mode" value="synthesize">
-        <div class="field">
-          <label>Name <span class="font-normal normal-case tracking-normal">(optional)</span></label>
-          <input name="name" placeholder="e.g. Housing research" maxlength="120">
-        </div>
-        <div class="field">
-          <label>Brief</label>
-          <textarea name="brief" placeholder="What should this skill produce? Who is it for? What sources should it lean on?" required></textarea>
-        </div>
-        <button class="btn" type="submit">Synthesise skill</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <div class="h3-row"><h3>Write a skill by hand</h3></div>
+      <div class="h3-row"><h3>New skill</h3></div>
       <p class="field-help mb-3">Pick a tool + op, set its params, then write the instructions. The agent feeds the instructions verbatim into the planner (to generate queries) and the writer (to author the report).</p>
       <form method="post" action="/admin/skills">
-        <input type="hidden" name="mode" value="write">
         <div class="field">
           <label>Name</label>
           <input name="name" required maxlength="120">
@@ -1693,38 +1743,20 @@ export async function renderAdminSkills(env: Env): Promise<string> {
           <input name="description" maxlength="200">
         </div>
 
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4 mb-1">
+          <div class="field mb-0">
             <label>Tool</label>
             <select name="tool_slug">${toolOptions("tavily")}</select>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Operation</label>
             <select name="tool_op">${opOptionsFor("tavily", "search")}</select>
           </div>
         </div>
 
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
-            <label>Search topic</label>
-            <select name="topic">${topicOptions("general")}</select>
-          </div>
-          <div class="field flex-1 mb-0">
-            <label>Time range</label>
-            <select name="time_range">${timeRangeOptions("")}</select>
-          </div>
-          <div class="field flex-1 mb-0">
-            <label>Depth</label>
-            <select name="depth">${depthOptions("basic")}</select>
-          </div>
-        </div>
+        ${tavilySettings({}, "", false)}
 
-        <details class="mb-4">
-          <summary class="cursor-pointer text-xs text-zee-muted">Source URLs <span class="font-normal normal-case tracking-normal">(only used with <code>tavily / extract</code>)</span></summary>
-          <textarea name="tool_sources" class="mt-2 min-h-[100px] font-mono text-[13px]" placeholder="One URL per line."></textarea>
-        </details>
-
-        <div class="field">
+        <div class="field mt-6">
           <label>Writer instructions <span class="font-normal normal-case tracking-normal">(markdown — goes verbatim to the planner + writer)</span></label>
           <textarea name="procedure_md" required class="min-h-[240px] font-mono text-[13px]" placeholder="**Purpose:** ...
 
@@ -1741,6 +1773,74 @@ export async function renderAdminSkills(env: Env): Promise<string> {
     </div>
 
     ${list}
+
+    <script>
+      // Delete-skill safety check. Before firing the destructive POST we
+      // call GET /admin/skills/:slug/usage and show the user what's still
+      // referencing the skill. Server-side deleteSkill also blocks if any
+      // target points at it, so this is belt-and-braces — the inline check
+      // just gives a better message than a 409 response would.
+      document.querySelectorAll('[data-delete-skill]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const slug = btn.getAttribute('data-slug');
+          const name = btn.getAttribute('data-name') || slug;
+          btn.disabled = true;
+          try {
+            const r = await fetch('/admin/skills/' + encodeURIComponent(slug) + '/usage');
+            if (!r.ok) {
+              alert('Could not check skill usage. Try again.');
+              return;
+            }
+            const usage = await r.json();
+            const tList = (usage.targets || []).map((t) => '"' + t.name + '"').join(', ');
+            if ((usage.targets || []).length > 0) {
+              alert(
+                'Cannot delete "' + name + '" — it is still the primary skill for ' +
+                usage.targets.length + ' target' + (usage.targets.length === 1 ? '' : 's') + ': ' + tList +
+                '.\\n\\nReassign ' + (usage.targets.length === 1 ? 'that target' : 'those targets') +
+                ' to a different skill first, then come back.',
+              );
+              return;
+            }
+            const reportsNote = usage.reports > 0
+              ? '\\n\\nNote: ' + usage.reports + ' past report' + (usage.reports === 1 ? '' : 's') +
+                ' produced by this skill will stay in the archive but lose their skill link.'
+              : '';
+            if (!confirm('Delete skill "' + name + '"?' + reportsNote)) return;
+            const del = await fetch('/admin/skills/' + encodeURIComponent(slug) + '/delete', { method: 'POST' });
+            if (del.ok || del.redirected) {
+              location.reload();
+            } else {
+              const body = await del.json().catch(() => null);
+              alert(body?.error || ('Delete failed (HTTP ' + del.status + ')'));
+            }
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      });
+
+      // Reveal the "Source URLs" textarea only when the operation dropdown
+      // is set to "extract". Saves the user from staring at a field that
+      // does nothing for the search op (which is 95%+ of skills).
+      function syncExtractFields(form) {
+        const op = form.querySelector('select[name="tool_op"]');
+        const tool = form.querySelector('select[name="tool_slug"]');
+        const extractField = form.querySelector('[data-extract-only]');
+        if (!op || !tool || !extractField) return;
+        const isExtract = tool.value === 'tavily' && op.value === 'extract';
+        extractField.style.display = isExtract ? '' : 'none';
+      }
+      document.querySelectorAll('form').forEach((form) => {
+        if (!form.querySelector('[data-extract-only]')) return;
+        syncExtractFields(form);
+        form.addEventListener('change', (e) => {
+          if (e.target.matches('select[name="tool_op"]') || e.target.matches('select[name="tool_slug"]')) {
+            syncExtractFields(form);
+          }
+        });
+      });
+    </script>
   `;
   return shell("Skills · WatchOMacho", body, { activeNav: "skills", adminFooter: true });
 }
@@ -1827,8 +1927,8 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
           <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
           <input name="description" maxlength="400">
         </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-4 mb-4">
+          <div class="field mb-0">
             <label>Cadence</label>
             <select name="cadence_hours">
               <option value="1">every hour</option>
@@ -1839,7 +1939,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
               <option value="168">every week</option>
             </select>
           </div>
-          <div class="field flex-[2] mb-0">
+          <div class="field mb-0 sm:col-span-2">
             <label>Skill to apply</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
@@ -2022,8 +2122,8 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <label>Description</label>
           <input name="description" value="${escapeHtml(target.description ?? "")}" maxlength="400">
         </div>
-        <div class="row gap-4 mb-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-4 mb-4">
+          <div class="field mb-0">
             <label>Status</label>
             <select name="status">
               <option value="active"${target.status === "active" ? " selected" : ""}>active</option>
@@ -2031,33 +2131,33 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
               <option value="archived"${target.status === "archived" ? " selected" : ""}>archived</option>
             </select>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Cadence</label>
             <select name="cadence_hours">${cadenceOptions}</select>
           </div>
-          <div class="field flex-[2] mb-0">
+          <div class="field mb-0 md:col-span-2">
             <label>Primary skill</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
 
         <div class="label-muted mt-2 mb-2">Tavily knobs <span class="font-normal normal-case tracking-normal text-zee-muted">(blank = use the global default)</span></div>
-        <div class="row gap-4">
-          <div class="field flex-1 mb-0">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4">
+          <div class="field mb-0">
             <label>Queries per run</label>
             <input type="number" name="queries_per_run" min="1" max="20" step="1"
                    value="${target.queries_per_run ?? ""}"
                    placeholder="10 (default)">
             <div class="field-help mt-1.5">How many distinct search queries the planner produces. World-news-style skills want 10; a focused postcode dossier wants 2–3.</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Tavily min score</label>
             <input type="number" name="tavily_min_score" min="0" max="1" step="0.05"
                    value="${target.tavily_min_score != null ? target.tavily_min_score.toFixed(2) : ""}"
                    placeholder="0.40 (default)">
             <div class="field-help mt-1.5">Drops Tavily hits below this relevance score. 0 = keep everything (noisy). 1 = strict.</div>
           </div>
-          <div class="field flex-1 mb-0">
+          <div class="field mb-0">
             <label>Max final sources</label>
             <input type="number" name="tavily_max_final_sources" min="1" max="200" step="1"
                    value="${target.tavily_max_final_sources ?? ""}"
