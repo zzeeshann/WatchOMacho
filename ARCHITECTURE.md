@@ -60,7 +60,7 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | 3 | **Plan** — LLM picks **N** search queries where N = `target.queries_per_run` (NULL falls back to global default 10). Planner prompt scales with N. Skipped if the tool call isn't Tavily/search. | 1 chat call | ~$0.01 (Sonnet) / ~$0.003 (Haiku) / free (Workers AI) |
 | 4 | **Gather** — dispatch the tool call. Today always Tavily. Results pass through 3 filters (see "Gather pipeline" below). | N HTTP calls (one per query) | Tavily: 1 credit/query |
 | 5 | **Recall** — Vectorize semantic + D1 same-target recents, layered & deduped | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
-| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context. Output capped by `writer_max_tokens` setting (default 2200, range 200–16000). | 1 chat call | ~$0.04–0.43 (Sonnet) / ~$0.013–0.036 (Haiku) — scales with sources kept |
+| 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context. Output is parsed for a leading YAML frontmatter block (`title:` + `summary:`) that becomes the LLM-authored headline and editorial abstract; the body is the rest. If parsing fails, falls back to templated title + first-240-char body lead (logs `writeReport: frontmatter parse failed`). Body capped by `writer_max_tokens` setting (default 2200, range 200–16000). | 1 chat call | ~$0.04–0.43 (Sonnet) / ~$0.013–0.036 (Haiku) — scales with sources kept |
 | 7 | **Persist** — R2 put + D1 inserts + embed + Vectorize upsert + update target.next_run_at + runs audit row + heartbeat setting | 1 R2 put + ~4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
 
 **Total per run (Sonnet default):** ~2 chat calls + 1 embedding + N Tavily calls (default N=10) → roughly **$0.05/run with a tight min-score filter, up to $0.44/run with min-score=0 on a busy news skill** + N Tavily credits. At 1 run/day = **~$1.50–13/month + 300 Tavily credits/month** (free tier is 1000). Haiku 4.5 selectable as a ~5× cheaper fallback.
@@ -223,6 +223,9 @@ cadence_hours INTEGER              -- 1, 6, 12, 24, 72, 168
 primary_skill_id TEXT
 last_run_at INTEGER                -- unix ms
 next_run_at INTEGER                -- unix ms; cron picks where this <= now
+queries_per_run INTEGER            -- v11: per-target override; NULL = use global default (10). Range 1–20.
+tavily_min_score REAL              -- v11: per-target override; NULL = use global default (0.35). 0 = keep all hits.
+tavily_max_final_sources INTEGER   -- v11: per-target override; NULL = use global default (100). Range 1–200.
 created_at, updated_at
 ```
 
@@ -233,7 +236,11 @@ id TEXT PRIMARY KEY
 slug TEXT UNIQUE
 name TEXT
 description TEXT
-procedure_md TEXT                  -- the source of truth — agent reads this at run time
+procedure_md TEXT                  -- writer instructions — agent reads at run time. Just prose; no parseable markdown headers.
+tool_slug TEXT                     -- v10: which tool this skill uses (today always 'tavily', or NULL for writer-only)
+tool_op TEXT                       -- v10: tool operation ('search' or 'extract' for tavily)
+tool_params_json TEXT              -- v10: {"topic":"news","time_range":"day","depth":"basic","country":"...","include_domains":"...","exclude_domains":"..."}
+tool_sources_json TEXT             -- v10: ["https://...","..."] (only used by tavily/extract)
 author TEXT                        -- 'user' | 'agent'
 used_count INTEGER                 -- incremented after each successful run
 created_at, updated_at
@@ -245,12 +252,13 @@ created_at, updated_at
 id TEXT PRIMARY KEY
 target_id TEXT
 skill_id TEXT
-title TEXT
-snippet TEXT                       -- ~240 chars, shown on dashboards
-r2_key TEXT                        -- where the full markdown lives
+title TEXT                         -- LLM-authored headline from writer frontmatter (≤80-char target, 150-char hard cap). Fallback: '<target.name> — <skill.name> (<date>)' templated string.
+snippet TEXT                       -- LLM-authored editorial summary from writer frontmatter (1–4 sentences, ≤100-word target, 800-char hard cap). Surfaced as `summary` on the public JSON API. Fallback: first-240-char lead with trailing '…'.
+r2_key TEXT                        -- where the full markdown lives in R2 (`# <title>\n\n<body>`)
 word_count INTEGER
-sources_json TEXT                  -- JSON: [{title, url}, ...]
+sources_json TEXT                  -- JSON: [{title, url, kind: 'web'|'archive'}, ...]
 run_id TEXT
+chat_model TEXT                    -- which chat model wrote it (e.g. 'anthropic/claude-sonnet-4-6')
 created_at
 ```
 
@@ -271,14 +279,23 @@ created_at
 
 ### `settings`
 
-Key/value strings.
+Key/value strings. Editable live from `/admin` (Budgets & settings + Run guardrails).
 
 | Key | Default | Purpose |
 | --- | --- | --- |
+| `chat_model` | `anthropic/claude-sonnet-4-6` | Active chat model. Must be in `ALLOWED_CHAT_MODELS` in `agent.ts`. |
 | `daily_report_limit` | `20` | Cap on reports written per UTC day |
 | `daily_search_limit` | `500` | Cap on Tavily credits consumed per UTC day |
 | `cron_max_per_tick` | `2` | Max targets advanced per hourly cron tick |
-| `last_cron_run` | `0` | Last successful cron timestamp |
+| `max_run_seconds` | `90` | Per-run wall-clock budget (5–600). DO alarm aborts when exceeded. |
+| `writer_max_tokens` | `2200` | LLM `max_tokens` for the writer call (200–16000) |
+| `max_chars_per_source` | `4000` | Per-source content truncation before it's sent to the writer |
+| `max_final_sources` | `100` | Global cap on sources passed to the writer (1–200; per-target override in `targets.tavily_max_final_sources`) |
+| `default_queries_per_run` | `10` | Global default for planner query count (per-target override in `targets.queries_per_run`) |
+| `tavily_min_score` | `0.35` | Global default for Tavily score filter (per-target override in `targets.tavily_min_score`) |
+| `last_cron_run` | `0` | Last successful cron timestamp (heartbeat) |
+| `last_run_attempt` | `{}` | JSON: live "in-flight" step breadcrumb for the most-recent run |
+| `embed_last_ok_at` / `embed_last_error` | — | Heartbeat for the Vectorize embedding step |
 
 ### `daily_usage`
 

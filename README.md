@@ -30,7 +30,7 @@ For each `(target, skill)` execution:
 1. **Plan** — the LLM, given the skill's writer instructions and the target, returns N web search queries. N is set per-target (default 10). The planner prompt scales with N (N=1: "the single most important query"; N=10: "EXACTLY 10 distinct angles").
 2. **Gather** — the agent runs the skill's tool call. Today that's always Tavily (search or extract). Results pass through a min-score filter (per-target), URL dedupe, title-Jaccard story dedupe, and a final cap (per-target).
 3. **Recall** — Vectorize returns the most relevant past reports + last 2 same-target reports via D1. They become `[N]` archive citations (📚) alongside web sources in the same numbered footer — so the new report builds on prior ones rather than repeating, and the archive becomes a navigable graph.
-4. **Write** — the LLM writes a markdown report following the skill's output structure, citing every source (web + archive) inline by number.
+4. **Write** — the LLM writes a markdown report following the skill's output structure, citing every source (web + archive) inline by number. The writer also emits a YAML frontmatter block at the top — a real headline (`title`) and a 1–4 sentence editorial summary — so each report has its own story-specific title + abstract rather than a templated `target — skill (date)` string. A fallback path keeps the old template if the frontmatter is ever malformed (logs `writeReport: frontmatter parse failed` to worker logs).
 5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs` (incl. per-run gather funnel JSON), step-level heartbeat in `settings` so the admin System heartbeat shows what's happening live.
 
 Two LLM calls + one Tavily batch per run. Predictable cost (~$0.05/run on Claude Sonnet 4.6, ~$0.01 on Haiku 4.5, free on Workers AI), predictable structure, fully observable.
@@ -183,8 +183,8 @@ On **Haiku 4.5** the same workload costs ~$0.30–1.20/month. Switch via the cha
 | --- | --- | --- |
 | `GET` | `/api/targets` | Active targets |
 | `GET` | `/api/skills` | Skill list |
-| `GET` | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10), with summary + source count |
-| `GET` | `/api/reports/:id` | Full report: metadata + `body_markdown` (from R2) + `sources[]` with `kind: "web" \| "archive"` |
+| `GET` | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Each row: LLM-authored `title` + `summary`, `date`, `target {slug,name}`, `word_count`, `source_count`, public `url` |
+| `GET` | `/api/reports/:id` | Full report: above metadata + `body_markdown` (from R2) + `sources[]` with `kind: "web" \| "archive"` |
 
 Daylila or any other dashboard polls `/api/reports/recent` for a feed and `/api/reports/:id` for full content, renders the markdown its own way.
 

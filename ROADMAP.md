@@ -2,7 +2,7 @@
 
 Forward plan for WatchOMacho. Where v4 is, where it's going, and what's deliberately out of scope right now.
 
-> **Status (2026-05-22):**
+> **Status (2026-05-23):**
 > - Level 1+2 shipped via Tavily ([PLAN.md](PLAN.md))
 > - **Level 3 REVERTED 2026-05-19** — the four UK typed tools (Land Registry, ONS, data.police.uk, Companies House) shipped on 2026-05-17 but were rolled back in commit `1825402` ("Simplify: one tool, explicit skills"). `TOOLS` registry is now Tavily-only. The multi-tool refactor that supported them stayed in place; one explicit tool per skill is the current shape.
 > - **Memory loop shipped** — embed every report, recall similar prior reports as `[N]` archive citations alongside web sources, navigable graph via 📚 markers
@@ -10,6 +10,7 @@ Forward plan for WatchOMacho. Where v4 is, where it's going, and what's delibera
 > - **Gather tuning shipped** — Tavily max_results=20, planner cap 10, title-Jaccard dedupe, dynamic skill structure, `max_chars_per_source` admin-tunable
 > - **Admin Search-tuning shipped** — `tavily_min_score` editable per-target (and globally) from `/admin`
 > - **Sonnet 4.6 + lean prompts shipped 2026-05-22** — default chat model is `anthropic/claude-sonnet-4-6`; hardcoded editorial controls stripped from writer/planner so the skill is the only voice; new `writer_max_tokens` setting tunable from admin (default 2200, range 200–16000)
+> - **LLM-authored title + summary shipped 2026-05-23** — writer call now emits a YAML frontmatter block (`title:` + `summary:`) parsed back into the existing `reports.title` and `reports.snippet` columns. No schema migration, no API shape change. Public `/api/reports/recent` and `/api/reports/:id` now expose a real story headline + 1–4-sentence editorial abstract automatically. Fallback to legacy templated title + truncated lead when parsing fails (logs `writeReport: frontmatter parse failed`).
 > - Level 4 (true agentic tool-use loop) still deferred — current pipeline is fully sufficient
 
 ## Where we are — v4 + Tavily (current)

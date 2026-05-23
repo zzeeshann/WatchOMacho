@@ -1497,6 +1497,62 @@ interface CitableSource {
   published_date?: string;
 }
 
+/** Parse the YAML frontmatter block the writer is asked to emit at the top
+ *  of every report. Returns null when the block is missing or malformed so
+ *  the caller can fall back to the legacy templated title + truncated lead.
+ *
+ *  Deliberately minimal — no YAML lib. We only accept the exact shape we
+ *  prompt for:
+ *      ---
+ *      title: <single line>
+ *      summary: <single line, may be long>
+ *      ---
+ *      <body>
+ *
+ *  Tolerates: leading whitespace before the opening ---, optional surrounding
+ *  quotes on values, and an accidental leading `# Title` line above the
+ *  block (sometimes models add one against instructions). */
+function parseReportFrontmatter(
+  raw: string,
+): { title: string; summary: string; body: string } | null {
+  let src = raw.replace(/^﻿/, "").trimStart();
+  // Strip an accidental leading `# Heading` line if the model added one
+  // above the frontmatter despite being told not to.
+  src = src.replace(/^#[^\n]*\n+/, "");
+  // Strip a stray code fence if the model wrapped its output in ```.
+  src = src.replace(/^```[a-z]*\n/i, "");
+
+  const m = src.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
+  if (!m) return null;
+  const [, header, rest] = m;
+
+  const stripQuotes = (s: string): string => {
+    const t = s.trim();
+    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+      return t.slice(1, -1).trim();
+    }
+    return t;
+  };
+
+  const titleMatch = header.match(/^\s*title\s*:\s*(.+)$/m);
+  const summaryMatch = header.match(/^\s*summary\s*:\s*(.+)$/m);
+  if (!titleMatch || !summaryMatch) return null;
+
+  const title = stripQuotes(titleMatch[1]);
+  const summary = stripQuotes(summaryMatch[1]);
+  const body = rest.trim();
+
+  if (!title || !summary || body.length < 80) return null;
+
+  // Clip to defensible upper bounds so a runaway model doesn't blow up the
+  // D1 row or break list-page layout. Prompt asks for ≤80 chars / ≤100 words
+  // — these caps are headroom, not the target.
+  const safeTitle = title.length > 150 ? title.slice(0, 147).trimEnd() + "…" : title;
+  const safeSummary = summary.length > 800 ? summary.slice(0, 797).trimEnd() + "…" : summary;
+
+  return { title: safeTitle, summary: safeSummary, body };
+}
+
 /** Step 4: ask the LLM to write the report, given everything we gathered. */
 async function writeReport(
   env: Env,
@@ -1506,7 +1562,7 @@ async function writeReport(
   recalled: RecalledReport[],
   model: string,
   signal?: AbortSignal,
-): Promise<{ title: string; body: string; citations: CitableSource[] }> {
+): Promise<{ title: string; summary: string; body: string; citations: CitableSource[] }> {
   // Web sources first (fresh material the writer must rely on), archive
   // sources after (background/continuity). One unified numbering scheme.
   const citations: CitableSource[] = [
@@ -1582,11 +1638,28 @@ Now write the report. Follow the skill exactly. Cite sources inline by [n] match
 
 Apply the SKILL exactly — tone, structure, length, source weighting, and editorial posture all come from it. Each web source carries metadata after its title line ("published <date> · relevance <0-1>") that the skill can tell you how to use.
 
+Output format (required — the pipeline parses this):
+Begin every report with a YAML frontmatter block exactly like this, then the body:
+
+---
+title: A real headline for this specific report, single line, max 80 characters, no date, no category or source names
+summary: A standalone abstract of this report in 1 to 4 sentences, single line (no newlines), max 100 words, written as if it might be read on its own
+---
+
+## First section heading
+
+Body paragraph here…
+
+Notes on the frontmatter:
+- Both \`title\` and \`summary\` must be on a single line each. The summary may be long but must not contain line breaks.
+- Do NOT wrap values in quotes unless they contain a colon.
+- The title is the actual story headline (e.g. "Ukraine seizes initiative as Russia threatens retaliation") — not "World News" or "Daily briefing". Category and date are rendered separately from other metadata.
+
 Markdown formatting rules (follow strictly — the rendering engine depends on them):
-- Do NOT write a top-level \`# Title\` heading at the start. The report title is rendered separately above the body. Start directly with your first section.
+- After the closing \`---\` of the frontmatter, start directly with your first \`## Section\` heading. Do NOT write a top-level \`# Title\` line.
 - Each section heading from the skill's Output structure MUST be written as a level-2 markdown heading: \`## Section name\` on its own line, sentence case, no trailing colon, no bold markers around the heading text.
 - Within a section, individual stories/items can use a bold lead-in followed by the body in the same paragraph: \`**Lead-in sentence.** body sentence body sentence.\`
-- Use \`---\` on its own line ONLY between major sections you want visually separated. Don't sprinkle them.
+- Use \`---\` on its own line ONLY between major sections you want visually separated (never inside the frontmatter region, and never as the very first line of the body). Don't sprinkle them.
 - Cite sources inline by [number] matching the gathered web sources. Citations like [3], [8,10], [3-5] are all fine.
 - Do NOT write your own "Sources" / "References" / "Citations" section — the page renders one automatically.`,
       },
@@ -1595,15 +1668,26 @@ Markdown formatting rules (follow strictly — the rendering engine depends on t
     max_tokens: writerMaxTokens,
   }, signal);
 
-  const body = res.response.trim();
-  if (!body || body.length < 80) throw new Error("LLM returned empty or too-short report");
+  const raw = res.response.trim();
+  if (!raw || raw.length < 80) throw new Error("LLM returned empty or too-short report");
 
-  // The title is the target name + skill name, dated. We don't ask the LLM
-  // to pick it — keeps reports comparable across the same target.
+  // Preferred path: writer produced the YAML frontmatter we asked for, so
+  // title + summary are LLM-authored and the body is the rest.
+  const parsed = parseReportFrontmatter(raw);
+  if (parsed) {
+    return { title: parsed.title, summary: parsed.summary, body: parsed.body, citations };
+  }
+
+  // Fallback: writer skipped or malformed the frontmatter. Don't fail the
+  // run — fall back to the legacy templated title + truncated-lead snippet.
+  // Surface it to worker logs so we can see how often it happens.
+  console.warn(
+    `writeReport: frontmatter parse failed (model=${model}, target=${target.slug}, skill=${skill.slug}); using fallback title/summary`,
+  );
   const dateLabel = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
-  const title = `${target.name} — ${skill.name} (${dateLabel})`;
-
-  return { title, body, citations };
+  const fallbackTitle = `${target.name} — ${skill.name} (${dateLabel})`;
+  const fallbackSummary = raw.replace(/\s+/g, " ").slice(0, 240).trim() + "…";
+  return { title: fallbackTitle, summary: fallbackSummary, body: raw, citations };
 }
 
 /** Pipeline step labels used by runResearch's step-boundary breadcrumb.
@@ -1781,7 +1865,7 @@ export async function runResearch(
     const recalled = await recallMemory(env, target, skill);
 
     await markStep(env, attempt, "write");
-    const { title, body, citations } = await writeReport(
+    const { title, summary, body, citations } = await writeReport(
       env,
       skill,
       target,
@@ -1796,7 +1880,11 @@ export async function runResearch(
     const reportId = uid();
     const created = Date.now();
     const wordCount = body.split(/\s+/).filter(Boolean).length;
-    const snippet = body.replace(/\s+/g, " ").slice(0, 240).trim() + "…";
+    // `snippet` is now the LLM-authored editorial summary (~1–4 sentences,
+    // ≤100 words) from the writer's frontmatter block — or the fallback
+    // truncated lead if the model fumbled the format. Same column, better
+    // content. Surfaced as `summary` in the public JSON API.
+    const snippet = summary;
 
     // R2 stores just title + body. Target / skill / generated-at metadata
     // is rendered from the D1 row in the page header, no need to duplicate
