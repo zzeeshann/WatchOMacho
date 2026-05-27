@@ -1397,9 +1397,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
             <div class="field-help">${usage.searches} used today</div>
           </div>
           <div class="field mb-0">
-            <label>Runs / hour</label>
+            <label>Max parallel runs</label>
             <input type="number" name="cron_max_per_tick" min="1" max="20" value="${escapeHtml(perTick)}">
-            <div class="field-help">Cap per hourly cron firing</div>
+            <div class="field-help">If several targets come due in the same hour, run at most this many at once. The rest wait for next hour. Leave at 2 unless you add lots of targets.</div>
           </div>
         </div>
 
