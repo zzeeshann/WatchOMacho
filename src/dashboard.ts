@@ -1942,14 +1942,20 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
             <label>Cadence</label>
             <select name="cadence_hours">
               <option value="1">every hour</option>
-              <option value="6">every 6 hours</option>
-              <option value="12">every 12 hours</option>
-              <option value="24" selected>every 24 hours</option>
+              <option value="6">every 6 hours (4× per day)</option>
+              <option value="12">every 12 hours (2× per day)</option>
+              <option value="24" selected>every 24 hours (1× per day)</option>
               <option value="72">every 3 days</option>
               <option value="168">every week</option>
             </select>
           </div>
-          <div class="field mb-0 sm:col-span-2">
+          <div class="field mb-0">
+            <label>Anchor hour (UTC)</label>
+            <input type="number" name="anchor_hour_utc" min="0" max="23" step="1"
+                   placeholder="2 (default — 02:00 UTC)">
+            <div class="field-help mt-1.5">Fixed UTC hour the first daily slot runs at. With cadence 12h and anchor 2, runs land at 02:00 and 14:00 UTC. Blank = inherit 02:00 UTC default.</div>
+          </div>
+          <div class="field mb-0">
             <label>Skill to apply</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
@@ -2000,9 +2006,22 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     `<option value="${escapeHtml(s.slug)}"${s.slug === currentSkillSlug ? " selected" : ""}>${escapeHtml(s.name)}</option>`,
   ).join("");
 
-  const cadenceOptions = [1, 6, 12, 24, 72, 168].map((h) =>
-    `<option value="${h}"${target.cadence_hours === h ? " selected" : ""}>${h === 1 ? "every hour" : h < 24 ? `every ${h} hours` : h === 24 ? "every 24 hours" : h === 72 ? "every 3 days" : "every week"}</option>`,
-  ).join("");
+  const cadenceOptions = [1, 6, 12, 24, 72, 168].map((h) => {
+    const label =
+      h === 1   ? "every hour"
+    : h === 6   ? "every 6 hours (4× per day)"
+    : h === 12  ? "every 12 hours (2× per day)"
+    : h === 24  ? "every 24 hours (1× per day)"
+    : h === 72  ? "every 3 days"
+    :             "every week";
+    return `<option value="${h}"${target.cadence_hours === h ? " selected" : ""}>${label}</option>`;
+  }).join("");
+  // Pretty-formatted anchor for the configure-card header — "02:00 UTC"
+  // for a numeric anchor, or "—" while inheriting the default.
+  const anchorHour = target.anchor_hour_utc;
+  const anchorLabel = anchorHour === null
+    ? "02:00 UTC (default)"
+    : `${String(anchorHour).padStart(2, "0")}:00 UTC`;
 
   /** Middot separator between meta items on the same line. */
   const metaSep = `<span class="mx-2.5 text-zee-border" aria-hidden="true">·</span>`;
@@ -2120,7 +2139,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
       <summary>
         <div class="h3-row">
           <h3>Configure</h3>
-          <span class="label-muted">${target.cadence_hours}h cadence${target.primary_skill_id ? "" : " · no skill"}<span class="chev">▾</span></span>
+          <span class="label-muted">${target.cadence_hours}h cadence · at ${anchorLabel}${target.primary_skill_id ? "" : " · no skill"}<span class="chev">▾</span></span>
         </div>
       </summary>
       <form id="update-target-form" method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
@@ -2145,7 +2164,14 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             <label>Cadence</label>
             <select name="cadence_hours">${cadenceOptions}</select>
           </div>
-          <div class="field mb-0 md:col-span-2">
+          <div class="field mb-0">
+            <label>Anchor hour (UTC)</label>
+            <input type="number" name="anchor_hour_utc" min="0" max="23" step="1"
+                   value="${target.anchor_hour_utc ?? ""}"
+                   placeholder="2 (default — 02:00 UTC)">
+            <div class="field-help mt-1.5">First daily slot in UTC. Blank = inherit 02:00 UTC default. Changing this snaps the next run to the new schedule.</div>
+          </div>
+          <div class="field mb-0">
             <label>Primary skill</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>

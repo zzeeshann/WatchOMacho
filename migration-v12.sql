@@ -1,0 +1,22 @@
+-- v11 → v12: targets get a fixed daily anchor for scheduling.
+--
+-- Before: next_run_at = last_run_at + cadence_hours. Each run completes 1-2
+-- minutes after the hour, so the eligible slot drifts ~1 hour later every
+-- day. Eventually the run crosses UTC midnight, the published date jumps a
+-- day, and downstream consumers (daylila) start labelling briefings with
+-- the wrong calendar date. The drift was the trigger that exposed
+-- daylila's homepage-vs-detail date inconsistency on 2026-05-27.
+--
+-- After: anchor_hour_utc (0-23) defines the first slot of each day in UTC.
+-- A target with cadence_hours=24 anchor_hour_utc=2 runs at 02:00 UTC daily.
+-- A target with cadence_hours=12 anchor_hour_utc=2 runs at 02:00 and 14:00.
+-- A target with cadence_hours=6  anchor_hour_utc=2 runs at 02, 08, 14, 20.
+--
+-- next_run_at is now computed as the next slot at or after the just-
+-- completed run's finished_at, where slot = anchor + k*cadence. No drift.
+--
+-- NULL = inherit the worker-wide default (`DEFAULT_ANCHOR_HOUR_UTC = 2` in
+-- src/agent.ts). Set explicitly per-target via the admin UI when a
+-- different fixed wall-clock time is wanted.
+
+ALTER TABLE targets ADD COLUMN anchor_hour_utc INTEGER;

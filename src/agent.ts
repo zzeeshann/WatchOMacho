@@ -301,8 +301,83 @@ export interface Target {
   queries_per_run: number | null;
   tavily_min_score: number | null;
   tavily_max_final_sources: number | null;
+  // Fixed daily anchor for scheduling (v12). 0-23, UTC. NULL = inherit
+  // DEFAULT_ANCHOR_HOUR_UTC below. See computeNextRunAt() for the slot
+  // formula and migration-v12.sql for the rationale.
+  anchor_hour_utc: number | null;
   created_at: number;
   updated_at: number;
+}
+
+/** Default anchor hour (UTC) when a target has anchor_hour_utc = NULL.
+ *  02:00 UTC = 03:00 BST / 21:00 EST — overnight in most populated time
+ *  zones, so cron tick noise doesn't compete with daytime traffic. */
+export const DEFAULT_ANCHOR_HOUR_UTC = 2;
+
+/** Compute the next scheduled run timestamp for a target.
+ *
+ *  Slots fire at `anchor + k * cadence_hours` (mod day) in UTC. We pick the
+ *  first slot strictly after `nowMs`. "Strictly after" prevents the just-
+ *  completed run from re-firing on the same tick.
+ *
+ *  Edge cases:
+ *  - cadence_hours not a divisor of 24 (e.g. 7, 72): slots still walk
+ *    forward by cadence each step. With cadence=72 anchor=2 the slot
+ *    cycles through 02:00 UTC every three days.
+ *  - cadence_hours = 1: slots are hourly, anchor effectively pins the
+ *    minute (always :00). Same as the old behaviour.
+ *  - cadence_hours >= 24*K: slots are still spaced by exactly cadence,
+ *    so e.g. cadence=168 anchor=2 is "weekly at 02:00 UTC starting from
+ *    the most recent past 02:00 UTC plus the cadence multiple".
+ *
+ *  Returned timestamp is in milliseconds (matches the rest of the schema).
+ */
+export function computeNextRunAt(
+  nowMs: number,
+  cadenceHours: number,
+  anchorHourUtc: number,
+): number {
+  const cad = Math.max(1, Math.min(720, Math.floor(cadenceHours)));
+  const anchor = Math.max(0, Math.min(23, Math.floor(anchorHourUtc)));
+  const cadMs = cad * 3600 * 1000;
+  const now = new Date(nowMs);
+  // Today's anchor wall-clock in UTC. May be in the past (most cases) or
+  // future (if `now` is between 00:00 and anchor:00 UTC).
+  let slot = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    anchor,
+    0,
+    0,
+    0,
+  );
+  // If today's anchor is itself in the future, that's the next slot —
+  // unless cadence < 24, in which case there may be an earlier same-day
+  // slot already past. Walk forward from a safe lower bound instead.
+  if (cad < 24) {
+    // Step back to the most recent slot <= nowMs, then step forward to
+    // the first slot > nowMs.
+    while (slot > nowMs) slot -= cadMs;
+  }
+  while (slot <= nowMs) slot += cadMs;
+  return slot;
+}
+
+/** Re-read a target and snap its next_run_at to the next anchored slot.
+ *  Called from the admin update handler whenever cadence or anchor
+ *  changes, so the new schedule takes effect immediately rather than
+ *  after the next completed run. */
+export async function rescheduleTarget(env: Env, id: string): Promise<void> {
+  const t = await getTargetById(env, id);
+  if (!t) return;
+  const anchor = t.anchor_hour_utc ?? DEFAULT_ANCHOR_HOUR_UTC;
+  const next = computeNextRunAt(Date.now(), t.cadence_hours, anchor);
+  await env.DB.prepare(
+    `UPDATE targets SET next_run_at = ?, updated_at = ? WHERE id = ?`,
+  )
+    .bind(next, Date.now(), id)
+    .run();
 }
 
 async function uniqueSlug(env: Env, base: string): Promise<string> {
@@ -321,7 +396,15 @@ async function uniqueSlug(env: Env, base: string): Promise<string> {
 
 export async function createTarget(
   env: Env,
-  input: { name: string; kind?: string; description?: string; cadence_hours?: number; primary_skill_id?: string },
+  input: {
+    name: string;
+    kind?: string;
+    description?: string;
+    cadence_hours?: number;
+    primary_skill_id?: string;
+    /** 0-23 UTC, or null/undefined to inherit DEFAULT_ANCHOR_HOUR_UTC. */
+    anchor_hour_utc?: number | null;
+  },
 ): Promise<Target> {
   const name = input.name.trim();
   if (!name) throw new Error("name is required");
@@ -330,10 +413,15 @@ export async function createTarget(
   const id = uid();
   const now = Date.now();
   const cadence = Math.max(1, Math.min(720, Math.floor(input.cadence_hours ?? 24)));
+  // Anchor: clamp to 0-23 if provided, otherwise NULL (inherits default).
+  const anchor =
+    input.anchor_hour_utc === undefined || input.anchor_hour_utc === null
+      ? null
+      : Math.max(0, Math.min(23, Math.floor(input.anchor_hour_utc)));
   await env.DB.prepare(
     `INSERT INTO targets
-       (id, slug, name, kind, description, status, cadence_hours, primary_skill_id, last_run_at, next_run_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?)`,
+       (id, slug, name, kind, description, status, cadence_hours, primary_skill_id, last_run_at, next_run_at, anchor_hour_utc, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?, ?)`,
   )
     .bind(
       id,
@@ -343,7 +431,8 @@ export async function createTarget(
       input.description ?? null,
       cadence,
       input.primary_skill_id ?? null,
-      now, // next_run_at = immediately
+      now, // next_run_at = immediately (next cron tick will pick it up)
+      anchor,
       now,
       now,
     )
@@ -392,6 +481,7 @@ export async function updateTarget(
       | "queries_per_run"
       | "tavily_min_score"
       | "tavily_max_final_sources"
+      | "anchor_hour_utc"
     >
   >,
 ): Promise<void> {
@@ -435,6 +525,17 @@ export async function updateTarget(
     args.push(patch.tavily_max_final_sources === null
       ? null
       : Math.max(1, Math.min(200, Math.floor(patch.tavily_max_final_sources))));
+  }
+  // Anchor hour (v12). NULL = inherit DEFAULT_ANCHOR_HOUR_UTC. Clamp 0-23.
+  // The caller (admin update handler) is responsible for calling
+  // rescheduleTarget() after this UPDATE if cadence or anchor changed —
+  // otherwise the next_run_at row stays on the old schedule until the
+  // next completed run rewrites it.
+  if (patch.anchor_hour_utc !== undefined) {
+    sets.push("anchor_hour_utc = ?");
+    args.push(patch.anchor_hour_utc === null
+      ? null
+      : Math.max(0, Math.min(23, Math.floor(patch.anchor_hour_utc))));
   }
   if (sets.length === 0) return;
   sets.push("updated_at = ?");
@@ -1938,10 +2039,17 @@ export async function runResearch(
       .bind(Date.now(), skill.id)
       .run();
 
+    // next_run_at uses anchor-based slots (v12): the next wall-clock slot
+    // at `anchor + k*cadence` UTC strictly after the run just completed.
+    // No more 1-hour-per-day drift — the schedule stays pinned to a fixed
+    // UTC time regardless of how long any individual run took. NULL
+    // anchor falls back to DEFAULT_ANCHOR_HOUR_UTC (= 2 → 02:00 UTC).
+    const anchorHour = target.anchor_hour_utc ?? DEFAULT_ANCHOR_HOUR_UTC;
+    const nextRunAt = computeNextRunAt(created, target.cadence_hours, anchorHour);
     await env.DB.prepare(
       `UPDATE targets SET last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?`,
     )
-      .bind(created, created + target.cadence_hours * 3600 * 1000, created, target.id)
+      .bind(created, nextRunAt, created, target.id)
       .run();
 
     // Persist the gather funnel onto the run row so historical Activity

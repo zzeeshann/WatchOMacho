@@ -27,6 +27,7 @@ import {
   listSkills,
   listTargets,
   ResearchRunner,
+  rescheduleTarget,
   runResearch,
   setSetting,
   updateSkill,
@@ -139,6 +140,20 @@ function requireApiKey(req: Request, env: Env): Response | null {
     return json({ error: "unauthorised" }, { status: 401 });
   }
   return null;
+}
+
+/** Format a millisecond timestamp as "YYYY-MM-DD" in UTC. Used by the
+ *  public report API so downstream consumers (daylila) have a single
+ *  canonical "day this briefing belongs to" string. Picking UTC keeps it
+ *  consistent regardless of where the consumer renders it — no more
+ *  homepage-vs-detail-page mismatches caused by independent timezone
+ *  formatting on each surface. */
+function formatBriefingDateUtc(ms: number): string {
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function redirect(location: string, extraHeaders: Record<string, string> = {}): Response {
@@ -337,7 +352,13 @@ export default {
             id: r.id,
             title: r.title,
             url: `${origin}/report/${r.id}`,
+            // `date` is the full ISO timestamp (kept for back-compat with
+            // any existing consumer); `briefing_date` is the canonical
+            // UTC calendar date — use this one for date-stamping the
+            // briefing in UI surfaces, so homepage/detail render the
+            // same string.
             date: new Date(r.created_at).toISOString(),
+            briefing_date: formatBriefingDateUtc(r.created_at),
             summary: r.snippet,
             word_count: r.word_count,
             target: r.target_slug
@@ -383,7 +404,10 @@ export default {
             id: report.id,
             title: report.title,
             url: `${origin}/report/${report.id}`,
+            // See /api/reports/recent above for the date / briefing_date
+            // split. Keep both surfaces emitting identical date semantics.
             date: new Date(report.created_at).toISOString(),
+            briefing_date: formatBriefingDateUtc(report.created_at),
             summary: report.snippet,
             word_count: report.word_count,
             target: target ? { slug: target.slug, name: target.name } : null,
@@ -462,6 +486,16 @@ export default {
         const name = (form.name ?? "").trim();
         if (!name) return json({ error: "name required" }, { status: 400 });
         const cadence = parseInt(form.cadence_hours ?? "24", 10);
+        // Anchor hour (v12). Blank or invalid → undefined → createTarget
+        // stores NULL → row inherits DEFAULT_ANCHOR_HOUR_UTC at run time.
+        const anchorRaw = (form.anchor_hour_utc ?? "").trim();
+        let anchor: number | undefined | null = undefined;
+        if (anchorRaw === "") {
+          anchor = null; // blank = explicit "inherit default"
+        } else {
+          const n = parseInt(anchorRaw, 10);
+          if (Number.isFinite(n) && n >= 0 && n <= 23) anchor = n;
+        }
         const skillSlug = (form.skill_slug ?? "").trim();
         let skillId: string | undefined;
         if (skillSlug) {
@@ -474,6 +508,7 @@ export default {
           description: form.description?.trim() || undefined,
           cadence_hours: Number.isFinite(cadence) ? cadence : undefined,
           primary_skill_id: skillId,
+          anchor_hour_utc: anchor,
         });
         // If the form asked for an immediate run, schedule one through the
         // ResearchRunner DO (15-min alarm budget) so the new target's first
@@ -500,9 +535,32 @@ export default {
         if (form.status !== undefined && ["active", "paused", "archived"].includes(form.status)) {
           patch.status = form.status as Target["status"];
         }
+        // Track whether scheduling inputs changed so we can call
+        // rescheduleTarget() AFTER the row write — otherwise next_run_at
+        // stays on the old schedule until the next completed run.
+        let scheduleChanged = false;
         if (form.cadence_hours !== undefined) {
           const n = parseInt(form.cadence_hours, 10);
-          if (Number.isFinite(n)) patch.cadence_hours = n;
+          if (Number.isFinite(n) && n !== target.cadence_hours) {
+            patch.cadence_hours = n;
+            scheduleChanged = true;
+          }
+        }
+        // Anchor hour (v12). Blank = inherit default (NULL), 0-23 = explicit.
+        if (form.anchor_hour_utc !== undefined) {
+          const raw = form.anchor_hour_utc.trim();
+          if (raw === "") {
+            if (target.anchor_hour_utc !== null) {
+              patch.anchor_hour_utc = null;
+              scheduleChanged = true;
+            }
+          } else {
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n) && n >= 0 && n <= 23 && n !== target.anchor_hour_utc) {
+              patch.anchor_hour_utc = n;
+              scheduleChanged = true;
+            }
+          }
         }
         if (form.skill_slug !== undefined) {
           if (form.skill_slug.trim()) {
@@ -541,6 +599,11 @@ export default {
           }
         }
         await updateTarget(env, target.id, patch);
+        // Snap next_run_at to the new schedule immediately when cadence
+        // or anchor changed — see rescheduleTarget() in src/agent.ts.
+        if (scheduleChanged) {
+          await rescheduleTarget(env, target.id);
+        }
         return redirect(`/admin/targets/${target.slug}`);
       }
 

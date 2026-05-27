@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS targets (
   queries_per_run INTEGER,
   tavily_min_score REAL,
   tavily_max_final_sources INTEGER,
+  -- Fixed daily anchor for scheduling (v12). 0-23, UTC. The next_run_at
+  -- formula picks the next slot at `anchor + k*cadence_hours` (mod day)
+  -- strictly after the just-finished run, so cadence no longer drifts
+  -- by run-duration each cycle. NULL = inherit DEFAULT_ANCHOR_HOUR_UTC
+  -- from src/agent.ts (currently 2 → 02:00 UTC).
+  anchor_hour_utc INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
