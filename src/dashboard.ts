@@ -535,6 +535,42 @@ function timeUntil(ts: number): string {
   return rem ? `in ${hours}h ${rem}m` : `in ${hours}h`;
 }
 
+/** Render a target's schedule in plain English from its cadence + anchor.
+ *  Used on the configure card header and the targets list row so the
+ *  user doesn't have to combine "every 12 hours" + "anchor 2" in their
+ *  head. Examples:
+ *    cadence=24, anchor=2   → "Daily at 02:00 UTC"
+ *    cadence=12, anchor=2   → "2× per day at 02:00 and 14:00 UTC"
+ *    cadence=6,  anchor=2   → "4× per day at 02:00, 08:00, 14:00, 20:00 UTC"
+ *    cadence=1,  anchor=*   → "Every hour"
+ *    cadence=72, anchor=2   → "Every 3 days at 02:00 UTC"
+ *    cadence=168, anchor=2  → "Weekly at 02:00 UTC"
+ *  `anchor === null` falls back to the worker default (02:00 UTC). */
+function describeSchedule(cadenceHours: number, anchorHourUtc: number | null): string {
+  const pad = (h: number) => String(h).padStart(2, "0") + ":00";
+  const anchor = anchorHourUtc ?? 2; // matches DEFAULT_ANCHOR_HOUR_UTC in agent.ts
+  if (cadenceHours === 1) return "Every hour";
+  if (cadenceHours === 168) return `Weekly at ${pad(anchor)} UTC`;
+  if (cadenceHours === 72) return `Every 3 days at ${pad(anchor)} UTC`;
+  if (24 % cadenceHours === 0) {
+    const runsPerDay = 24 / cadenceHours;
+    if (runsPerDay === 1) return `Daily at ${pad(anchor)} UTC`;
+    // Walk the slot pattern from anchor, wrap mod 24, then sort
+    // ascending so the rendered list reads in clock order.
+    const slots: number[] = [];
+    let h = anchor;
+    for (let i = 0; i < runsPerDay; i++) {
+      slots.push(h);
+      h = (h + cadenceHours) % 24;
+    }
+    slots.sort((a, b) => a - b);
+    const formatted = slots.map(pad).join(", ");
+    return `${runsPerDay}× per day at ${formatted} UTC`;
+  }
+  // Cadence that doesn't divide 24 evenly: fall back to a literal description.
+  return `Every ${cadenceHours}h from ${pad(anchor)} UTC`;
+}
+
 /** Minimal, safe markdown → HTML. Supports h1/h2/h3, paragraphs, links,
  *  bold, italic, inline code, lists. No HTML injection. */
 /** Collapse markdown source into plain text for snippets / list previews. */
@@ -1882,8 +1918,8 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
     : `<ul class="list-none">${sortedTargets.map((t) => {
         const isActive = t.status === "active";
         const meta = isActive
-          ? `${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"} · every ${t.cadence_hours}h`
-          : `every ${t.cadence_hours}h`;
+          ? `${t.next_run_at ? (t.next_run_at <= Date.now() ? `<span class="text-zee-primary">due now</span>` : escapeHtml(timeUntil(t.next_run_at))) : "—"} · ${escapeHtml(describeSchedule(t.cadence_hours, t.anchor_hour_utc))}`
+          : escapeHtml(describeSchedule(t.cadence_hours, t.anchor_hour_utc));
         return `
         <li class="py-2.5 border-b border-[rgba(232,228,222,0.6)]">
           <div class="flex flex-wrap justify-between items-baseline gap-3">
@@ -1937,29 +1973,32 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
           <label>Description <span class="font-normal normal-case tracking-normal">(optional — context for the agent)</span></label>
           <input name="description" maxlength="400">
         </div>
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-4 mb-4">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-4 mb-1">
           <div class="field mb-0">
-            <label>Cadence</label>
+            <label>How often</label>
             <select name="cadence_hours">
-              <option value="1">every hour</option>
-              <option value="6">every 6 hours (4× per day)</option>
-              <option value="12">every 12 hours (2× per day)</option>
-              <option value="24" selected>every 24 hours (1× per day)</option>
-              <option value="72">every 3 days</option>
-              <option value="168">every week</option>
+              <option value="1">Every hour</option>
+              <option value="6">4× per day</option>
+              <option value="12">2× per day</option>
+              <option value="24" selected>1× per day (daily)</option>
+              <option value="72">Every 3 days</option>
+              <option value="168">Once a week</option>
             </select>
           </div>
           <div class="field mb-0">
-            <label>Anchor hour (UTC)</label>
-            <input type="number" name="anchor_hour_utc" min="0" max="23" step="1"
-                   placeholder="2 (default — 02:00 UTC)">
-            <div class="field-help mt-1.5">Fixed UTC hour the first daily slot runs at. With cadence 12h and anchor 2, runs land at 02:00 and 14:00 UTC. Blank = inherit 02:00 UTC default.</div>
+            <label>Starting at</label>
+            <select name="anchor_hour_utc">
+              ${Array.from({ length: 24 }, (_, h) =>
+                `<option value="${h}"${h === 2 ? " selected" : ""}>${String(h).padStart(2, "0")}:00 UTC</option>`,
+              ).join("")}
+            </select>
           </div>
           <div class="field mb-0">
             <label>Skill to apply</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
+        <div class="field-help mb-4">First run lands at the "Starting at" hour; subsequent runs are evenly spaced. All times UTC (BST = UTC+1 in summer).</div>
         <label class="flex items-center gap-2 mb-3.5 text-[13px] text-zee-muted">
           <input type="checkbox" name="run_now" value="1"> Run once now
         </label>
@@ -2006,22 +2045,32 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     `<option value="${escapeHtml(s.slug)}"${s.slug === currentSkillSlug ? " selected" : ""}>${escapeHtml(s.name)}</option>`,
   ).join("");
 
+  // "How often" dropdown — labels phrased as "X× per day" / "every hour" /
+  // "every 3 days" / "weekly" so the user picks frequency, not internal hours.
+  // The form field is still `cadence_hours` (value = hours) so the backend is
+  // unchanged.
   const cadenceOptions = [1, 6, 12, 24, 72, 168].map((h) => {
     const label =
-      h === 1   ? "every hour"
-    : h === 6   ? "every 6 hours (4× per day)"
-    : h === 12  ? "every 12 hours (2× per day)"
-    : h === 24  ? "every 24 hours (1× per day)"
-    : h === 72  ? "every 3 days"
-    :             "every week";
+      h === 1   ? "Every hour"
+    : h === 6   ? "4× per day"
+    : h === 12  ? "2× per day"
+    : h === 24  ? "1× per day (daily)"
+    : h === 72  ? "Every 3 days"
+    :             "Once a week";
     return `<option value="${h}"${target.cadence_hours === h ? " selected" : ""}>${label}</option>`;
   }).join("");
-  // Pretty-formatted anchor for the configure-card header — "02:00 UTC"
-  // for a numeric anchor, or "—" while inheriting the default.
-  const anchorHour = target.anchor_hour_utc;
-  const anchorLabel = anchorHour === null
-    ? "02:00 UTC (default)"
-    : `${String(anchorHour).padStart(2, "0")}:00 UTC`;
+
+  // "Starting at" dropdown — 24 entries, one per UTC hour. Replaces the
+  // raw number input so the user doesn't have to type "2" and remember it
+  // means 02:00 UTC. Field name `anchor_hour_utc` is unchanged.
+  const selectedAnchor = target.anchor_hour_utc; // null = inherit default 2
+  const anchorOptions = Array.from({ length: 24 }, (_, h) => {
+    const selected = h === (selectedAnchor ?? 2) ? " selected" : "";
+    return `<option value="${h}"${selected}>${String(h).padStart(2, "0")}:00 UTC</option>`;
+  }).join("");
+
+  // Plain-English schedule line for the configure-card header.
+  const scheduleLabel = describeSchedule(target.cadence_hours, target.anchor_hour_utc);
 
   /** Middot separator between meta items on the same line. */
   const metaSep = `<span class="mx-2.5 text-zee-border" aria-hidden="true">·</span>`;
@@ -2139,7 +2188,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
       <summary>
         <div class="h3-row">
           <h3>Configure</h3>
-          <span class="label-muted">${target.cadence_hours}h cadence · at ${anchorLabel}${target.primary_skill_id ? "" : " · no skill"}<span class="chev">▾</span></span>
+          <span class="label-muted">${escapeHtml(scheduleLabel)}${target.primary_skill_id ? "" : " · no skill"}<span class="chev">▾</span></span>
         </div>
       </summary>
       <form id="update-target-form" method="post" action="/admin/targets/${escapeHtml(target.slug)}/update">
@@ -2151,7 +2200,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           <label>Description</label>
           <input name="description" value="${escapeHtml(target.description ?? "")}" maxlength="400">
         </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-4 mb-4">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-4 mb-1">
           <div class="field mb-0">
             <label>Status</label>
             <select name="status">
@@ -2161,21 +2210,19 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             </select>
           </div>
           <div class="field mb-0">
-            <label>Cadence</label>
+            <label>How often</label>
             <select name="cadence_hours">${cadenceOptions}</select>
           </div>
           <div class="field mb-0">
-            <label>Anchor hour (UTC)</label>
-            <input type="number" name="anchor_hour_utc" min="0" max="23" step="1"
-                   value="${target.anchor_hour_utc ?? ""}"
-                   placeholder="2 (default — 02:00 UTC)">
-            <div class="field-help mt-1.5">First daily slot in UTC. Blank = inherit 02:00 UTC default. Changing this snaps the next run to the new schedule.</div>
+            <label>Starting at</label>
+            <select name="anchor_hour_utc">${anchorOptions}</select>
           </div>
           <div class="field mb-0">
             <label>Primary skill</label>
             <select name="skill_slug">${skillOptions}</select>
           </div>
         </div>
+        <div class="field-help mb-4">→ <strong>${escapeHtml(scheduleLabel)}</strong>. All times in UTC (BST = UTC+1 in summer, GMT = UTC in winter). Changing the schedule snaps the next run to the new slot.</div>
 
         <div class="label-muted mt-2 mb-2">Tavily knobs <span class="font-normal normal-case tracking-normal text-zee-muted">(blank = use the global default)</span></div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4">
