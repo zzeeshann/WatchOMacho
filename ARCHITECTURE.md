@@ -222,10 +222,11 @@ status TEXT                        -- 'active' / 'paused' / 'archived'
 cadence_hours INTEGER              -- 1, 6, 12, 24, 72, 168
 primary_skill_id TEXT
 last_run_at INTEGER                -- unix ms
-next_run_at INTEGER                -- unix ms; cron picks where this <= now
+next_run_at INTEGER                -- unix ms; cron picks where this <= now. v12: computed as the next slot at `anchor_hour_utc + k*cadence_hours` UTC strictly after the just-finished run — no drift.
 queries_per_run INTEGER            -- v11: per-target override; NULL = use global default (10). Range 1–20.
 tavily_min_score REAL              -- v11: per-target override; NULL = use global default (0.35). 0 = keep all hits.
 tavily_max_final_sources INTEGER   -- v11: per-target override; NULL = use global default (100). Range 1–200.
+anchor_hour_utc INTEGER            -- v12: fixed daily anchor (0-23, UTC). NULL = inherit DEFAULT_ANCHOR_HOUR_UTC=2 (02:00 UTC). Combined with cadence_hours: cadence=24 anchor=2 → daily 02:00; cadence=12 anchor=2 → 02:00 + 14:00; etc.
 created_at, updated_at
 ```
 
@@ -376,8 +377,8 @@ Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 | --- | --- | --- |
 | GET | `/api/targets` | Active targets |
 | GET | `/api/skills` | Skill list |
-| GET | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Slim — summary + source_count, no body. |
-| GET | `/api/reports/:id` | Full report — D1 metadata + R2 `body_markdown` + `sources[]` with `kind: "web" \| "archive"` |
+| GET | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Slim — summary + source_count, no body. Includes `date` (ISO) and `briefing_date` (v12: `YYYY-MM-DD` UTC — the canonical date for any UI that needs to label which day this briefing belongs to). |
+| GET | `/api/reports/:id` | Full report — D1 metadata + R2 `body_markdown` + `sources[]` with `kind: "web" \| "archive"`. Same `briefing_date` field as `/recent`. |
 
 ### Admin (cookie auth, set via `/admin/login`)
 
@@ -467,7 +468,9 @@ SELECT * FROM targets
 
 For each row: `runResearch(target, skill, 'cron')`.
 
-After each successful run, `target.next_run_at = now + cadence_hours * 3600000`.
+After each successful run, `target.next_run_at` is set to the next anchored slot via `computeNextRunAt(now, cadence_hours, anchor_hour_utc ?? DEFAULT_ANCHOR_HOUR_UTC)` (v12). Slots fire at `anchor + k*cadence` UTC; we pick the first slot strictly after the run-completion timestamp. Replaces the previous `now + cadence_hours * 3600000` formula, which drifted ~1 hour/day because each run completes a minute or two after the hour. The new formula pins runs to a fixed UTC wall-clock time regardless of how long any individual run took.
+
+When the admin handler updates `cadence_hours` or `anchor_hour_utc`, it also calls `rescheduleTarget(env, id)` so the new schedule takes effect immediately (otherwise `next_run_at` stays on the old slot until the next completed run rewrites it).
 
 Daily budget gates stop early on `BudgetExceeded`.
 

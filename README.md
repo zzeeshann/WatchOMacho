@@ -183,8 +183,8 @@ On **Haiku 4.5** the same workload costs ~$0.30–1.20/month. Switch via the cha
 | --- | --- | --- |
 | `GET` | `/api/targets` | Active targets |
 | `GET` | `/api/skills` | Skill list |
-| `GET` | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Each row: LLM-authored `title` + `summary`, `date`, `target {slug,name}`, `word_count`, `source_count`, public `url` |
-| `GET` | `/api/reports/:id` | Full report: above metadata + `body_markdown` (from R2) + `sources[]` with `kind: "web" \| "archive"` |
+| `GET` | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Each row: LLM-authored `title` + `summary`, `date` (ISO ms), `briefing_date` (`YYYY-MM-DD` UTC — v12, the canonical "what day" field), `target {slug,name}`, `word_count`, `source_count`, public `url` |
+| `GET` | `/api/reports/:id` | Full report: above metadata + `body_markdown` (from R2) + `sources[]` with `kind: "web" \| "archive"`. Same `briefing_date` field as `/recent`. |
 
 Daylila or any other dashboard polls `/api/reports/recent` for a feed and `/api/reports/:id` for full content, renders the markdown its own way.
 

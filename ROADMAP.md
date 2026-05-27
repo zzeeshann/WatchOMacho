@@ -2,7 +2,8 @@
 
 Forward plan for WatchOMacho. Where v4 is, where it's going, and what's deliberately out of scope right now.
 
-> **Status (2026-05-23):**
+> **Status (2026-05-27):**
+> - **Anchor-based cron + `briefing_date` API shipped 2026-05-27** — replaced the drifting `next_run_at = last + cadence` formula with `computeNextRunAt()` (anchor + k*cadence UTC slots). New `targets.anchor_hour_utc` column (v12 migration), default 02:00 UTC. Admin UI now uses plain-English "How often" + "Starting at HH:00 UTC" dropdowns and shows the schedule as e.g. "Daily at 02:00 UTC" / "2× per day at 02:00, 14:00 UTC". Both `/api/reports/recent` and `/api/reports/:id` now emit `briefing_date: "YYYY-MM-DD"` (UTC date of `created_at`) so downstream consumers like daylila have one canonical date string and don't need to do their own timezone math.
 > - Level 1+2 shipped via Tavily ([PLAN.md](PLAN.md))
 > - **Level 3 REVERTED 2026-05-19** — the four UK typed tools (Land Registry, ONS, data.police.uk, Companies House) shipped on 2026-05-17 but were rolled back in commit `1825402` ("Simplify: one tool, explicit skills"). `TOOLS` registry is now Tavily-only. The multi-tool refactor that supported them stayed in place; one explicit tool per skill is the current shape.
 > - **Memory loop shipped** — embed every report, recall similar prior reports as `[N]` archive citations alongside web sources, navigable graph via 📚 markers
