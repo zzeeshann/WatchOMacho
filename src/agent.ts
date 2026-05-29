@@ -1901,8 +1901,6 @@ async function planDayMap(
   title: string,
   summary: string | null,
   body: string,
-  targetName: string,
-  dateUtc: string,
   model: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
@@ -1917,8 +1915,8 @@ This is NOT abstract. Use the REAL names, places, dates and numbers from the bri
 
 OUTPUT
 - Output ONLY a complete HTML document. No prose, no markdown, no code fences. Start with <!DOCTYPE html> and end with </html>.
-- One self-contained file: inline <style> and inline <script> only. You MAY load ONE library from cdnjs (https://cdnjs.cloudflare.com/...) only if it truly helps — but the layout below is plain HTML/CSS and needs no library, so prefer none.
-- Runs inside a sandboxed iframe with NO network access: no fetch(), no localStorage/cookies, no forms, no external requests except an optional cdnjs tag. Inline everything.
+- Inline <style> and inline <script>. The ONLY external resources allowed: (1) the DM Sans brand font from Google Fonts (see STYLE — always load it), and (2) optionally ONE cdnjs library (https://cdnjs.cloudflare.com/...) if it truly helps — but the layout below is plain HTML/CSS and needs no library, so prefer none.
+- Runs inside a sandboxed iframe with NO other network access: no fetch(), no localStorage/cookies, no forms, no other external requests. Inline everything else.
 - Keep hand-written markup under ~45 KB.
 
 THE MAP — layout (this is the whole point, and it MUST stay readable on a phone)
@@ -1934,9 +1932,6 @@ THE MAP — layout (this is the whole point, and it MUST stay readable on a phon
 BELOW THE MAP — the day in short
 - A skimmable rundown: each story's HEADING followed by a tight 1–3 sentence take with the real specifics. Do NOT label these "beats" and do NOT number them ("Beat 1", etc.) — just the heading and the short take, cleanly.
 
-FOOTER
-- Small: WatchOMacho · ${targetName} · ${dateUtc}.
-
 AUTO-HEIGHT (required — so the embedding page can size the frame and there is NO inner scrollbar)
 - Include this exact script verbatim:
   <script>
@@ -1944,9 +1939,10 @@ AUTO-HEIGHT (required — so the embedding page can size the frame and there is 
   addEventListener('load',postH);addEventListener('resize',postH);new ResizeObserver(postH).observe(document.documentElement);
   </script>
 
-STYLE (brand)
-- Warm paper background #FAF8F4, near-black text #1A1A1A, teal accent #1A6B62, gold accent #C49A1A, hairline borders #E8E4DE.
-- Clean sans-serif. Calm, editorial, professional — this is news, not a toy.`;
+STYLE (brand — match daylila exactly)
+- Load the brand font in <head> and use it everywhere: <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap"> then font-family: 'DM Sans', system-ui, sans-serif.
+- Palette: warm paper background #FAF8F4, near-black text #1A1A1A, teal #1A6B62 (primary/accent; use #155951 for hover), gold #C49A1A, muted text #6B6B6B, hairline borders #E8E4DE.
+- Calm, editorial, professional — this is news, not a toy. No footer/branding line at the bottom.`;
 
   const userMsg = `BRIEFING TITLE
 ${title}
@@ -1984,19 +1980,15 @@ export async function makeDayMap(
   env: Env,
   report: { id: string; created_at: number; title: string; snippet?: string | null },
   body: string,
-  target: Target,
   model: string,
   signal?: AbortSignal,
 ): Promise<void> {
   try {
-    const dateUtc = new Date(report.created_at).toISOString().slice(0, 10);
     const html = await planDayMap(
       env,
       report.title,
       report.snippet ?? null,
       body,
-      target.name,
-      dateUtc,
       model,
       signal,
     );
@@ -2039,8 +2031,6 @@ export async function regenerateDayMap(
 ): Promise<boolean> {
   const report = await getReportById(env, reportId);
   if (!report) return false;
-  const target = await getTargetById(env, report.target_id);
-  if (!target) return false;
   const obj = await env.REPORTS.get(report.r2_key);
   if (!obj) return false;
   const body = await obj.text();
@@ -2049,7 +2039,6 @@ export async function regenerateDayMap(
     env,
     { id: report.id, created_at: report.created_at, title: report.title, snippet: report.snippet },
     body,
-    target,
     model,
     signal,
   );
@@ -2348,7 +2337,6 @@ export async function runResearch(
           env,
           { id: reportId, created_at: created, title, snippet },
           body,
-          target,
           chatModel,
           signal,
         );

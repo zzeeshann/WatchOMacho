@@ -309,9 +309,10 @@ export default {
       // The HTML is LLM-authored, so a direct (non-iframed) visit would run its
       // script in this origin. We serve it under a strict Content-Security-
       // Policy that blocks all network egress (`connect-src 'none'`) and allows
-      // scripts only inline + from cdnjs — the same one-library allowance the
-      // generator is given. That caps a prompt-injected map: it can't phone
-      // home or load arbitrary code, in or out of an iframe.
+      // scripts only inline + from cdnjs, styles inline + Google Fonts, and
+      // fonts from gstatic (the DM Sans brand font, matching daylila). Even so a
+      // prompt-injected map can't phone home (no fetch/XHR/beacon channel) or
+      // load arbitrary code, in or out of an iframe.
       if (path.startsWith("/day-map/") && (req.method === "GET" || req.method === "HEAD")) {
         const id = path.slice("/day-map/".length);
         if (!/^[a-z0-9-]+$/.test(id)) {
@@ -332,7 +333,8 @@ export default {
             "cache-control": "public, max-age=86400",
             "content-security-policy":
               "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com; " +
-              "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; " +
+              "style-src 'unsafe-inline' https://fonts.googleapis.com; img-src data: blob:; " +
+              "font-src data: https://fonts.gstatic.com; " +
               "connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors *",
           },
         });
