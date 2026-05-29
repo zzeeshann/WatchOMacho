@@ -1835,6 +1835,323 @@ Markdown formatting rules (follow strictly — the rendering engine depends on t
   return { title: fallbackTitle, summary: fallbackSummary, body: raw, citations };
 }
 
+// ─── the daily comic ────────────────────────────────────────────────────────
+//
+// After a briefing is written, optionally generate a small "connection comic":
+// a few panels that show how the day's stories hang together — a cause-and-
+// effect chain, not a gag. It is drawn as SVG *in code* (brand palette, real
+// text), never an image-gen model. One LLM pass distils the briefing into a
+// spine + 3-5 panels; renderComicSvg() lays those into a fixed vertical chain.
+//
+// Gated per-target via comicEnabledForTarget(). Best-effort: makeComic never
+// throws, so a comic failure can never fail (or roll back) the briefing.
+
+/** One panel of the comic. `label` is the 1-3 word node title (the actor or
+ *  force — "Iran war", "Oil markets"); `caption` is one short line of what
+ *  happens / how it connects; `icon` is a motif from a small fixed set that
+ *  renderComicSvg knows how to draw (anything else falls back to a dot). */
+interface ComicPanel {
+  label: string;
+  caption: string;
+  icon: string;
+}
+
+interface ComicSpec {
+  spine: string;        // the single connecting thread, one sentence
+  slug: string;         // short descriptive kebab-case slug for the comic page
+  panels: ComicPanel[]; // 3-5, in cause→effect order
+}
+
+/** Icons renderComicSvg can draw as simple SVG shapes. The comic LLM is asked
+ *  to pick from these; unknown values render as a neutral dot. */
+const COMIC_ICONS = new Set([
+  "flame", "up", "down", "globe", "bolt", "alert", "coin", "dot",
+]);
+
+/** Step C1: ask the LLM to distil the finished briefing into a comic spec.
+ *  Mirrors planResearch's "parse the JSON object out of the response" pattern.
+ *  Returns null if the model didn't produce a usable spec (caller skips the
+ *  comic — never fails the run). */
+async function planComic(
+  env: Env,
+  title: string,
+  body: string,
+  model: string,
+  signal?: AbortSignal,
+): Promise<ComicSpec | null> {
+  const system = `You turn a finished daily news briefing into a small "connection comic": a few panels that show how the day's stories CONNECT — a cause-and-effect chain or a single thread running through everything. It is not a joke or a gag; the news is serious. You are reshaping facts the briefing already verified, not adding new ones.
+
+Return ONLY a JSON object, no prose, exactly this shape:
+{
+  "spine": "one sentence naming the single thread that ties the day together (max 140 chars)",
+  "slug": "short-kebab-case-slug-3-to-5-words",
+  "panels": [
+    { "label": "1-3 word node title (the actor or force)", "caption": "one short line: what happens or how it connects to the next panel (max 110 chars)", "icon": "one of: flame up down globe bolt alert coin dot" }
+  ]
+}
+
+Rules:
+- Exactly 3 to 5 panels, ordered as a cause→effect chain (panel 1 leads to panel 2, etc.) or as facets of the one spine.
+- "label" max 24 chars, "caption" max 110 chars, both single-line plain text (no markdown, no quotes, no emoji).
+- Pick the "icon" that best fits each panel's motif: flame (war/conflict/destruction), down (markets/decline/loss), up (gains/escalation/rise), globe (diplomacy/international), bolt (energy/sudden shock), alert (warning/crisis), coin (economy/money), dot (anything else).
+- The spine is the EDITORIAL point — what the day was really about — not a summary of each story.`;
+
+  const userMsg = `BRIEFING TITLE\n${title}\n\nBRIEFING BODY\n${body.slice(0, 6000)}\n\nReturn the comic JSON now.`;
+
+  const res = await runChat(env, model, {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: userMsg },
+    ],
+    max_tokens: 700,
+  }, signal);
+
+  const m = res.response.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(m[0]);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const spine = String(parsed.spine ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+  if (!spine) return null;
+
+  const rawPanels = Array.isArray(parsed.panels) ? parsed.panels : [];
+  const panels: ComicPanel[] = rawPanels
+    .map((p: any): ComicPanel => {
+      const icon = String(p?.icon ?? "dot").toLowerCase().trim();
+      return {
+        label: String(p?.label ?? "").replace(/\s+/g, " ").trim().slice(0, 40),
+        caption: String(p?.caption ?? "").replace(/\s+/g, " ").trim().slice(0, 160),
+        icon: COMIC_ICONS.has(icon) ? icon : "dot",
+      };
+    })
+    .filter((p: ComicPanel) => p.label || p.caption)
+    .slice(0, 5);
+  if (panels.length < 2) return null; // too thin to be a "connection"
+
+  const slug = slugify(String(parsed.slug ?? "") || spine);
+  return { spine, slug, panels };
+}
+
+// ─── SVG rendering (brand palette, code-drawn — no image-gen model) ──────────
+
+const COMIC = {
+  bg: "#FAF8F4",
+  card: "#FFFFFF",
+  text: "#1A1A1A",
+  primary: "#1A6B62",
+  muted: "#6B6B6B",
+  gold: "#C49A1A",
+  border: "#E8E4DE",
+  width: 720,
+  margin: 36,
+} as const;
+
+/** Minimal XML text escaper for SVG content (no dep on dashboard's helper). */
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/** Greedy word-wrap by estimated pixel width. SVG has no layout engine, so we
+ *  approximate character width as ~0.55em and pack words into lines that fit
+ *  `maxWidth`. Good enough for the bounded caption/spine lengths we render. */
+function wrapText(text: string, maxWidth: number, fontSize: number): string[] {
+  const maxChars = Math.max(8, Math.floor(maxWidth / (fontSize * 0.55)));
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let cur = "";
+  for (const w of words) {
+    const cand = cur ? `${cur} ${w}` : w;
+    if (cand.length > maxChars && cur) {
+      lines.push(cur);
+      cur = w;
+    } else {
+      cur = cand;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [""];
+}
+
+/** Draw one motif icon as simple SVG shapes, centred at (cx, cy). */
+function comicIcon(name: string, cx: number, cy: number): string {
+  const s = 11; // half-extent
+  const c = COMIC.gold;
+  switch (name) {
+    case "flame":
+      return `<path d="M${cx} ${cy - s} C ${cx + s} ${cy - 2}, ${cx + s * 0.5} ${cy + s}, ${cx} ${cy + s} C ${cx - s * 0.6} ${cy + s}, ${cx - s} ${cy - 1}, ${cx} ${cy - s} Z" fill="${c}"/>`;
+    case "down":
+      return `<path d="M${cx - s} ${cy - s * 0.6} L${cx + s} ${cy - s * 0.6} L${cx} ${cy + s} Z" fill="#B4452F"/>`;
+    case "up":
+      return `<path d="M${cx} ${cy - s} L${cx + s} ${cy + s * 0.6} L${cx - s} ${cy + s * 0.6} Z" fill="${COMIC.primary}"/>`;
+    case "globe":
+      return `<g fill="none" stroke="${c}" stroke-width="1.6"><circle cx="${cx}" cy="${cy}" r="${s}"/><ellipse cx="${cx}" cy="${cy}" rx="${s * 0.45}" ry="${s}"/><line x1="${cx - s}" y1="${cy}" x2="${cx + s}" y2="${cy}"/></g>`;
+    case "bolt":
+      return `<path d="M${cx + 2} ${cy - s} L${cx - s} ${cy + 2} L${cx - 1} ${cy + 2} L${cx - 3} ${cy + s} L${cx + s} ${cy - 3} L${cx + 1} ${cy - 3} Z" fill="${c}"/>`;
+    case "alert":
+      return `<g><path d="M${cx} ${cy - s} L${cx + s} ${cy + s} L${cx - s} ${cy + s} Z" fill="none" stroke="#B4452F" stroke-width="1.8" stroke-linejoin="round"/><line x1="${cx}" y1="${cy - 2}" x2="${cx}" y2="${cy + 4}" stroke="#B4452F" stroke-width="1.8"/><circle cx="${cx}" cy="${cy + 8}" r="1" fill="#B4452F"/></g>`;
+    case "coin":
+      return `<g fill="none" stroke="${c}" stroke-width="1.6"><circle cx="${cx}" cy="${cy}" r="${s}"/><line x1="${cx}" y1="${cy - 5}" x2="${cx}" y2="${cy + 5}"/></g>`;
+    default: // dot
+      return `<circle cx="${cx}" cy="${cy}" r="5" fill="${COMIC.primary}"/>`;
+  }
+}
+
+/** Render a comic spec into a self-contained SVG string. Fixed vertical
+ *  connection-chain layout: a spine header, then numbered panel cards joined
+ *  by downward connectors, then a footer. Width is fixed; height grows with
+ *  content so nothing ever clips. */
+function renderComicSvg(
+  spec: ComicSpec,
+  meta: { dateUtc: string; targetName: string },
+): string {
+  const W = COMIC.width;
+  const M = COMIC.margin;
+  const contentW = W - 2 * M;
+  const parts: string[] = [];
+
+  // ── header ──
+  let y = 52;
+  parts.push(
+    `<text x="${M}" y="${y}" font-size="12" letter-spacing="2" font-weight="700" fill="${COMIC.primary}">THE DAY'S THREAD</text>`,
+  );
+  y += 26;
+  const spineLines = wrapText(spec.spine, contentW, 22);
+  for (const line of spineLines) {
+    parts.push(
+      `<text x="${M}" y="${y}" font-size="22" font-weight="700" fill="${COMIC.text}">${escapeXml(line)}</text>`,
+    );
+    y += 30;
+  }
+  y += 6;
+  parts.push(`<line x1="${M}" y1="${y}" x2="${W - M}" y2="${y}" stroke="${COMIC.border}" stroke-width="1.5"/>`);
+  y += 28;
+
+  // ── panel cards joined by connectors ──
+  const labelX = M + 64;
+  const textW = contentW - 64 - 44; // minus badge gutter and icon gutter
+  spec.panels.forEach((p, i) => {
+    const capLines = p.caption ? wrapText(p.caption, textW, 15) : [];
+    const cardH = Math.max(74, 50 + capLines.length * 21 + 14);
+    const cardY = y;
+
+    // card + left accent stripe
+    parts.push(
+      `<rect x="${M}" y="${cardY}" width="${contentW}" height="${cardH}" rx="14" fill="${COMIC.card}" stroke="${COMIC.border}" stroke-width="1.5"/>`,
+    );
+    parts.push(
+      `<rect x="${M}" y="${cardY}" width="6" height="${cardH}" rx="3" fill="${COMIC.primary}"/>`,
+    );
+    // number badge
+    const badgeCx = M + 34;
+    const badgeCy = cardY + 34;
+    parts.push(`<circle cx="${badgeCx}" cy="${badgeCy}" r="16" fill="${COMIC.primary}"/>`);
+    parts.push(
+      `<text x="${badgeCx}" y="${badgeCy + 5}" font-size="15" font-weight="700" fill="#FFFFFF" text-anchor="middle">${i + 1}</text>`,
+    );
+    // icon top-right
+    parts.push(comicIcon(p.icon, W - M - 28, cardY + 30));
+    // label
+    if (p.label) {
+      parts.push(
+        `<text x="${labelX}" y="${cardY + 30}" font-size="17" font-weight="700" fill="${COMIC.text}">${escapeXml(p.label)}</text>`,
+      );
+    }
+    // caption lines
+    let cy = cardY + (p.label ? 54 : 36);
+    for (const line of capLines) {
+      parts.push(
+        `<text x="${labelX}" y="${cy}" font-size="15" fill="${COMIC.muted}">${escapeXml(line)}</text>`,
+      );
+      cy += 21;
+    }
+
+    y = cardY + cardH;
+
+    // connector to the next card (chain arrow)
+    if (i < spec.panels.length - 1) {
+      const gap = 26;
+      const x = badgeCx;
+      parts.push(
+        `<line x1="${x}" y1="${y + 4}" x2="${x}" y2="${y + gap - 4}" stroke="${COMIC.primary}" stroke-width="2"/>`,
+      );
+      parts.push(
+        `<path d="M${x - 5} ${y + gap - 7} L${x} ${y + gap - 1} L${x + 5} ${y + gap - 7}" fill="none" stroke="${COMIC.primary}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+      );
+      y += gap;
+    }
+  });
+
+  // ── footer ──
+  y += 30;
+  parts.push(`<line x1="${M}" y1="${y - 18}" x2="${W - M}" y2="${y - 18}" stroke="${COMIC.border}" stroke-width="1.5"/>`);
+  parts.push(
+    `<text x="${M}" y="${y}" font-size="12" font-weight="700" fill="${COMIC.primary}">WatchOMacho</text>`,
+  );
+  parts.push(
+    `<text x="${W - M}" y="${y}" font-size="12" fill="${COMIC.muted}" text-anchor="end">${escapeXml(meta.targetName)} · ${escapeXml(meta.dateUtc)}</text>`,
+  );
+  const H = y + 24;
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="'DM Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+<rect width="${W}" height="${H}" fill="${COMIC.bg}"/>
+<rect x="6" y="6" width="${W - 12}" height="${H - 12}" rx="18" fill="none" stroke="${COMIC.border}" stroke-width="1.5"/>
+${parts.join("\n")}
+</svg>`;
+}
+
+/** Generate + persist the comic for a just-written briefing. Best-effort:
+ *  catches everything, records the failure to settings for the admin page,
+ *  and never throws — the briefing is already saved before this runs.
+ *  Stores the SVG in R2 (mirroring report markdown) and links it from the
+ *  reports row via comic_r2_key + comic_slug. */
+export async function makeComic(
+  env: Env,
+  report: { id: string; created_at: number; title: string },
+  body: string,
+  target: Target,
+  model: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    const spec = await planComic(env, report.title, body, model, signal);
+    if (!spec) {
+      console.warn(`makeComic: no usable comic spec for report ${report.id}; skipping`);
+      return;
+    }
+    const dateUtc = new Date(report.created_at).toISOString().slice(0, 10);
+    const svg = renderComicSvg(spec, { dateUtc, targetName: target.name });
+    const r2Key = `comics/${report.created_at}-${report.id}.svg`;
+    await env.REPORTS.put(r2Key, svg, {
+      httpMetadata: { contentType: "image/svg+xml; charset=utf-8" },
+    });
+    await env.DB.prepare(
+      "UPDATE reports SET comic_r2_key = ?, comic_slug = ? WHERE id = ?",
+    )
+      .bind(r2Key, spec.slug || "comic", report.id)
+      .run();
+    await setSetting(env, "comic_last_ok_at", String(Date.now())).catch(() => {});
+    await setSetting(env, "comic_last_error", "").catch(() => {});
+  } catch (e: any) {
+    const msg = String(e?.message ?? e).slice(0, 500);
+    console.error("makeComic failed", report.id, msg);
+    await setSetting(
+      env,
+      "comic_last_error",
+      JSON.stringify({ message: msg, at: Date.now(), report_id: report.id }),
+    ).catch(() => {});
+  }
+}
+
 /** Pipeline step labels used by runResearch's step-boundary breadcrumb.
  *  These flow into both the live `last_run_attempt` setting (so admin can
  *  see "in-flight at step X") and the `runs.error` text (so completed
@@ -2114,6 +2431,27 @@ export async function runResearch(
     attempt.completed_at = Date.now();
     attempt.outcome = "success";
     await markStep(env, attempt, "done");
+
+    // Paired comic (v13). Runs AFTER the briefing is fully persisted, gated
+    // per-target. Lives here (not only in the DO alarm) so BOTH the cron and
+    // the manual "Run Now" path get a comic. makeComic is best-effort and
+    // never throws, so it can't fail or roll back the briefing above. We do
+    // it before the final getReportById so the returned Report carries the
+    // freshly-linked comic_r2_key / comic_slug.
+    try {
+      if (await comicEnabledForTarget(env, target)) {
+        await makeComic(
+          env,
+          { id: reportId, created_at: created, title },
+          body,
+          target,
+          chatModel,
+          signal,
+        );
+      }
+    } catch (comicErr) {
+      console.error(`runResearch[${runId}] comic step failed (non-fatal):`, comicErr);
+    }
 
     return (await getReportById(env, reportId))!;
   } catch (err: any) {
