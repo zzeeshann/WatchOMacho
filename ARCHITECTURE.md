@@ -414,6 +414,7 @@ Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 | POST | `/admin/storage/gc` | Sweep R2 orphans |
 | POST | `/admin/memory/backfill` | Re-embed every report into Vectorize |
 | POST | `/admin/reports/:id/delete` | Delete a single report |
+| POST | `/admin/reports/:id/day-map` | Rebuild ONLY the day-map for one report (one AI call, no re-research). Runs via the `ResearchRunner` DO; "Remake map" button on the Activity card. |
 
 ---
 
