@@ -836,7 +836,9 @@ export default {
           updated.chat_model = form.chat_model;
         }
         // Global comic default (v13): per-target comic_enabled=NULL inherits this.
-        // Checkbox semantics — present in the form means "on".
+        // Sent as a <select> (always present, value "on"/"off") — keep it a
+        // select, not a checkbox: an unchecked checkbox is absent from FormData,
+        // so "off" could never be saved.
         if (form.comics_enabled !== undefined) {
           const on = form.comics_enabled === "on" || form.comics_enabled === "true" || form.comics_enabled === "1";
           await setSetting(env, "comics_enabled", on ? "on" : "off");
