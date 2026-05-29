@@ -375,8 +375,8 @@ Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 | GET | `/` | Home — list of active targets |
 | GET | `/target/:slug` | Target page with all reports |
 | GET | `/skill/:slug` | Skill detail with writer instructions |
-| GET | `/report/:id` | Single report (date + word count only on header — no admin info). Embeds the paired day-map via a sandboxed iframe at `/day-map/:id` when present. |
-| GET | `/day-map/:id` | The report's paired day-map (self-contained interactive HTML, served from R2; v14). `cache-control: no-store` (so a "Remake map" shows immediately) + a no-network CSP (`connect-src 'none'`; scripts inline + cdnjs, styles inline + Google Fonts, fonts gstatic). Reports its height to the embedder via `postMessage({type:'day-map-height'})`. 404 when none. Public, like `/report/:id`. |
+| GET | `/report/<date>/<slug>` | Single report at a pretty daylila-style URL (`/report/2026-05-29/<title-slug>`; `getReportByDateSlug()` resolves it by scanning that UTC day's reports + matching the title slug). Legacy `/report/<id>` 302-redirects here via `reportUrlParts()`. Embeds the paired day-map via a sandboxed iframe when present. |
+| GET | `/day-map/<date>/<slug>` | The report's paired day-map (self-contained interactive HTML, served from R2; v14). Legacy `/day-map/<id>` redirects here. `cache-control: no-store` (so a "Remake map" shows immediately) + a no-network CSP (`connect-src 'none'`; scripts inline + cdnjs, styles inline + Google Fonts, fonts gstatic). Reports its height to the embedder via `postMessage({type:'day-map-height'})`. 404 when none. |
 
 ### JSON API (gated by `X-API-Key: <WATCHOMACHO_API_KEY>`)
 

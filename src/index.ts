@@ -17,6 +17,8 @@ import {
   getChatModel,
   getDailyUsage,
   getReportById,
+  getReportByDateSlug,
+  reportUrlParts,
   getSetting,
   getSkillById,
   getSkillBySlug,
@@ -293,18 +295,29 @@ export default {
       }
 
       if (path.startsWith("/report/") && req.method === "GET") {
-        const id = path.slice("/report/".length);
-        if (!/^[a-z0-9-]+$/.test(id)) {
+        const rest = path.slice("/report/".length).replace(/\/+$/, "");
+        // Pretty form: /report/<YYYY-MM-DD>/<slug>
+        if (rest.includes("/")) {
+          const slash = rest.indexOf("/");
+          const report = await getReportByDateSlug(env, rest.slice(0, slash), rest.slice(slash + 1));
+          if (!report) return new Response("Not found", withSecurityHeaders({ status: 404 }));
+          return html(await renderReportPage(env, report.id));
+        }
+        // Legacy form: /report/<id> → redirect to the pretty URL (kept working).
+        if (!/^[a-z0-9-]+$/.test(rest)) {
           return new Response("Bad id", withSecurityHeaders({ status: 400 }));
         }
-        return html(await renderReportPage(env, id));
+        const report = await getReportById(env, rest);
+        if (!report) return new Response("Not found", withSecurityHeaders({ status: 404 }));
+        const { date, slug } = reportUrlParts(report);
+        return redirect(`/report/${date}/${slug}`);
       }
 
       // ─── Day-map (public; v14) ─────────────────────────────────────────────
       // Serves a briefing's paired day-map (self-contained interactive HTML) at
-      // its own URL so daylila (or anyone) can embed it in a sandboxed iframe
-      // or link to it. Keyed by report id; the descriptive day_map_slug is
-      // exposed via the JSON API for building pretty URLs on top.
+      // a pretty /day-map/<YYYY-MM-DD>/<slug> URL (daylila-style); the legacy
+      // /day-map/<id> still works and redirects here. daylila embeds it in a
+      // sandboxed iframe or links to it.
       //
       // The HTML is LLM-authored, so a direct (non-iframed) visit would run its
       // script in this origin. We serve it under a strict Content-Security-
@@ -314,13 +327,26 @@ export default {
       // prompt-injected map can't phone home (no fetch/XHR/beacon channel) or
       // load arbitrary code, in or out of an iframe.
       if (path.startsWith("/day-map/") && (req.method === "GET" || req.method === "HEAD")) {
-        const id = path.slice("/day-map/".length);
-        if (!/^[a-z0-9-]+$/.test(id)) {
-          return new Response("Bad id", withSecurityHeaders({ status: 400 }));
+        const rest = path.slice("/day-map/".length).replace(/\/+$/, "");
+        let report: Awaited<ReturnType<typeof getReportById>> = null;
+        let legacyId = false;
+        if (rest.includes("/")) {
+          const slash = rest.indexOf("/");
+          report = await getReportByDateSlug(env, rest.slice(0, slash), rest.slice(slash + 1));
+        } else {
+          if (!/^[a-z0-9-]+$/.test(rest)) {
+            return new Response("Bad id", withSecurityHeaders({ status: 400 }));
+          }
+          legacyId = true;
+          report = await getReportById(env, rest);
         }
-        const report = await getReportById(env, id);
         if (!report?.day_map_r2_key) {
           return new Response("Not found", withSecurityHeaders({ status: 404 }));
+        }
+        // Legacy /day-map/<id> → redirect to the pretty URL.
+        if (legacyId) {
+          const { date, slug } = reportUrlParts(report);
+          return redirect(`/day-map/${date}/${slug}`);
         }
         const obj = await env.REPORTS.get(report.day_map_r2_key);
         if (!obj) return new Response("Not found", withSecurityHeaders({ status: 404 }));
@@ -392,10 +418,12 @@ export default {
               ORDER BY reports.created_at DESC
               LIMIT ?`,
           ).bind(limit).all<any>();
-          const items = (rows.results ?? []).map((r) => ({
+          const items = (rows.results ?? []).map((r) => {
+            const parts = reportUrlParts({ id: r.id, created_at: r.created_at, title: r.title });
+            return {
             id: r.id,
             title: r.title,
-            url: `${origin}/report/${r.id}`,
+            url: `${origin}/report/${parts.date}/${parts.slug}`,
             // `date` is the full ISO timestamp (kept for back-compat with
             // any existing consumer); `briefing_date` is the canonical
             // UTC calendar date — use this one for date-stamping the
@@ -415,9 +443,10 @@ export default {
             // stays light — slug + URL only, no inline HTML (pull /api/reports/:id
             // for the HTML itself).
             day_map: r.day_map_r2_key
-              ? { slug: r.day_map_slug, url: `${origin}/day-map/${r.id}` }
+              ? { slug: r.day_map_slug, url: `${origin}/day-map/${parts.date}/${parts.slug}` }
               : null,
-          }));
+          };
+          });
           return json({ reports: items });
         }
 
@@ -439,6 +468,7 @@ export default {
           // (mirrors body_markdown) in daylila's "lab" shape — { type:'html',
           // html } — plus the slug + its own URL. daylila drops `html` straight
           // into a sandboxed iframe. null when the run made no day-map.
+          const parts = reportUrlParts(report);
           let day_map:
             | { type: "html"; html: string | null; slug: string | null; url: string }
             | null = null;
@@ -448,7 +478,7 @@ export default {
               type: "html",
               html: dmObj ? await dmObj.text() : null,
               slug: report.day_map_slug,
-              url: `${new URL(req.url).origin}/day-map/${report.id}`,
+              url: `${new URL(req.url).origin}/day-map/${parts.date}/${parts.slug}`,
             };
           }
           const target = await getTargetById(env, report.target_id);
@@ -469,7 +499,7 @@ export default {
           return json({
             id: report.id,
             title: report.title,
-            url: `${origin}/report/${report.id}`,
+            url: `${origin}/report/${parts.date}/${parts.slug}`,
             // See /api/reports/recent above for the date / briefing_date
             // split. Keep both surfaces emitting identical date semantics.
             date: new Date(report.created_at).toISOString(),

@@ -20,6 +20,7 @@ import {
   listReportsForTarget,
   listSkills,
   listTargets,
+  reportUrlParts,
   type Env,
   type Report,
   type Skill,
@@ -849,8 +850,9 @@ export async function renderTargetPage(env: Env, slug: string): Promise<string> 
   } else {
     body += `<section class="py-2">`;
     for (const r of reports) {
+      const rp = reportUrlParts(r);
       body += `
-        <a class="piece" href="/report/${escapeHtml(r.id)}">
+        <a class="piece" href="/report/${rp.date}/${escapeHtml(rp.slug)}">
           <div class="piece-row">
             <div class="flex-1 min-w-0">
               <p class="piece-title">${escapeHtml(r.title)} <span class="piece-arrow" aria-hidden="true">→</span></p>
@@ -955,9 +957,11 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   // Paired day-map (v14). The day-map is LLM-authored interactive HTML, so it
   // is embedded inside a SANDBOXED iframe (allow-scripts only — no
   // allow-same-origin) so its script is caged away from this page's origin.
-  // The /day-map/:id route additionally serves it under a no-network CSP.
-  // Omitted entirely when the run produced no day-map.
-  const dayMapUrl = `/day-map/${escapeHtml(report.id)}`;
+  // The /day-map route additionally serves it under a no-network CSP.
+  // Omitted entirely when the run produced no day-map. Pretty URL (date/slug)
+  // so the embed loads directly without a redirect hop.
+  const dmParts = reportUrlParts(report);
+  const dayMapUrl = `/day-map/${dmParts.date}/${escapeHtml(dmParts.slug)}`;
   const dayMapHtml = report.day_map_r2_key
     ? `
     <figure class="mt-8 mb-2">

@@ -176,8 +176,8 @@ On **Haiku 4.5** the same workload costs ~$0.30–1.20/month. Switch via the cha
 | `GET` | `/` | Home — list of active targets |
 | `GET` | `/target/:slug` | Target page with all reports |
 | `GET` | `/skill/:slug` | Skill detail with writer instructions |
-| `GET` | `/report/:id` | Single report |
-| `GET` | `/day-map/:id` | The report's paired day-map (self-contained interactive HTML), if any. Served under a no-network CSP; embed in a sandboxed iframe. 404 when the report has no day-map. |
+| `GET` | `/report/<date>/<slug>` | Single report (pretty URL, e.g. `/report/2026-05-29/<slug>`). Legacy `/report/<id>` still works and 302-redirects here. |
+| `GET` | `/day-map/<date>/<slug>` | The report's paired day-map (self-contained interactive HTML), if any. Served under a no-network CSP; embed in a sandboxed iframe. Legacy `/day-map/<id>` redirects here. 404 when the report has no day-map. |
 
 ### JSON API — gated by `X-API-Key: <WATCHOMACHO_API_KEY>`
 

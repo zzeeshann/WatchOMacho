@@ -1067,6 +1067,33 @@ export async function getReportById(env: Env, id: string): Promise<Report | null
   return env.DB.prepare("SELECT * FROM reports WHERE id = ?").bind(id).first<Report>();
 }
 
+/** Pretty-URL parts for a report: the UTC date + a title slug (id as fallback).
+ *  Drives the public `/report/<date>/<slug>` and `/day-map/<date>/<slug>` URLs
+ *  (daylila-style). Deterministic from created_at + title, so it's stable. */
+export function reportUrlParts(report: { id: string; created_at: number; title: string }): { date: string; slug: string } {
+  return {
+    date: new Date(report.created_at).toISOString().slice(0, 10),
+    slug: slugify(report.title) || report.id,
+  };
+}
+
+/** Resolve a report from a pretty-URL (date, slug) pair. Scans the reports
+ *  created on that UTC day — 1–2 rows in practice — and matches the title slug.
+ *  Returns null on a malformed date or no match. The legacy `/report/:id` and
+ *  `/day-map/:id` routes still work (they redirect here), so this is additive. */
+export async function getReportByDateSlug(env: Env, date: string, slug: string): Promise<Report | null> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  const start = Date.parse(`${date}T00:00:00Z`);
+  if (Number.isNaN(start)) return null;
+  const rows = await env.DB.prepare(
+    "SELECT * FROM reports WHERE created_at >= ? AND created_at < ? ORDER BY created_at DESC",
+  ).bind(start, start + 86400000).all<Report>();
+  for (const r of rows.results ?? []) {
+    if ((slugify(r.title) || r.id) === slug) return r;
+  }
+  return null;
+}
+
 // ─── the research loop ─────────────────────────────────────────────────────
 
 interface ResearchPlan {
