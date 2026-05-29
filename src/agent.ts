@@ -1920,10 +1920,15 @@ OUTPUT
 - One self-contained file: inline <style> and inline <script> only. You MAY load ONE library from cdnjs (https://cdnjs.cloudflare.com/...) via a <script src> tag if it genuinely helps (e.g. D3 v7 for a force/graph layout) — otherwise use none.
 - It runs inside a sandboxed iframe with NO network access: do not fetch(), do not use localStorage/cookies, no forms, no external requests except the one optional cdnjs library tag. Everything the page needs must be inlined.
 - Keep the hand-written markup under ~45 KB (the cdnjs library, if used, does not count).
-- Responsive and mobile-respectable. Legible on a phone.
+
+LAYOUT (quality floor — non-negotiable; the page is viewed on phones)
+- The page MUST be responsive down to a 320px-wide screen. Nothing may overflow the viewport or get clipped, and node cards/labels MUST NEVER overlap each other at any width.
+- Do NOT hand-place the map's nodes at fixed pixel coordinates — that looks fine on a wide screen but collapses into an unreadable pile on a phone. Use an AUTOMATIC layout that spreads nodes apart and adapts to the container width. A D3 v7 force-directed graph from cdnjs (with a collision force, and re-run on window 'resize') is the recommended, reliable way to guarantee no overlaps; size the SVG to its container.
+- Make the map pan- and zoom-able (drag + scroll/pinch-to-zoom) and fit/center it to the container on load, so it stays explorable when it is larger than the screen rather than shrinking into illegibility.
+- Keep on-map node labels short; put the full detail in the click/tap panel.
 
 CONTENT
-1. TOP — the overview map: the single connecting thread (one sentence, prominent), then the major forces/stories as nodes with short cause→effect links between them. Make the connections visible and, where it helps, interactive (hover/click to highlight a link or reveal a one-line detail).
+1. TOP — the overview map: the single connecting thread (one sentence, prominent), then the major forces/stories as nodes with short cause→effect links between them, positioned by the automatic layout above (never fixed coordinates). Clicking/tapping a node or edge reveals its full one-line detail.
 2. BELOW — the beats: one block per briefing section, in order, each with its heading and a tight 1–3 sentence take carrying the real specifics. Tie each beat back to the map where natural.
 3. A small footer: WatchOMacho · ${targetName} · ${dateUtc}.
 
