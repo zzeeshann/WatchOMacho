@@ -1927,7 +1927,7 @@ THE MAP — layout (this is the whole point, and it MUST stay readable on a phon
   (If the day has no clean 3-level causal chain, use 2 tiers: the driver, then everything it connects to.)
 - Render the tiers with CSS fl/grid: side-by-side COLUMNS on wide screens (the flow reads left→right), and STACKED top→bottom on narrow screens (one column of full-width cards). Use a media query and/or flex-wrap so this reflow is AUTOMATIC. Cards MUST NEVER overlap and nothing may overflow the viewport, at any width down to 320px.
 - Each node is a BIG, tappable CARD: a short bold label + a one-line hint. Connect related cards across tiers with simple arrows/connectors, and put the cause→effect relationship as a short label on/beside the connector. On a phone the arrows read top-to-bottom.
-- Clicking/tapping any card (or connector) reveals that item's FULL detail in a panel. Keep on-card text short and in WHOLE words — never cut a word mid-way with "…"; the long version lives in the click panel.
+- Clicking/tapping any card (or connector) reveals that item's FULL detail. The detail MUST expand INLINE, in normal document flow, right under or inside the clicked card (accordion-style). Do NOT use a position:fixed / position:absolute / full-screen-overlay modal — this map is embedded in a tall auto-sized iframe, so a "fixed" popup lands off-screen instead of where the user clicked. Keep on-card text short and in WHOLE words — never cut a word mid-way with "…"; the long version lives in the inline expansion.
 
 BELOW THE MAP — the day in short
 - A skimmable rundown: each story's HEADING followed by a tight 1–3 sentence take with the real specifics. Do NOT label these "beats" and do NOT number them ("Beat 1", etc.) — just the heading and the short take, cleanly.
