@@ -300,26 +300,40 @@ export default {
         return html(await renderReportPage(env, id));
       }
 
-      // ─── Comic (public; v13) ───────────────────────────────────────────────
-      // Serves a briefing's paired comic SVG at its own URL so daylila (or
-      // anyone) can embed it or link to it. Keyed by report id — unique and
-      // simple; the descriptive comic_slug is exposed via the JSON API for
-      // building pretty URLs on top. Public, like /report/:id.
-      if (path.startsWith("/comic/") && (req.method === "GET" || req.method === "HEAD")) {
-        const id = path.slice("/comic/".length);
+      // ─── Day-map (public; v14) ─────────────────────────────────────────────
+      // Serves a briefing's paired day-map (self-contained interactive HTML) at
+      // its own URL so daylila (or anyone) can embed it in a sandboxed iframe
+      // or link to it. Keyed by report id; the descriptive day_map_slug is
+      // exposed via the JSON API for building pretty URLs on top.
+      //
+      // The HTML is LLM-authored, so a direct (non-iframed) visit would run its
+      // script in this origin. We serve it under a strict Content-Security-
+      // Policy that blocks all network egress (`connect-src 'none'`) and allows
+      // scripts only inline + from cdnjs — the same one-library allowance the
+      // generator is given. That caps a prompt-injected map: it can't phone
+      // home or load arbitrary code, in or out of an iframe.
+      if (path.startsWith("/day-map/") && (req.method === "GET" || req.method === "HEAD")) {
+        const id = path.slice("/day-map/".length);
         if (!/^[a-z0-9-]+$/.test(id)) {
           return new Response("Bad id", withSecurityHeaders({ status: 400 }));
         }
         const report = await getReportById(env, id);
-        if (!report?.comic_r2_key) {
+        if (!report?.day_map_r2_key) {
           return new Response("Not found", withSecurityHeaders({ status: 404 }));
         }
-        const obj = await env.REPORTS.get(report.comic_r2_key);
+        const obj = await env.REPORTS.get(report.day_map_r2_key);
         if (!obj) return new Response("Not found", withSecurityHeaders({ status: 404 }));
+        // Honour the stored content-type so pre-v14 rows (which still point at
+        // an old SVG) keep serving as SVG; new day-maps are text/html.
+        const contentType = obj.httpMetadata?.contentType || "text/html; charset=utf-8";
         return new Response(req.method === "HEAD" ? null : obj.body, {
           headers: {
-            "content-type": "image/svg+xml; charset=utf-8",
+            "content-type": contentType,
             "cache-control": "public, max-age=86400",
+            "content-security-policy":
+              "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com; " +
+              "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; " +
+              "connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors *",
           },
         });
       }
@@ -366,7 +380,7 @@ export default {
           const rows = await env.DB.prepare(
             `SELECT reports.id, reports.title, reports.snippet, reports.word_count,
                     reports.sources_json, reports.created_at,
-                    reports.comic_r2_key, reports.comic_slug,
+                    reports.day_map_r2_key, reports.day_map_slug,
                     targets.slug AS target_slug, targets.name AS target_name
                FROM reports
                LEFT JOIN targets ON targets.id = reports.target_id
@@ -392,11 +406,11 @@ export default {
             source_count: r.sources_json
               ? (() => { try { return JSON.parse(r.sources_json).length; } catch { return 0; } })()
               : 0,
-            // Paired comic (v13). null when the run made no comic. The feed
-            // stays light — slug + URL only, no inline SVG (pull /api/reports/:id
-            // for the SVG itself).
-            comic: r.comic_r2_key
-              ? { slug: r.comic_slug, url: `${origin}/comic/${r.id}` }
+            // Paired day-map (v14). null when the run made no day-map. The feed
+            // stays light — slug + URL only, no inline HTML (pull /api/reports/:id
+            // for the HTML itself).
+            day_map: r.day_map_r2_key
+              ? { slug: r.day_map_slug, url: `${origin}/day-map/${r.id}` }
               : null,
           }));
           return json({ reports: items });
@@ -416,15 +430,20 @@ export default {
           }
           const obj = await env.REPORTS.get(report.r2_key);
           const bodyMarkdown = obj ? await obj.text() : null;
-          // Paired comic (v13): inline the SVG (mirrors body_markdown) plus the
-          // slug + its own URL. null when the run made no comic.
-          let comic: { slug: string | null; url: string; svg: string | null } | null = null;
-          if (report.comic_r2_key) {
-            const comicObj = await env.REPORTS.get(report.comic_r2_key);
-            comic = {
-              slug: report.comic_slug,
-              url: `${new URL(req.url).origin}/comic/${report.id}`,
-              svg: comicObj ? await comicObj.text() : null,
+          // Paired day-map (v14): inline the self-contained interactive HTML
+          // (mirrors body_markdown) in daylila's "lab" shape — { type:'html',
+          // html } — plus the slug + its own URL. daylila drops `html` straight
+          // into a sandboxed iframe. null when the run made no day-map.
+          let day_map:
+            | { type: "html"; html: string | null; slug: string | null; url: string }
+            | null = null;
+          if (report.day_map_r2_key) {
+            const dmObj = await env.REPORTS.get(report.day_map_r2_key);
+            day_map = {
+              type: "html",
+              html: dmObj ? await dmObj.text() : null,
+              slug: report.day_map_slug,
+              url: `${new URL(req.url).origin}/day-map/${report.id}`,
             };
           }
           const target = await getTargetById(env, report.target_id);
@@ -455,7 +474,7 @@ export default {
             target: target ? { slug: target.slug, name: target.name } : null,
             body_markdown: bodyMarkdown,
             sources,
-            comic,
+            day_map,
           });
         }
 
@@ -641,10 +660,10 @@ export default {
             if (Number.isFinite(n) && n >= 1 && n <= 200) patch.tavily_max_final_sources = n;
           }
         }
-        // Comic switch (v13). "" = inherit global default (NULL), on = 1, off = 0.
-        if (form.comic_enabled !== undefined) {
-          const raw = form.comic_enabled.trim();
-          patch.comic_enabled = raw === "" ? null : (raw === "on" ? 1 : 0);
+        // Day-map switch (v14). "" = inherit global default (NULL), on = 1, off = 0.
+        if (form.day_map_enabled !== undefined) {
+          const raw = form.day_map_enabled.trim();
+          patch.day_map_enabled = raw === "" ? null : (raw === "on" ? 1 : 0);
         }
         await updateTarget(env, target.id, patch);
         // Snap next_run_at to the new schedule immediately when cadence
@@ -778,13 +797,13 @@ export default {
       // Settings
       if (path === "/admin/settings" && req.method === "GET") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const [reportLim, searchLim, perTick, lastCron, chatModel, comicsEnabled] = await Promise.all([
+        const [reportLim, searchLim, perTick, lastCron, chatModel, dayMapEnabled] = await Promise.all([
           getSetting(env, "daily_report_limit", "20"),
           getSetting(env, "daily_search_limit", "500"),
           getSetting(env, "cron_max_per_tick", "2"),
           getSetting(env, "last_cron_run", "0"),
           getChatModel(env),
-          getSetting(env, "comics_enabled", "off"),
+          getSetting(env, "day_map_enabled", "off"),
         ]);
         const usage = await getDailyUsage(env);
         return json({
@@ -793,7 +812,7 @@ export default {
           cron_max_per_tick: Number(perTick),
           last_cron_run: Number(lastCron),
           chat_model: chatModel,
-          comics_enabled: comicsEnabled === "on",
+          day_map_enabled: dayMapEnabled === "on",
           allowed_chat_models: ALLOWED_CHAT_MODELS,
           usage,
           tavily_api_key_set: !!env.TAVILY_API_KEY,
@@ -835,14 +854,14 @@ export default {
           await setSetting(env, "chat_model", form.chat_model);
           updated.chat_model = form.chat_model;
         }
-        // Global comic default (v13): per-target comic_enabled=NULL inherits this.
-        // Sent as a <select> (always present, value "on"/"off") — keep it a
-        // select, not a checkbox: an unchecked checkbox is absent from FormData,
-        // so "off" could never be saved.
-        if (form.comics_enabled !== undefined) {
-          const on = form.comics_enabled === "on" || form.comics_enabled === "true" || form.comics_enabled === "1";
-          await setSetting(env, "comics_enabled", on ? "on" : "off");
-          updated.comics_enabled = on ? "on" : "off";
+        // Global day-map default (v14): per-target day_map_enabled=NULL inherits
+        // this. Sent as a <select> (always present, value "on"/"off") — keep it
+        // a select, not a checkbox: an unchecked checkbox is absent from
+        // FormData, so "off" could never be saved.
+        if (form.day_map_enabled !== undefined) {
+          const on = form.day_map_enabled === "on" || form.day_map_enabled === "true" || form.day_map_enabled === "1";
+          await setSetting(env, "day_map_enabled", on ? "on" : "off");
+          updated.day_map_enabled = on ? "on" : "off";
         }
         return json({ ok: true, updated });
       }
