@@ -2523,7 +2523,9 @@ export class ResearchRunner extends DurableObject<Env> {
   /** Like scheduleManualRun, but regenerates ONLY the day-map for one existing
    *  report (no research, no re-write). Runs inside the alarm's 15-min budget
    *  so the long day-map call can't be cut off by the 30s ctx.waitUntil cap.
-   *  Keyed by the report's target slug so it serialises with that target. */
+   *  The caller keys this DO by report id (`day-map:<id>`), separate from the
+   *  target's full-run DO, so a regen never clobbers a "Run Now" job slot.
+   *  `targetSlug` is kept only for log context. */
   async scheduleDayMapRun(targetSlug: string, reportId: string): Promise<void> {
     await this.ctx.storage.put("job", {
       kind: "day-map" as const,

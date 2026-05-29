@@ -730,7 +730,12 @@ export default {
         if (!report) return redirect(req.headers.get("referer") || "/admin");
         const target = await getTargetById(env, report.target_id);
         if (!target) return redirect("/admin");
-        const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(target.slug));
+        // Key the DO by report id (NOT the target slug) so a day-map regen gets
+        // its own instance and can never clobber the target's full-run "job"
+        // slot — i.e. "Remake map" and "Run Now" on the same target are
+        // independent. (A new full run creates a different report, so its
+        // day-map and a manual regen never touch the same R2 key either.)
+        const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(`day-map:${id}`));
         await stub.scheduleDayMapRun(target.slug, id);
         return redirect(`/admin/targets/${target.slug}?daymap=1`);
       }
