@@ -302,7 +302,7 @@ Key/value strings. Editable live from `/admin` (Budgets & settings + Run guardra
 | `last_cron_run` | `0` | Last successful cron timestamp (heartbeat) |
 | `last_run_attempt` | `{}` | JSON: live "in-flight" step breadcrumb for the most-recent run |
 | `embed_last_ok_at` / `embed_last_error` | — | Heartbeat for the Vectorize embedding step |
-| `day_map_last_ok_at` / `day_map_last_error` | — | v14. Heartbeat for the day-map step (best-effort; failures recorded here, never abort the run) |
+| `day_map_last_ok_at` / `day_map_last_error` | — | v14. Heartbeat for the day-map step (best-effort; failures recorded here, never abort the run). Surfaced in admin as "Day-map status" in the Memory & cleanup card. |
 
 ### `daily_usage`
 
