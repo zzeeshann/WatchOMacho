@@ -2061,7 +2061,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
 // Admin: target edit page
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function renderAdminTargetEdit(env: Env, slug: string, queued = false): Promise<string> {
+export async function renderAdminTargetEdit(env: Env, slug: string, queued = false, dayMapQueued = false): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
     return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { activeNav: "targets", adminFooter: true });
@@ -2160,9 +2160,10 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             }
           } catch { /* malformed JSON — skip */ }
         }
-        // Day-map link (v14) — only when this run produced one.
+        // Day-map link (v14) — only when this run produced one. whitespace-nowrap
+        // so "day-map ↗" wraps as one unit instead of breaking after the hyphen.
         if (isSuccess && r.report_day_map_r2_key) {
-          lineReportParts.push(`<a href="/day-map/${escapeHtml(r.report_id)}" class="text-zee-primary" target="_blank" rel="noopener">day-map ↗</a>`);
+          lineReportParts.push(`<a href="/day-map/${escapeHtml(r.report_id)}" class="text-zee-primary whitespace-nowrap" target="_blank" rel="noopener">day-map ↗</a>`);
         }
 
         // ─── Line 3 — gather funnel (only when populated) ───
@@ -2186,9 +2187,14 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
                 </a>
                 ${metaBlock}
               </div>
-              <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline shrink-0" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
-                <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-              </form>
+              <div class="shrink-0 flex flex-col items-end gap-2">
+                <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/day-map" class="inline" onsubmit="return confirm('Rebuild the map of the day for this story? One AI call (~1 min), no re-research.')">
+                  <button class="btn btn-sm" type="submit">${r.report_day_map_r2_key ? "Remake map" : "Make map"}</button>
+                </form>
+                <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
+                  <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+                </form>
+              </div>
             </li>`;
         }
         // Failure path: no report, no view, no delete. The error message is
@@ -2233,6 +2239,14 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     <div class="card" style="border-color:#1A6B62;background:rgba(26,107,98,0.06);">
       <p class="text-zee-primary text-sm m-0">
         <strong>Run queued.</strong> Reports take ~20–30 seconds to complete. Refresh this page in 30 seconds to see the new entry in <em>Reports</em> and <em>Run history</em>. If nothing appears after a minute, check the Worker logs or the AI Gateway dashboard for errors.
+      </p>
+    </div>
+    ` : ""}
+
+    ${dayMapQueued ? `
+    <div class="card" style="border-color:#C49A1A;background:rgba(196,154,26,0.08);">
+      <p class="text-sm m-0" style="color:#8a6d12;">
+        <strong>Map rebuilding.</strong> Regenerating the map of the day from the existing story — one AI call, no re-research, ~1 minute. Refresh this page shortly to see the new map.
       </p>
     </div>
     ` : ""}

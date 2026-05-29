@@ -2026,6 +2026,36 @@ export async function makeDayMap(
   }
 }
 
+/** Regenerate ONLY the day-map for an existing report — no research, no
+ *  re-write of the briefing, just the day-map LLM call over the already-stored
+ *  body. Powers the admin "Remake map" button, so a story can get a fresh map
+ *  (e.g. after a generator change) for one cheap call instead of a whole run.
+ *  Best-effort via makeDayMap; returns false if the report/body/target can't
+ *  be loaded (caller logs it). */
+export async function regenerateDayMap(
+  env: Env,
+  reportId: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const report = await getReportById(env, reportId);
+  if (!report) return false;
+  const target = await getTargetById(env, report.target_id);
+  if (!target) return false;
+  const obj = await env.REPORTS.get(report.r2_key);
+  if (!obj) return false;
+  const body = await obj.text();
+  const model = await getChatModel(env);
+  await makeDayMap(
+    env,
+    { id: report.id, created_at: report.created_at, title: report.title, snippet: report.snippet },
+    body,
+    target,
+    model,
+    signal,
+  );
+  return true;
+}
+
 /** Pipeline step labels used by runResearch's step-boundary breadcrumb.
  *  These flow into both the live `last_run_attempt` setting (so admin can
  *  see "in-flight at step X") and the `runs.error` text (so completed
@@ -2481,6 +2511,7 @@ export class ResearchRunner extends DurableObject<Env> {
    *  alarm; returns immediately so the route can redirect the user. */
   async scheduleManualRun(targetSlug: string): Promise<void> {
     await this.ctx.storage.put("job", {
+      kind: "full" as const,
       targetSlug,
       triggeredBy: "manual" as const,
       scheduledAt: Date.now(),
@@ -2489,16 +2520,29 @@ export class ResearchRunner extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + 1000);
   }
 
+  /** Like scheduleManualRun, but regenerates ONLY the day-map for one existing
+   *  report (no research, no re-write). Runs inside the alarm's 15-min budget
+   *  so the long day-map call can't be cut off by the 30s ctx.waitUntil cap.
+   *  Keyed by the report's target slug so it serialises with that target. */
+  async scheduleDayMapRun(targetSlug: string, reportId: string): Promise<void> {
+    await this.ctx.storage.put("job", {
+      kind: "day-map" as const,
+      targetSlug,
+      reportId,
+      scheduledAt: Date.now(),
+    });
+    await this.ctx.storage.setAlarm(Date.now() + 1000);
+  }
+
   /** Cloudflare invokes this when our setAlarm time arrives. Runs in the
    *  scheduled-handler context (15-min wall budget). We enforce a tighter
    *  `max_run_seconds` ceiling via an AbortController so a hung Tavily /
    *  Anthropic fetch can't burn the full 15 minutes (~115 GB-seconds). */
   async alarm(): Promise<void> {
-    const job = await this.ctx.storage.get<{
-      targetSlug: string;
-      triggeredBy: "manual";
-      scheduledAt: number;
-    }>("job");
+    const job = await this.ctx.storage.get<
+      | { kind?: "full"; targetSlug: string; triggeredBy: "manual"; scheduledAt: number }
+      | { kind: "day-map"; targetSlug: string; reportId: string; scheduledAt: number }
+    >("job");
     if (!job) {
       console.warn("ResearchRunner alarm: no pending job; nothing to do");
       return;
@@ -2525,22 +2569,30 @@ export class ResearchRunner extends DurableObject<Env> {
     }, maxRunSeconds * 1000);
 
     try {
-      const target = await getTargetBySlug(this.env, job.targetSlug);
-      if (!target) {
-        console.error(`ResearchRunner alarm: target not found: ${job.targetSlug}`);
-        return;
+      if (job.kind === "day-map") {
+        // Day-map-only regen: no research, just rebuild the map from the
+        // already-stored briefing body. Best-effort, like the post-run hook.
+        console.log(`ResearchRunner alarm: regenerating day-map for report ${job.reportId} (max ${maxRunSeconds}s)`);
+        const ok = await regenerateDayMap(this.env, job.reportId, controller.signal);
+        if (!ok) console.error(`ResearchRunner alarm: could not load report ${job.reportId} for day-map regen`);
+      } else {
+        const target = await getTargetBySlug(this.env, job.targetSlug);
+        if (!target) {
+          console.error(`ResearchRunner alarm: target not found: ${job.targetSlug}`);
+          return;
+        }
+        if (!target.primary_skill_id) {
+          console.error(`ResearchRunner alarm: target has no skill: ${job.targetSlug}`);
+          return;
+        }
+        const skill = await getSkillById(this.env, target.primary_skill_id);
+        if (!skill) {
+          console.error(`ResearchRunner alarm: skill not found for target: ${job.targetSlug}`);
+          return;
+        }
+        console.log(`ResearchRunner alarm: running ${job.targetSlug} (${job.triggeredBy}, max ${maxRunSeconds}s)`);
+        await runResearch(this.env, target, skill, job.triggeredBy, controller.signal);
       }
-      if (!target.primary_skill_id) {
-        console.error(`ResearchRunner alarm: target has no skill: ${job.targetSlug}`);
-        return;
-      }
-      const skill = await getSkillById(this.env, target.primary_skill_id);
-      if (!skill) {
-        console.error(`ResearchRunner alarm: skill not found for target: ${job.targetSlug}`);
-        return;
-      }
-      console.log(`ResearchRunner alarm: running ${job.targetSlug} (${job.triggeredBy}, max ${maxRunSeconds}s)`);
-      await runResearch(this.env, target, skill, job.triggeredBy, controller.signal);
     } catch (e) {
       console.error(`ResearchRunner alarm failed:`, e);
     } finally {

@@ -538,7 +538,8 @@ export default {
           return new Response("Bad slug", withSecurityHeaders({ status: 400 }));
         }
         const queued = url.searchParams.get("queued") === "1";
-        return html(await renderAdminTargetEdit(env, slug, queued));
+        const dayMapQueued = url.searchParams.get("daymap") === "1";
+        return html(await renderAdminTargetEdit(env, slug, queued, dayMapQueued));
       }
 
       // Targets: create / update / delete
@@ -713,6 +714,25 @@ export default {
         const target = await getTargetById(env, report.target_id);
         await deleteReport(env, id);
         return redirect(target ? `/admin/targets/${target.slug}` : "/admin");
+      }
+
+      // Reports: regenerate ONLY the day-map for one report (one AI call, no
+      // re-research). Powers the per-report "Remake map" button. Runs in the
+      // ResearchRunner DO (15-min budget) — NOT ctx.waitUntil (30s cap) — so
+      // the long day-map call can't be cut off mid-generation.
+      if (path.startsWith("/admin/reports/") && path.endsWith("/day-map") && req.method === "POST") {
+        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+        const id = path.slice("/admin/reports/".length, path.length - "/day-map".length);
+        if (!/^[a-z0-9-]+$/.test(id)) {
+          return new Response("Bad id", withSecurityHeaders({ status: 400 }));
+        }
+        const report = await getReportById(env, id);
+        if (!report) return redirect(req.headers.get("referer") || "/admin");
+        const target = await getTargetById(env, report.target_id);
+        if (!target) return redirect("/admin");
+        const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(target.slug));
+        await stub.scheduleDayMapRun(target.slug, id);
+        return redirect(`/admin/targets/${target.slug}?daymap=1`);
       }
 
       // Skills: create / update / delete
