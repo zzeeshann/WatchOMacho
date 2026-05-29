@@ -330,7 +330,10 @@ export default {
         return new Response(req.method === "HEAD" ? null : obj.body, {
           headers: {
             "content-type": contentType,
-            "cache-control": "public, max-age=86400",
+            // No long-lived cache: a day-map can be regenerated in place
+            // ("Remake map") under the same URL, so a stale 24h cache would
+            // hide the new version. Always revalidate so a remake shows up.
+            "cache-control": "no-store",
             "content-security-policy":
               "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com; " +
               "style-src 'unsafe-inline' https://fonts.googleapis.com; img-src data: blob:; " +
