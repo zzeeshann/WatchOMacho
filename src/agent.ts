@@ -1966,7 +1966,15 @@ function escapeXml(s: string): string {
  *  `maxWidth`. Good enough for the bounded caption/spine lengths we render. */
 function wrapText(text: string, maxWidth: number, fontSize: number): string[] {
   const maxChars = Math.max(8, Math.floor(maxWidth / (fontSize * 0.55)));
-  const words = text.split(/\s+/).filter(Boolean);
+  // Hard-split any single token longer than the line so a URL-like or
+  // whitespace-free string (adversarial/garbled LLM output) can't run off the
+  // fixed card width instead of wrapping.
+  const words = text
+    .split(/\s+/)
+    .filter(Boolean)
+    .flatMap((w) =>
+      w.length <= maxChars ? [w] : (w.match(new RegExp(`.{1,${maxChars}}`, "g")) ?? [w]),
+    );
   const lines: string[] = [];
   let cur = "";
   for (const w of words) {
