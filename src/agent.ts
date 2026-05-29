@@ -95,6 +95,21 @@ export async function getChatModel(env: Env): Promise<string> {
   return isAllowedChatModel(val) ? val : DEFAULT_CHAT_MODEL;
 }
 
+/** Read the global comic default (`comics_enabled` setting, ships 'off').
+ *  Per-target overrides live on targets.comic_enabled; resolve the effective
+ *  value with comicEnabledForTarget() below. */
+export async function getComicsEnabledDefault(env: Env): Promise<boolean> {
+  return (await getSetting(env, "comics_enabled", "off")) === "on";
+}
+
+/** Effective comic switch for a target: the per-target column wins (1 on /
+ *  0 off), NULL falls back to the global `comics_enabled` default. */
+export async function comicEnabledForTarget(env: Env, target: Target): Promise<boolean> {
+  if (target.comic_enabled === 1) return true;
+  if (target.comic_enabled === 0) return false;
+  return getComicsEnabledDefault(env);
+}
+
 // ─── chat dispatcher ──────────────────────────────────────────────────────
 //
 // Single chat entry point. Routes by model prefix:
@@ -305,6 +320,9 @@ export interface Target {
   // DEFAULT_ANCHOR_HOUR_UTC below. See computeNextRunAt() for the slot
   // formula and migration-v12.sql for the rationale.
   anchor_hour_utc: number | null;
+  // Per-target comic switch (v13). 1 = on, 0 = off, NULL = inherit the global
+  // `comics_enabled` setting. See comicEnabledForTarget() / makeComic().
+  comic_enabled: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -482,6 +500,7 @@ export async function updateTarget(
       | "tavily_min_score"
       | "tavily_max_final_sources"
       | "anchor_hour_utc"
+      | "comic_enabled"
     >
   >,
 ): Promise<void> {
@@ -537,6 +556,11 @@ export async function updateTarget(
       ? null
       : Math.max(0, Math.min(23, Math.floor(patch.anchor_hour_utc))));
   }
+  // Comic switch (v13). NULL = inherit the global default; 1 = on; 0 = off.
+  if (patch.comic_enabled !== undefined) {
+    sets.push("comic_enabled = ?");
+    args.push(patch.comic_enabled === null ? null : (patch.comic_enabled ? 1 : 0));
+  }
   if (sets.length === 0) return;
   sets.push("updated_at = ?");
   args.push(Date.now());
@@ -562,8 +586,15 @@ export async function findOrphanedR2(
   env: Env,
 ): Promise<{ scanned: number; orphans: string[] }> {
   const known = new Set<string>(R2_STATIC_KEEP);
-  const rows = await env.DB.prepare("SELECT r2_key FROM reports").all<{ r2_key: string }>();
-  for (const r of rows.results ?? []) known.add(r.r2_key);
+  const rows = await env.DB.prepare(
+    "SELECT r2_key, comic_r2_key FROM reports",
+  ).all<{ r2_key: string; comic_r2_key: string | null }>();
+  for (const r of rows.results ?? []) {
+    known.add(r.r2_key);
+    // Comic SVGs live under their own column (v13) — keep them too, or the
+    // sweep would delete every comic on the next tick.
+    if (r.comic_r2_key) known.add(r.comic_r2_key);
+  }
 
   let scanned = 0;
   const orphans: string[] = [];
@@ -726,14 +757,22 @@ export async function backfillMemory(
  *  because once the report is gone the run is just an unmoored "something
  *  ran" record with no payload to link to. */
 export async function deleteReport(env: Env, id: string): Promise<void> {
-  const row = await env.DB.prepare("SELECT r2_key FROM reports WHERE id = ?")
+  const row = await env.DB.prepare("SELECT r2_key, comic_r2_key FROM reports WHERE id = ?")
     .bind(id)
-    .first<{ r2_key: string }>();
+    .first<{ r2_key: string; comic_r2_key: string | null }>();
   if (!row) return;
   try {
     await env.REPORTS.delete(row.r2_key);
   } catch (e) {
     console.error("deleteReport: R2 delete failed", row.r2_key, e);
+  }
+  // Also drop the paired comic SVG (v13) so it doesn't leak as an orphan.
+  if (row.comic_r2_key) {
+    try {
+      await env.REPORTS.delete(row.comic_r2_key);
+    } catch (e) {
+      console.error("deleteReport: comic R2 delete failed", row.comic_r2_key, e);
+    }
   }
   try {
     await env.MEMORY.deleteByIds([id]);
@@ -1007,6 +1046,11 @@ export interface Report {
   sources_json: string | null;
   run_id: string | null;
   chat_model: string | null;
+  // Paired comic (v13). NULL when the run made no comic (feature off, or a
+  // pre-v13 report). comic_r2_key points at the SVG in R2; comic_slug is the
+  // short descriptive slug for the comic's own page.
+  comic_r2_key: string | null;
+  comic_slug: string | null;
   created_at: number;
 }
 

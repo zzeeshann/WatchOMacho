@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS targets (
   -- by run-duration each cycle. NULL = inherit DEFAULT_ANCHOR_HOUR_UTC
   -- from src/agent.ts (currently 2 → 02:00 UTC).
   anchor_hour_utc INTEGER,
+  -- Per-target comic switch (v13). 1 = generate a comic after each briefing,
+  -- 0 = never, NULL = inherit the global `comics_enabled` setting (ships
+  -- 'off'). See makeComic() in src/agent.ts.
+  comic_enabled INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -71,6 +75,10 @@ CREATE TABLE IF NOT EXISTS reports (
   sources_json TEXT,
   run_id TEXT,
   chat_model TEXT,                          -- which Workers AI model wrote this report
+  -- Paired comic (v13). SVG lives in R2 under comic_r2_key; comic_slug is a
+  -- short descriptive slug for the comic's own page. Both NULL = no comic.
+  comic_r2_key TEXT,
+  comic_slug TEXT,
   created_at INTEGER NOT NULL
 );
 
@@ -102,7 +110,8 @@ INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES
   ('daily_search_limit', '500', 0),
   ('cron_max_per_tick', '2', 0),
   ('last_cron_run', '0', 0),
-  ('chat_model', '@cf/meta/llama-3.3-70b-instruct-fp8-fast', 0);
+  ('chat_model', '@cf/meta/llama-3.3-70b-instruct-fp8-fast', 0),
+  ('comics_enabled', 'off', 0);
 
 CREATE TABLE IF NOT EXISTS daily_usage (
   date TEXT PRIMARY KEY,
