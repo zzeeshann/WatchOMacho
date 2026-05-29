@@ -300,6 +300,30 @@ export default {
         return html(await renderReportPage(env, id));
       }
 
+      // ─── Comic (public; v13) ───────────────────────────────────────────────
+      // Serves a briefing's paired comic SVG at its own URL so daylila (or
+      // anyone) can embed it or link to it. Keyed by report id — unique and
+      // simple; the descriptive comic_slug is exposed via the JSON API for
+      // building pretty URLs on top. Public, like /report/:id.
+      if (path.startsWith("/comic/") && (req.method === "GET" || req.method === "HEAD")) {
+        const id = path.slice("/comic/".length);
+        if (!/^[a-z0-9-]+$/.test(id)) {
+          return new Response("Bad id", withSecurityHeaders({ status: 400 }));
+        }
+        const report = await getReportById(env, id);
+        if (!report?.comic_r2_key) {
+          return new Response("Not found", withSecurityHeaders({ status: 404 }));
+        }
+        const obj = await env.REPORTS.get(report.comic_r2_key);
+        if (!obj) return new Response("Not found", withSecurityHeaders({ status: 404 }));
+        return new Response(req.method === "HEAD" ? null : obj.body, {
+          headers: {
+            "content-type": "image/svg+xml; charset=utf-8",
+            "cache-control": "public, max-age=86400",
+          },
+        });
+      }
+
       // ─── JSON API ────────────────────────────────────────────────────────
       // All /api/* endpoints are gated by the X-API-Key header. The secret
       // is WATCHOMACHO_API_KEY (set via `wrangler secret put`). Callers
@@ -342,6 +366,7 @@ export default {
           const rows = await env.DB.prepare(
             `SELECT reports.id, reports.title, reports.snippet, reports.word_count,
                     reports.sources_json, reports.created_at,
+                    reports.comic_r2_key, reports.comic_slug,
                     targets.slug AS target_slug, targets.name AS target_name
                FROM reports
                LEFT JOIN targets ON targets.id = reports.target_id
@@ -367,6 +392,12 @@ export default {
             source_count: r.sources_json
               ? (() => { try { return JSON.parse(r.sources_json).length; } catch { return 0; } })()
               : 0,
+            // Paired comic (v13). null when the run made no comic. The feed
+            // stays light — slug + URL only, no inline SVG (pull /api/reports/:id
+            // for the SVG itself).
+            comic: r.comic_r2_key
+              ? { slug: r.comic_slug, url: `${origin}/comic/${r.id}` }
+              : null,
           }));
           return json({ reports: items });
         }
@@ -385,6 +416,17 @@ export default {
           }
           const obj = await env.REPORTS.get(report.r2_key);
           const bodyMarkdown = obj ? await obj.text() : null;
+          // Paired comic (v13): inline the SVG (mirrors body_markdown) plus the
+          // slug + its own URL. null when the run made no comic.
+          let comic: { slug: string | null; url: string; svg: string | null } | null = null;
+          if (report.comic_r2_key) {
+            const comicObj = await env.REPORTS.get(report.comic_r2_key);
+            comic = {
+              slug: report.comic_slug,
+              url: `${new URL(req.url).origin}/comic/${report.id}`,
+              svg: comicObj ? await comicObj.text() : null,
+            };
+          }
           const target = await getTargetById(env, report.target_id);
           let sources: Array<{ title: string; url: string; kind: string }> = [];
           if (report.sources_json) {
@@ -413,6 +455,7 @@ export default {
             target: target ? { slug: target.slug, name: target.name } : null,
             body_markdown: bodyMarkdown,
             sources,
+            comic,
           });
         }
 
