@@ -953,13 +953,21 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const sourcesHtml = renderSourcesSection(report.sources_json);
 
   // Paired comic (v13). Embed via the public /comic/:id route (the SVG is
-  // served from R2). Omitted entirely when the run produced no comic.
+  // served from R2), and surface that same URL as a clickable link so the
+  // comic's own page is reachable. Omitted entirely when the run produced
+  // no comic.
+  const comicUrl = `/comic/${escapeHtml(report.id)}`;
   const comicHtml = report.comic_r2_key
     ? `
     <figure class="mt-8 mb-2">
-      <figcaption class="label mb-2">The day's thread</figcaption>
-      <img src="/comic/${escapeHtml(report.id)}" alt="Comic: the day's connecting thread"
-           class="w-full max-w-2xl rounded-xl border border-zee-border" loading="lazy">
+      <figcaption class="label mb-2 flex items-center gap-3">
+        <span>The day's thread</span>
+        <a href="${comicUrl}" class="text-zee-primary normal-case tracking-normal font-normal" target="_blank" rel="noopener">open comic ↗</a>
+      </figcaption>
+      <a href="${comicUrl}" target="_blank" rel="noopener" class="block max-w-2xl">
+        <img src="${comicUrl}" alt="Comic: the day's connecting thread"
+             class="w-full rounded-xl border border-zee-border" loading="lazy">
+      </a>
     </figure>`
     : "";
 
@@ -2047,6 +2055,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             reports.word_count    AS report_word_count,
             reports.chat_model    AS report_chat_model,
             reports.sources_json  AS report_sources_json,
+            reports.comic_r2_key  AS report_comic_r2_key,
             skills.name           AS skill_name,
             skills.slug           AS skill_slug
        FROM runs
@@ -2132,6 +2141,10 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
               if (bits.length) lineReportParts.push(bits.join(" + ") + " sources");
             }
           } catch { /* malformed JSON — skip */ }
+        }
+        // Comic link (v13) — only when this run produced one.
+        if (isSuccess && r.report_comic_r2_key) {
+          lineReportParts.push(`<a href="/comic/${escapeHtml(r.report_id)}" class="text-zee-primary" target="_blank" rel="noopener">comic ↗</a>`);
         }
 
         // ─── Line 3 — gather funnel (only when populated) ───
