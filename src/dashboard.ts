@@ -965,11 +965,28 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
         <span>Map of the day</span>
         <a href="${dayMapUrl}" class="text-zee-primary normal-case tracking-normal font-normal" target="_blank" rel="noopener">open day-map ↗</a>
       </figcaption>
-      <iframe src="${dayMapUrl}" title="Map of the day"
+      <iframe id="day-map-frame" src="${dayMapUrl}" title="Map of the day"
               sandbox="allow-scripts"
               class="w-full rounded-xl border border-zee-border bg-white"
-              style="height:720px" loading="lazy"></iframe>
-    </figure>`
+              style="height:600px;border-width:1px" loading="lazy"></iframe>
+    </figure>
+    <script>
+      (function(){
+        var f=document.getElementById('day-map-frame');
+        if(!f)return;
+        // The day-map posts its content height (it's a sandboxed cross-origin
+        // frame, so we can't read it directly). Grow the frame to fit so there
+        // is no inner scrollbar.
+        addEventListener('message',function(e){
+          if(e.source!==f.contentWindow)return;
+          var d=e.data;
+          if(d&&d.type==='day-map-height'){
+            var h=Math.max(300,Math.min(8000,parseInt(d.height,10)||0));
+            f.style.height=h+'px';
+          }
+        });
+      })();
+    </script>`
     : "";
 
   // Public report page meta is intentionally minimal — date + word count.

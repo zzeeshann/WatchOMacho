@@ -1911,30 +1911,42 @@ async function planDayMap(
     ? headings.map((h, i) => `${i + 1}. ${h}`).join("\n")
     : "(no explicit section headings — infer the beats from the body)";
 
-  const system = `You turn a finished, fact-checked daily news briefing into a "map of the day": a single self-contained interactive HTML page that shows, at a glance, how the day's stories connect — the ONE thread running through them, the major forces, and the cause→effect links between them — and then lays out the beats below the map.
+  const system = `You turn a finished, fact-checked daily news briefing into a "map of the day": a single self-contained interactive HTML page. At the top is a clear MAP of how the day's stories connect — the one thread, the central driver, and the cause→effect links. Below it is a short, skimmable rundown of each story.
 
 This is NOT abstract. Use the REAL names, places, dates and numbers from the briefing — the specifics are the whole point. Invent no new facts; only reshape what the briefing already states.
 
 OUTPUT
 - Output ONLY a complete HTML document. No prose, no markdown, no code fences. Start with <!DOCTYPE html> and end with </html>.
-- One self-contained file: inline <style> and inline <script> only. You MAY load ONE library from cdnjs (https://cdnjs.cloudflare.com/...) via a <script src> tag if it genuinely helps (e.g. D3 v7 for a force/graph layout) — otherwise use none.
-- It runs inside a sandboxed iframe with NO network access: do not fetch(), do not use localStorage/cookies, no forms, no external requests except the one optional cdnjs library tag. Everything the page needs must be inlined.
-- Keep the hand-written markup under ~45 KB (the cdnjs library, if used, does not count).
+- One self-contained file: inline <style> and inline <script> only. You MAY load ONE library from cdnjs (https://cdnjs.cloudflare.com/...) only if it truly helps — but the layout below is plain HTML/CSS and needs no library, so prefer none.
+- Runs inside a sandboxed iframe with NO network access: no fetch(), no localStorage/cookies, no forms, no external requests except an optional cdnjs tag. Inline everything.
+- Keep hand-written markup under ~45 KB.
 
-LAYOUT (quality floor — non-negotiable; the page is viewed on phones)
-- The page MUST be responsive down to a 320px-wide screen. Nothing may overflow the viewport or get clipped, and node cards/labels MUST NEVER overlap each other at any width.
-- Do NOT hand-place the map's nodes at fixed pixel coordinates — that looks fine on a wide screen but collapses into an unreadable pile on a phone. Use an AUTOMATIC layout that spreads nodes apart and adapts to the container width. A D3 v7 force-directed graph from cdnjs (with a collision force, and re-run on window 'resize') is the recommended, reliable way to guarantee no overlaps; size the SVG to its container.
-- Make the map pan- and zoom-able (drag + scroll/pinch-to-zoom) and fit/center it to the container on load, so it stays explorable when it is larger than the screen rather than shrinking into illegibility.
-- Keep on-map node labels short; put the full detail in the click/tap panel.
+THE MAP — layout (this is the whole point, and it MUST stay readable on a phone)
+- Lay the map out as a CAUSE→EFFECT FLOW in tiers. Do NOT use a free-floating "web" of nodes and do NOT hand-place nodes at fixed pixel coordinates — both pile up into an unreadable mess on small screens. Instead assign EVERY node a tier:
+  • Tier 1 = the root driver — the single thread, the one thing the day traces back to.
+  • Tier 2 = the major forces it sets in motion.
+  • Tier 3 = the downstream effects/consequences.
+  (If the day has no clean 3-level causal chain, use 2 tiers: the driver, then everything it connects to.)
+- Render the tiers with CSS fl/grid: side-by-side COLUMNS on wide screens (the flow reads left→right), and STACKED top→bottom on narrow screens (one column of full-width cards). Use a media query and/or flex-wrap so this reflow is AUTOMATIC. Cards MUST NEVER overlap and nothing may overflow the viewport, at any width down to 320px.
+- Each node is a BIG, tappable CARD: a short bold label + a one-line hint. Connect related cards across tiers with simple arrows/connectors, and put the cause→effect relationship as a short label on/beside the connector. On a phone the arrows read top-to-bottom.
+- Clicking/tapping any card (or connector) reveals that item's FULL detail in a panel. Keep on-card text short and in WHOLE words — never cut a word mid-way with "…"; the long version lives in the click panel.
 
-CONTENT
-1. TOP — the overview map: the single connecting thread (one sentence, prominent), then the major forces/stories as nodes with short cause→effect links between them, positioned by the automatic layout above (never fixed coordinates). Clicking/tapping a node or edge reveals its full one-line detail.
-2. BELOW — the beats: one block per briefing section, in order, each with its heading and a tight 1–3 sentence take carrying the real specifics. Tie each beat back to the map where natural.
-3. A small footer: WatchOMacho · ${targetName} · ${dateUtc}.
+BELOW THE MAP — the day in short
+- A skimmable rundown: each story's HEADING followed by a tight 1–3 sentence take with the real specifics. Do NOT label these "beats" and do NOT number them ("Beat 1", etc.) — just the heading and the short take, cleanly.
+
+FOOTER
+- Small: WatchOMacho · ${targetName} · ${dateUtc}.
+
+AUTO-HEIGHT (required — so the embedding page can size the frame and there is NO inner scrollbar)
+- Include this exact script verbatim:
+  <script>
+  function postH(){parent.postMessage({type:'day-map-height',height:document.documentElement.scrollHeight},'*');}
+  addEventListener('load',postH);addEventListener('resize',postH);new ResizeObserver(postH).observe(document.documentElement);
+  </script>
 
 STYLE (brand)
 - Warm paper background #FAF8F4, near-black text #1A1A1A, teal accent #1A6B62, gold accent #C49A1A, hairline borders #E8E4DE.
-- Clean sans-serif. Calm, editorial, serious — this is news, not a toy.`;
+- Clean sans-serif. Calm, editorial, professional — this is news, not a toy.`;
 
   const userMsg = `BRIEFING TITLE
 ${title}
