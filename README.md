@@ -32,8 +32,9 @@ For each `(target, skill)` execution:
 3. **Recall** — Vectorize returns the most relevant past reports + last 2 same-target reports via D1. They become `[N]` archive citations (📚) alongside web sources in the same numbered footer — so the new report builds on prior ones rather than repeating, and the archive becomes a navigable graph.
 4. **Write** — the LLM writes a markdown report following the skill's output structure, citing every source (web + archive) inline by number. The writer also emits a YAML frontmatter block at the top — a real headline (`title`) and a 1–4 sentence editorial summary — so each report has its own story-specific title + abstract rather than a templated `target — skill (date)` string. A fallback path keeps the old template if the frontmatter is ever malformed (logs `writeReport: frontmatter parse failed` to worker logs).
 5. **Persist** — markdown in R2, row in D1, embedding in Vectorize, audit log in `runs` (incl. per-run gather funnel JSON), step-level heartbeat in `settings` so the admin System heartbeat shows what's happening live.
+6. **Comic** (optional, v13) — when comics are enabled for the target, one more LLM pass distils the finished briefing into a *spine* (the day's connecting thread) + 3–5 cause→effect panels. `renderComicSvg()` draws those into a fixed connection-chain SVG **in code** (brand palette, real text — never an image-gen model). The SVG is stored in R2 (`comics/*.svg`) and linked from the report row (`comic_r2_key` / `comic_slug`). Best-effort: a comic failure never fails the briefing. Runs on both the cron and manual paths (it lives in `runResearch`, not just the manual alarm). Toggle globally on the admin console or per-target on the target page (default off).
 
-Two LLM calls + one Tavily batch per run. Predictable cost (~$0.05/run on Claude Sonnet 4.6, ~$0.01 on Haiku 4.5, free on Workers AI), predictable structure, fully observable.
+Two-to-three LLM calls + one Tavily batch per run. Predictable cost (~$0.05/run on Claude Sonnet 4.6, ~$0.01 on Haiku 4.5, free on Workers AI; the comic adds ~one short call when enabled), predictable structure, fully observable.
 
 ## Setup — about 10 minutes
 
@@ -62,7 +63,7 @@ npm run vector:create   # creates the Vectorize index (768 dims, cosine)
 If you're upgrading from an earlier version, run every migration in order:
 
 ```bash
-for v in 6 7 8 9 10 11; do
+for v in 6 7 8 9 10 11 12 13; do
   npx wrangler d1 execute watchomacho-db --remote --file=migration-v$v.sql
 done
 ```
@@ -176,6 +177,7 @@ On **Haiku 4.5** the same workload costs ~$0.30–1.20/month. Switch via the cha
 | `GET` | `/target/:slug` | Target page with all reports |
 | `GET` | `/skill/:slug` | Skill detail with writer instructions |
 | `GET` | `/report/:id` | Single report |
+| `GET` | `/comic/:id` | The report's paired comic SVG (`image/svg+xml`), if any. 404 when the report has no comic. |
 
 ### JSON API — gated by `X-API-Key: <WATCHOMACHO_API_KEY>`
 
@@ -183,8 +185,8 @@ On **Haiku 4.5** the same workload costs ~$0.30–1.20/month. Switch via the cha
 | --- | --- | --- |
 | `GET` | `/api/targets` | Active targets |
 | `GET` | `/api/skills` | Skill list |
-| `GET` | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Each row: LLM-authored `title` + `summary`, `date` (ISO ms), `briefing_date` (`YYYY-MM-DD` UTC — v12, the canonical "what day" field), `target {slug,name}`, `word_count`, `source_count`, public `url` |
-| `GET` | `/api/reports/:id` | Full report: above metadata + `body_markdown` (from R2) + `sources[]` with `kind: "web" \| "archive"`. Same `briefing_date` field as `/recent`. |
+| `GET` | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Each row: LLM-authored `title` + `summary`, `date` (ISO ms), `briefing_date` (`YYYY-MM-DD` UTC — v12, the canonical "what day" field), `target {slug,name}`, `word_count`, `source_count`, public `url`, and `comic` (`{slug, url}` or `null` — v13; no inline SVG here to keep the feed light) |
+| `GET` | `/api/reports/:id` | Full report: above metadata + `body_markdown` (from R2) + `sources[]` with `kind: "web" \| "archive"` + `comic` (`{slug, url, svg}` with the SVG inlined, or `null` — v13). Same `briefing_date` field as `/recent`. |
 
 Daylila or any other dashboard polls `/api/reports/recent` for a feed and `/api/reports/:id` for full content, renders the markdown its own way.
 
