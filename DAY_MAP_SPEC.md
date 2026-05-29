@@ -1,5 +1,14 @@
 # Day-Map v2 — implementation spec
 
+> ⚠️ **SUPERSEDED (2026-05-29).** This spec proposed a *JSON graph + code-drawn
+> hub-and-spoke SVG*. The feature that was actually built (v14) took a different
+> shape after discussion: a **lab-style self-contained interactive HTML** page,
+> written free-form by one LLM call, embedded in a sandboxed iframe and served
+> under a no-network CSP — concrete/news-specific, overview + beats, no JSON
+> schema and no SVG renderer. WatchOMacho ships the finished HTML; daylila is
+> just the presenter. See README / ARCHITECTURE / ROADMAP for the real design.
+> Kept below as historical context only.
+
 Status: **designed, not built.** This is the handoff for the next session. The
 current shipped feature is the v13 "comic" (a linear panel SVG). This spec
 **replaces** it with a richer "map of the day". Nothing is live on daylila yet,

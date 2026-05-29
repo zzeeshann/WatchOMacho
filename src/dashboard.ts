@@ -952,23 +952,41 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const html = wrapSectionsInCards(renderMarkdown(bodyMd));
   const sourcesHtml = renderSourcesSection(report.sources_json);
 
-  // Paired comic (v13). Embed via the public /comic/:id route (the SVG is
-  // served from R2), and surface that same URL as a clickable link so the
-  // comic's own page is reachable. Omitted entirely when the run produced
-  // no comic.
-  const comicUrl = `/comic/${escapeHtml(report.id)}`;
-  const comicHtml = report.comic_r2_key
+  // Paired day-map (v14). The day-map is LLM-authored interactive HTML, so it
+  // is embedded inside a SANDBOXED iframe (allow-scripts only — no
+  // allow-same-origin) so its script is caged away from this page's origin.
+  // The /day-map/:id route additionally serves it under a no-network CSP.
+  // Omitted entirely when the run produced no day-map.
+  const dayMapUrl = `/day-map/${escapeHtml(report.id)}`;
+  const dayMapHtml = report.day_map_r2_key
     ? `
     <figure class="mt-8 mb-2">
       <figcaption class="label mb-2 flex items-center gap-3">
-        <span>The day's thread</span>
-        <a href="${comicUrl}" class="text-zee-primary normal-case tracking-normal font-normal" target="_blank" rel="noopener">open comic ↗</a>
+        <span>Map of the day</span>
+        <a href="${dayMapUrl}" class="text-zee-primary normal-case tracking-normal font-normal" target="_blank" rel="noopener">open day-map ↗</a>
       </figcaption>
-      <a href="${comicUrl}" target="_blank" rel="noopener" class="block max-w-2xl">
-        <img src="${comicUrl}" alt="Comic: the day's connecting thread"
-             class="w-full rounded-xl border border-zee-border" loading="lazy">
-      </a>
-    </figure>`
+      <iframe id="day-map-frame" src="${dayMapUrl}" title="Map of the day"
+              sandbox="allow-scripts"
+              class="w-full rounded-xl border border-zee-border bg-white"
+              style="height:600px;border-width:1px" loading="lazy"></iframe>
+    </figure>
+    <script>
+      (function(){
+        var f=document.getElementById('day-map-frame');
+        if(!f)return;
+        // The day-map posts its content height (it's a sandboxed cross-origin
+        // frame, so we can't read it directly). Grow the frame to fit so there
+        // is no inner scrollbar.
+        addEventListener('message',function(e){
+          if(e.source!==f.contentWindow)return;
+          var d=e.data;
+          if(d&&d.type==='day-map-height'){
+            var h=Math.max(300,Math.min(15000,parseInt(d.height,10)||0));
+            f.style.height=h+'px';
+          }
+        });
+      })();
+    </script>`
     : "";
 
   // Public report page meta is intentionally minimal — date + word count.
@@ -984,7 +1002,7 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
       </div>
     </section>
     <article class="prose pt-6 pb-2">${html}</article>
-    ${comicHtml}
+    ${dayMapHtml}
     ${sourcesHtml}
     <div class="pb-12"></div>
   `;
@@ -1314,7 +1332,7 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
 
 export async function renderAdminPanel(env: Env): Promise<string> {
   const cutoff24h = Date.now() - 24 * 3600 * 1000;
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr, comicsEnabledStr] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr, dayMapEnabledStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1349,9 +1367,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     getSetting(env, "max_chars_per_source", "4000"),
     getSetting(env, "max_run_seconds", "90"),
     getSetting(env, "writer_max_tokens", "2200"),
-    getSetting(env, "comics_enabled", "off"),
+    getSetting(env, "day_map_enabled", "off"),
   ]);
-  const comicsEnabled = comicsEnabledStr === "on";
+  const dayMapEnabled = dayMapEnabledStr === "on";
   const maxCharsPerSource = (() => {
     const n = parseInt(maxCharsPerSourceStr, 10);
     return Number.isFinite(n) && n >= 200 && n <= 8000 ? n : 4000;
@@ -1408,12 +1426,12 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
         </div>
         <div class="field mb-4">
-          <label>Daily comic (default)</label>
-          <select name="comics_enabled">
-            <option value="off"${comicsEnabled ? "" : " selected"}>Off</option>
-            <option value="on"${comicsEnabled ? " selected" : ""}>On</option>
+          <label>Daily day-map (default)</label>
+          <select name="day_map_enabled">
+            <option value="off"${dayMapEnabled ? "" : " selected"}>Off</option>
+            <option value="on"${dayMapEnabled ? " selected" : ""}>On</option>
           </select>
-          <div class="field-help">Global default. After each briefing, generate a small connection comic (SVG) with one extra LLM call. Per-target switches on the target page override this.</div>
+          <div class="field-help">Global default. After each briefing, generate an interactive "map of the day" (self-contained HTML) with one extra LLM call. Per-target switches on the target page override this.</div>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4 mb-4">
           <div class="field mb-0">
@@ -2043,7 +2061,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
 // Admin: target edit page
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function renderAdminTargetEdit(env: Env, slug: string, queued = false): Promise<string> {
+export async function renderAdminTargetEdit(env: Env, slug: string, queued = false, dayMapQueued = false): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
     return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { activeNav: "targets", adminFooter: true });
@@ -2055,7 +2073,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             reports.word_count    AS report_word_count,
             reports.chat_model    AS report_chat_model,
             reports.sources_json  AS report_sources_json,
-            reports.comic_r2_key  AS report_comic_r2_key,
+            reports.day_map_r2_key AS report_day_map_r2_key,
             skills.name           AS skill_name,
             skills.slug           AS skill_slug
        FROM runs
@@ -2142,9 +2160,10 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             }
           } catch { /* malformed JSON — skip */ }
         }
-        // Comic link (v13) — only when this run produced one.
-        if (isSuccess && r.report_comic_r2_key) {
-          lineReportParts.push(`<a href="/comic/${escapeHtml(r.report_id)}" class="text-zee-primary" target="_blank" rel="noopener">comic ↗</a>`);
+        // Day-map link (v14) — only when this run produced one. whitespace-nowrap
+        // so "day-map ↗" wraps as one unit instead of breaking after the hyphen.
+        if (isSuccess && r.report_day_map_r2_key) {
+          lineReportParts.push(`<a href="/day-map/${escapeHtml(r.report_id)}" class="text-zee-primary whitespace-nowrap" target="_blank" rel="noopener">day-map ↗</a>`);
         }
 
         // ─── Line 3 — gather funnel (only when populated) ───
@@ -2168,9 +2187,14 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
                 </a>
                 ${metaBlock}
               </div>
-              <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline shrink-0" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
-                <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-              </form>
+              <div class="shrink-0 flex flex-col items-end gap-2">
+                <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/day-map" class="inline" onsubmit="return confirm('Rebuild the map of the day for this story? One AI call (~1 min), no re-research.')">
+                  <button class="btn btn-sm" type="submit">${r.report_day_map_r2_key ? "Remake map" : "Make map"}</button>
+                </form>
+                <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
+                  <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+                </form>
+              </div>
             </li>`;
         }
         // Failure path: no report, no view, no delete. The error message is
@@ -2215,6 +2239,14 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     <div class="card" style="border-color:#1A6B62;background:rgba(26,107,98,0.06);">
       <p class="text-zee-primary text-sm m-0">
         <strong>Run queued.</strong> Reports take ~20–30 seconds to complete. Refresh this page in 30 seconds to see the new entry in <em>Reports</em> and <em>Run history</em>. If nothing appears after a minute, check the Worker logs or the AI Gateway dashboard for errors.
+      </p>
+    </div>
+    ` : ""}
+
+    ${dayMapQueued ? `
+    <div class="card" style="border-color:#C49A1A;background:rgba(196,154,26,0.08);">
+      <p class="text-sm m-0" style="color:#8a6d12;">
+        <strong>Map rebuilding.</strong> Regenerating the map of the day from the existing story — one AI call, no re-research, ~1 minute. Refresh this page shortly to see the new map.
       </p>
     </div>
     ` : ""}
@@ -2284,16 +2316,16 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           </div>
         </div>
 
-        <div class="label-muted mt-4 mb-2">Comic</div>
+        <div class="label-muted mt-4 mb-2">Day-map</div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4">
           <div class="field mb-0">
-            <label>Daily comic</label>
-            <select name="comic_enabled">
-              <option value=""${target.comic_enabled == null ? " selected" : ""}>Use default</option>
-              <option value="on"${target.comic_enabled === 1 ? " selected" : ""}>On</option>
-              <option value="off"${target.comic_enabled === 0 ? " selected" : ""}>Off</option>
+            <label>Daily day-map</label>
+            <select name="day_map_enabled">
+              <option value=""${target.day_map_enabled == null ? " selected" : ""}>Use default</option>
+              <option value="on"${target.day_map_enabled === 1 ? " selected" : ""}>On</option>
+              <option value="off"${target.day_map_enabled === 0 ? " selected" : ""}>Off</option>
             </select>
-            <div class="field-help mt-1.5">After each briefing for this target, generate a small SVG connection comic (one extra LLM call). "Use default" follows the global setting on the admin console.</div>
+            <div class="field-help mt-1.5">After each briefing for this target, generate an interactive "map of the day" (self-contained HTML, one extra LLM call). "Use default" follows the global setting on the admin console.</div>
           </div>
         </div>
       </form>

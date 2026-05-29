@@ -95,19 +95,19 @@ export async function getChatModel(env: Env): Promise<string> {
   return isAllowedChatModel(val) ? val : DEFAULT_CHAT_MODEL;
 }
 
-/** Read the global comic default (`comics_enabled` setting, ships 'off').
- *  Per-target overrides live on targets.comic_enabled; resolve the effective
- *  value with comicEnabledForTarget() below. */
-export async function getComicsEnabledDefault(env: Env): Promise<boolean> {
-  return (await getSetting(env, "comics_enabled", "off")) === "on";
+/** Read the global day-map default (`day_map_enabled` setting, ships 'off').
+ *  Per-target overrides live on targets.day_map_enabled; resolve the effective
+ *  value with dayMapEnabledForTarget() below. */
+export async function getDayMapEnabledDefault(env: Env): Promise<boolean> {
+  return (await getSetting(env, "day_map_enabled", "off")) === "on";
 }
 
-/** Effective comic switch for a target: the per-target column wins (1 on /
- *  0 off), NULL falls back to the global `comics_enabled` default. */
-export async function comicEnabledForTarget(env: Env, target: Target): Promise<boolean> {
-  if (target.comic_enabled === 1) return true;
-  if (target.comic_enabled === 0) return false;
-  return getComicsEnabledDefault(env);
+/** Effective day-map switch for a target: the per-target column wins (1 on /
+ *  0 off), NULL falls back to the global `day_map_enabled` default. */
+export async function dayMapEnabledForTarget(env: Env, target: Target): Promise<boolean> {
+  if (target.day_map_enabled === 1) return true;
+  if (target.day_map_enabled === 0) return false;
+  return getDayMapEnabledDefault(env);
 }
 
 // ─── chat dispatcher ──────────────────────────────────────────────────────
@@ -320,9 +320,9 @@ export interface Target {
   // DEFAULT_ANCHOR_HOUR_UTC below. See computeNextRunAt() for the slot
   // formula and migration-v12.sql for the rationale.
   anchor_hour_utc: number | null;
-  // Per-target comic switch (v13). 1 = on, 0 = off, NULL = inherit the global
-  // `comics_enabled` setting. See comicEnabledForTarget() / makeComic().
-  comic_enabled: number | null;
+  // Per-target day-map switch (v14). 1 = on, 0 = off, NULL = inherit the global
+  // `day_map_enabled` setting. See dayMapEnabledForTarget() / makeDayMap().
+  day_map_enabled: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -500,7 +500,7 @@ export async function updateTarget(
       | "tavily_min_score"
       | "tavily_max_final_sources"
       | "anchor_hour_utc"
-      | "comic_enabled"
+      | "day_map_enabled"
     >
   >,
 ): Promise<void> {
@@ -556,10 +556,10 @@ export async function updateTarget(
       ? null
       : Math.max(0, Math.min(23, Math.floor(patch.anchor_hour_utc))));
   }
-  // Comic switch (v13). NULL = inherit the global default; 1 = on; 0 = off.
-  if (patch.comic_enabled !== undefined) {
-    sets.push("comic_enabled = ?");
-    args.push(patch.comic_enabled === null ? null : (patch.comic_enabled ? 1 : 0));
+  // Day-map switch (v14). NULL = inherit the global default; 1 = on; 0 = off.
+  if (patch.day_map_enabled !== undefined) {
+    sets.push("day_map_enabled = ?");
+    args.push(patch.day_map_enabled === null ? null : (patch.day_map_enabled ? 1 : 0));
   }
   if (sets.length === 0) return;
   sets.push("updated_at = ?");
@@ -587,13 +587,13 @@ export async function findOrphanedR2(
 ): Promise<{ scanned: number; orphans: string[] }> {
   const known = new Set<string>(R2_STATIC_KEEP);
   const rows = await env.DB.prepare(
-    "SELECT r2_key, comic_r2_key FROM reports",
-  ).all<{ r2_key: string; comic_r2_key: string | null }>();
+    "SELECT r2_key, day_map_r2_key FROM reports",
+  ).all<{ r2_key: string; day_map_r2_key: string | null }>();
   for (const r of rows.results ?? []) {
     known.add(r.r2_key);
-    // Comic SVGs live under their own column (v13) — keep them too, or the
-    // sweep would delete every comic on the next tick.
-    if (r.comic_r2_key) known.add(r.comic_r2_key);
+    // Day-map HTML lives under its own column (v14) — keep it too, or the
+    // sweep would delete every day-map on the next tick.
+    if (r.day_map_r2_key) known.add(r.day_map_r2_key);
   }
 
   let scanned = 0;
@@ -757,21 +757,21 @@ export async function backfillMemory(
  *  because once the report is gone the run is just an unmoored "something
  *  ran" record with no payload to link to. */
 export async function deleteReport(env: Env, id: string): Promise<void> {
-  const row = await env.DB.prepare("SELECT r2_key, comic_r2_key FROM reports WHERE id = ?")
+  const row = await env.DB.prepare("SELECT r2_key, day_map_r2_key FROM reports WHERE id = ?")
     .bind(id)
-    .first<{ r2_key: string; comic_r2_key: string | null }>();
+    .first<{ r2_key: string; day_map_r2_key: string | null }>();
   if (!row) return;
   try {
     await env.REPORTS.delete(row.r2_key);
   } catch (e) {
     console.error("deleteReport: R2 delete failed", row.r2_key, e);
   }
-  // Also drop the paired comic SVG (v13) so it doesn't leak as an orphan.
-  if (row.comic_r2_key) {
+  // Also drop the paired day-map HTML (v14) so it doesn't leak as an orphan.
+  if (row.day_map_r2_key) {
     try {
-      await env.REPORTS.delete(row.comic_r2_key);
+      await env.REPORTS.delete(row.day_map_r2_key);
     } catch (e) {
-      console.error("deleteReport: comic R2 delete failed", row.comic_r2_key, e);
+      console.error("deleteReport: day-map R2 delete failed", row.day_map_r2_key, e);
     }
   }
   try {
@@ -1046,11 +1046,11 @@ export interface Report {
   sources_json: string | null;
   run_id: string | null;
   chat_model: string | null;
-  // Paired comic (v13). NULL when the run made no comic (feature off, or a
-  // pre-v13 report). comic_r2_key points at the SVG in R2; comic_slug is the
-  // short descriptive slug for the comic's own page.
-  comic_r2_key: string | null;
-  comic_slug: string | null;
+  // Paired day-map (v14). NULL when the run made no day-map (feature off, or a
+  // pre-v14 report). day_map_r2_key points at the interactive HTML in R2;
+  // day_map_slug is the short descriptive slug for its own page.
+  day_map_r2_key: string | null;
+  day_map_slug: string | null;
   created_at: number;
 }
 
@@ -1835,329 +1835,217 @@ Markdown formatting rules (follow strictly — the rendering engine depends on t
   return { title: fallbackTitle, summary: fallbackSummary, body: raw, citations };
 }
 
-// ─── the daily comic ────────────────────────────────────────────────────────
+// ─── the day-map ─────────────────────────────────────────────────────────────
 //
-// After a briefing is written, optionally generate a small "connection comic":
-// a few panels that show how the day's stories hang together — a cause-and-
-// effect chain, not a gag. It is drawn as SVG *in code* (brand palette, real
-// text), never an image-gen model. One LLM pass distils the briefing into a
-// spine + 3-5 panels; renderComicSvg() lays those into a fixed vertical chain.
+// After a briefing is written, optionally generate a "map of the day": ONE
+// self-contained interactive HTML artifact (hand-written HTML + inline CSS +
+// vanilla JS, optionally one cdnjs library) that opens with an overview of how
+// the day's stories connect — the single thread, the major forces, and the
+// cause→effect links between them — then lays out the beats below.
 //
-// Gated per-target via comicEnabledForTarget(). Best-effort: makeComic never
-// throws, so a comic failure can never fail (or roll back) the briefing.
+// It is written in ONE LLM pass over the FULL briefing (no truncation) and is
+// deliberately CONCRETE: real names, dates, numbers — the actual day. (This is
+// the inverse of daylila's abstract "labs", where specifics are banned; here
+// the specifics ARE the point.) The artifact is always rendered inside a
+// sandboxed iframe (on WatchOMacho's report page and on daylila), and the
+// public /day-map route serves it under a Content-Security-Policy that blocks
+// network egress — so the LLM-authored script is caged and no content
+// validator is needed here. The ONLY check we do is "is this actually a usable
+// HTML document?" so we never store empty/truncated junk.
+//
+// Gated per-target via dayMapEnabledForTarget(). Best-effort: makeDayMap never
+// throws, so a day-map failure can never fail (or roll back) the briefing.
 
-/** One panel of the comic. `label` is the 1-3 word node title (the actor or
- *  force — "Iran war", "Oil markets"); `caption` is one short line of what
- *  happens / how it connects; `icon` is a motif from a small fixed set that
- *  renderComicSvg knows how to draw (anything else falls back to a dot). */
-interface ComicPanel {
-  label: string;
-  caption: string;
-  icon: string;
+/** Output-token budget for the day-map call. The artifact is a full HTML
+ *  document, so this is far larger than the planner/writer budgets. daylila's
+ *  lab presenter caps INLINE bytes at ~50 KB; ~16k tokens leaves headroom. */
+const DAY_MAP_MAX_TOKENS = 16000;
+
+/** Pull the briefing's section headings ("## ...") in order, so the day-map
+ *  prompt can tell the model exactly which beats to lay out below the map. */
+function extractSectionHeadings(body: string): string[] {
+  const out: string[] = [];
+  for (const m of body.matchAll(/^##\s+(.+?)\s*$/gm)) {
+    const h = m[1].replace(/\s+/g, " ").trim();
+    if (h) out.push(h);
+  }
+  return out;
 }
 
-interface ComicSpec {
-  spine: string;        // the single connecting thread, one sentence
-  slug: string;         // short descriptive kebab-case slug for the comic page
-  panels: ComicPanel[]; // 3-5, in cause→effect order
+/** Pull the HTML document out of a model response: drop any ```html fences and
+ *  surrounding prose, returning the slice from <!DOCTYPE html> through </html>.
+ *  Returns null when no document is present. */
+function extractHtmlDoc(raw: string): string | null {
+  const fenced = raw.replace(/```(?:html)?/gi, "");
+  const lower = fenced.toLowerCase();
+  const start = lower.indexOf("<!doctype html");
+  const end = lower.lastIndexOf("</html>");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return fenced.slice(start, end + "</html>".length).trim();
 }
 
-/** Icons renderComicSvg can draw as simple SVG shapes. The comic LLM is asked
- *  to pick from these; unknown values render as a neutral dot. */
-const COMIC_ICONS = new Set([
-  "flame", "up", "down", "globe", "bolt", "alert", "coin", "dot",
-]);
+/** The ONLY validation we do on our side — a featherweight "is this a usable
+ *  HTML document?" check (the iframe sandbox + CSP are the real safety wall;
+ *  see the section comment above). Guards against empty / truncated /
+ *  prose-only model output that would otherwise render as a broken box. */
+function looksLikeHtmlDoc(s: string): boolean {
+  const t = s.toLowerCase();
+  return s.length >= 200 && t.includes("<!doctype html") && t.includes("</html>") && t.includes("<body");
+}
 
-/** Step C1: ask the LLM to distil the finished briefing into a comic spec.
- *  Mirrors planResearch's "parse the JSON object out of the response" pattern.
- *  Returns null if the model didn't produce a usable spec (caller skips the
- *  comic — never fails the run). */
-async function planComic(
+/** Step D1: ask the LLM to turn the finished briefing into a self-contained
+ *  interactive HTML "map of the day". Returns the HTML document, or null if
+ *  the model didn't return a usable one (caller skips — never fails the run). */
+async function planDayMap(
   env: Env,
   title: string,
+  summary: string | null,
   body: string,
   model: string,
   signal?: AbortSignal,
-): Promise<ComicSpec | null> {
-  const system = `You turn a finished daily news briefing into a small "connection comic": a few panels that show how the day's stories CONNECT — a cause-and-effect chain or a single thread running through everything. It is not a joke or a gag; the news is serious. You are reshaping facts the briefing already verified, not adding new ones.
+): Promise<string | null> {
+  const headings = extractSectionHeadings(body);
+  const sectionList = headings.length
+    ? headings.map((h, i) => `${i + 1}. ${h}`).join("\n")
+    : "(no explicit section headings — infer the beats from the body)";
 
-Return ONLY a JSON object, no prose, exactly this shape:
-{
-  "spine": "one sentence naming the single thread that ties the day together (max 140 chars)",
-  "slug": "short-kebab-case-slug-3-to-5-words",
-  "panels": [
-    { "label": "1-3 word node title (the actor or force)", "caption": "one short line: what happens or how it connects to the next panel (max 110 chars)", "icon": "one of: flame up down globe bolt alert coin dot" }
-  ]
-}
+  const system = `You turn a finished, fact-checked daily news briefing into a "map of the day": a single self-contained interactive HTML page. At the top is a clear MAP of how the day's stories connect — the one thread, the central driver, and the cause→effect links. Below it is a short, skimmable rundown of each story.
 
-Rules:
-- Exactly 3 to 5 panels, ordered as a cause→effect chain (panel 1 leads to panel 2, etc.) or as facets of the one spine.
-- "label" max 24 chars, "caption" max 110 chars, both single-line plain text (no markdown, no quotes, no emoji).
-- Pick the "icon" that best fits each panel's motif: flame (war/conflict/destruction), down (markets/decline/loss), up (gains/escalation/rise), globe (diplomacy/international), bolt (energy/sudden shock), alert (warning/crisis), coin (economy/money), dot (anything else).
-- The spine is the EDITORIAL point — what the day was really about — not a summary of each story.`;
+This is NOT abstract. Use the REAL names, places, dates and numbers from the briefing — the specifics are the whole point. Invent no new facts; only reshape what the briefing already states.
 
-  const userMsg = `BRIEFING TITLE\n${title}\n\nBRIEFING BODY\n${body.slice(0, 6000)}\n\nReturn the comic JSON now.`;
+OUTPUT
+- Output ONLY a complete HTML document. No prose, no markdown, no code fences. Start with <!DOCTYPE html> and end with </html>.
+- Inline <style> and inline <script>. The ONLY external resources allowed: (1) the DM Sans brand font from Google Fonts (see STYLE — always load it), and (2) optionally ONE cdnjs library (https://cdnjs.cloudflare.com/...) if it truly helps — but the layout below is plain HTML/CSS and needs no library, so prefer none.
+- Runs inside a sandboxed iframe with NO other network access: no fetch(), no localStorage/cookies, no forms, no other external requests. Inline everything else.
+- Keep hand-written markup under ~45 KB.
+
+THE MAP — layout (ONE layout for every screen size — mobile-first, just centered on desktop)
+- Use a SINGLE VERTICAL COLUMN at EVERY width: a reading column of max-width ~680px, centered on the page. Do NOT switch to side-by-side columns on desktop and do NOT reflow between two layouts — one column everywhere is simpler and bug-free. Do NOT hand-place nodes at fixed pixel coordinates and do NOT build a free-floating "web".
+- Assign every node a tier and lay them out TOP→DOWN in this order:
+  • Tier 1 = the root driver — the single thread, the one thing the day traces back to.
+  • Tier 2 = the major forces it sets in motion.
+  • Tier 3 = the downstream effects/consequences.
+  (If there's no clean 3-level chain, use 2 tiers: the driver, then everything it connects to.)
+- Within a tier, stack its cards vertically. Between tiers, put ONE DOWNWARD (↓) connector with a short label ("sets in motion", "downstream effects"). ALL connectors point DOWN — never sideways — because the flow is always vertical. Cards MUST NEVER overlap and nothing may overflow the viewport down to 320px.
+- Each node is a BIG, full-width, tappable CARD: a short bold label + a one-line hint, with a small tier badge (ROOT DRIVER / FORCE / EFFECT). Leave clear space before the +/− expand control so it never touches the title text.
+- Tapping any card expands its FULL detail INLINE, in normal document flow, directly under the card (accordion-style, with a +/− affordance). Do NOT use a position:fixed / position:absolute / full-screen-overlay modal — this map is embedded in a tall auto-sized iframe, so a "fixed" popup lands off-screen. Keep on-card text short and in WHOLE words — never cut a word mid-way with "…"; the long version lives in the inline expansion.
+
+BELOW THE MAP — the day in short
+- A skimmable rundown: each story's HEADING followed by a tight 1–3 sentence take with the real specifics. Do NOT label these "beats" and do NOT number them ("Beat 1", etc.) — just the heading and the short take, cleanly.
+
+AUTO-HEIGHT (required — so the embedding page can size the frame and there is NO inner scrollbar, even when a card is expanded)
+- Include this exact script verbatim:
+  <script>
+  function postH(){parent.postMessage({type:'day-map-height',height:Math.max(document.body.scrollHeight,document.documentElement.scrollHeight)},'*');}
+  addEventListener('load',postH);addEventListener('resize',postH);
+  new ResizeObserver(postH).observe(document.body);
+  addEventListener('click',function(){setTimeout(postH,60);setTimeout(postH,400);});
+  </script>
+
+STYLE (brand — match daylila exactly)
+- Load the brand font in <head> and use it everywhere: <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap"> then font-family: 'DM Sans', system-ui, sans-serif.
+- Palette: warm paper background #FAF8F4, near-black text #1A1A1A, teal #1A6B62 (primary/accent; use #155951 for hover), gold #C49A1A, muted text #6B6B6B, hairline borders #E8E4DE.
+- Calm, editorial, professional — this is news, not a toy. No footer/branding line at the bottom.`;
+
+  const userMsg = `BRIEFING TITLE
+${title}
+
+EDITORIAL SUMMARY
+${summary ?? "(none)"}
+
+SECTIONS (in order)
+${sectionList}
+
+BRIEFING BODY
+${body}
+
+Return the complete HTML document now.`;
 
   const res = await runChat(env, model, {
     messages: [
       { role: "system", content: system },
       { role: "user", content: userMsg },
     ],
-    max_tokens: 700,
+    max_tokens: DAY_MAP_MAX_TOKENS,
   }, signal);
 
-  const m = res.response.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  let parsed: any;
-  try {
-    parsed = JSON.parse(m[0]);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
-
-  const spine = String(parsed.spine ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-  if (!spine) return null;
-
-  const rawPanels = Array.isArray(parsed.panels) ? parsed.panels : [];
-  const panels: ComicPanel[] = rawPanels
-    .map((p: any): ComicPanel => {
-      const icon = String(p?.icon ?? "dot").toLowerCase().trim();
-      return {
-        label: String(p?.label ?? "").replace(/\s+/g, " ").trim().slice(0, 40),
-        caption: String(p?.caption ?? "").replace(/\s+/g, " ").trim().slice(0, 160),
-        icon: COMIC_ICONS.has(icon) ? icon : "dot",
-      };
-    })
-    .filter((p: ComicPanel) => p.label || p.caption)
-    .slice(0, 5);
-  if (panels.length < 2) return null; // too thin to be a "connection"
-
-  const slug = slugify(String(parsed.slug ?? "") || spine);
-  return { spine, slug, panels };
+  const doc = extractHtmlDoc(res.response);
+  if (!doc || !looksLikeHtmlDoc(doc)) return null;
+  return doc;
 }
 
-// ─── SVG rendering (brand palette, code-drawn — no image-gen model) ──────────
-
-const COMIC = {
-  bg: "#FAF8F4",
-  card: "#FFFFFF",
-  text: "#1A1A1A",
-  primary: "#1A6B62",
-  muted: "#6B6B6B",
-  gold: "#C49A1A",
-  border: "#E8E4DE",
-  width: 720,
-  margin: 36,
-} as const;
-
-/** Minimal XML text escaper for SVG content (no dep on dashboard's helper). */
-function escapeXml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-/** Greedy word-wrap by estimated pixel width. SVG has no layout engine, so we
- *  approximate character width as ~0.55em and pack words into lines that fit
- *  `maxWidth`. Good enough for the bounded caption/spine lengths we render. */
-function wrapText(text: string, maxWidth: number, fontSize: number): string[] {
-  const maxChars = Math.max(8, Math.floor(maxWidth / (fontSize * 0.55)));
-  // Hard-split any single token longer than the line so a URL-like or
-  // whitespace-free string (adversarial/garbled LLM output) can't run off the
-  // fixed card width instead of wrapping.
-  const words = text
-    .split(/\s+/)
-    .filter(Boolean)
-    .flatMap((w) =>
-      w.length <= maxChars ? [w] : (w.match(new RegExp(`.{1,${maxChars}}`, "g")) ?? [w]),
-    );
-  const lines: string[] = [];
-  let cur = "";
-  for (const w of words) {
-    const cand = cur ? `${cur} ${w}` : w;
-    if (cand.length > maxChars && cur) {
-      lines.push(cur);
-      cur = w;
-    } else {
-      cur = cand;
-    }
-  }
-  if (cur) lines.push(cur);
-  return lines.length ? lines : [""];
-}
-
-/** Draw one motif icon as simple SVG shapes, centred at (cx, cy). */
-function comicIcon(name: string, cx: number, cy: number): string {
-  const s = 11; // half-extent
-  const c = COMIC.gold;
-  switch (name) {
-    case "flame":
-      return `<path d="M${cx} ${cy - s} C ${cx + s} ${cy - 2}, ${cx + s * 0.5} ${cy + s}, ${cx} ${cy + s} C ${cx - s * 0.6} ${cy + s}, ${cx - s} ${cy - 1}, ${cx} ${cy - s} Z" fill="${c}"/>`;
-    case "down":
-      return `<path d="M${cx - s} ${cy - s * 0.6} L${cx + s} ${cy - s * 0.6} L${cx} ${cy + s} Z" fill="#B4452F"/>`;
-    case "up":
-      return `<path d="M${cx} ${cy - s} L${cx + s} ${cy + s * 0.6} L${cx - s} ${cy + s * 0.6} Z" fill="${COMIC.primary}"/>`;
-    case "globe":
-      return `<g fill="none" stroke="${c}" stroke-width="1.6"><circle cx="${cx}" cy="${cy}" r="${s}"/><ellipse cx="${cx}" cy="${cy}" rx="${s * 0.45}" ry="${s}"/><line x1="${cx - s}" y1="${cy}" x2="${cx + s}" y2="${cy}"/></g>`;
-    case "bolt":
-      return `<path d="M${cx + 2} ${cy - s} L${cx - s} ${cy + 2} L${cx - 1} ${cy + 2} L${cx - 3} ${cy + s} L${cx + s} ${cy - 3} L${cx + 1} ${cy - 3} Z" fill="${c}"/>`;
-    case "alert":
-      return `<g><path d="M${cx} ${cy - s} L${cx + s} ${cy + s} L${cx - s} ${cy + s} Z" fill="none" stroke="#B4452F" stroke-width="1.8" stroke-linejoin="round"/><line x1="${cx}" y1="${cy - 2}" x2="${cx}" y2="${cy + 4}" stroke="#B4452F" stroke-width="1.8"/><circle cx="${cx}" cy="${cy + 8}" r="1" fill="#B4452F"/></g>`;
-    case "coin":
-      return `<g fill="none" stroke="${c}" stroke-width="1.6"><circle cx="${cx}" cy="${cy}" r="${s}"/><line x1="${cx}" y1="${cy - 5}" x2="${cx}" y2="${cy + 5}"/></g>`;
-    default: // dot
-      return `<circle cx="${cx}" cy="${cy}" r="5" fill="${COMIC.primary}"/>`;
-  }
-}
-
-/** Render a comic spec into a self-contained SVG string. Fixed vertical
- *  connection-chain layout: a spine header, then numbered panel cards joined
- *  by downward connectors, then a footer. Width is fixed; height grows with
- *  content so nothing ever clips. */
-function renderComicSvg(
-  spec: ComicSpec,
-  meta: { dateUtc: string; targetName: string },
-): string {
-  const W = COMIC.width;
-  const M = COMIC.margin;
-  const contentW = W - 2 * M;
-  const parts: string[] = [];
-
-  // ── header ──
-  let y = 52;
-  parts.push(
-    `<text x="${M}" y="${y}" font-size="12" letter-spacing="2" font-weight="700" fill="${COMIC.primary}">THE DAY'S THREAD</text>`,
-  );
-  y += 26;
-  const spineLines = wrapText(spec.spine, contentW, 22);
-  for (const line of spineLines) {
-    parts.push(
-      `<text x="${M}" y="${y}" font-size="22" font-weight="700" fill="${COMIC.text}">${escapeXml(line)}</text>`,
-    );
-    y += 30;
-  }
-  y += 6;
-  parts.push(`<line x1="${M}" y1="${y}" x2="${W - M}" y2="${y}" stroke="${COMIC.border}" stroke-width="1.5"/>`);
-  y += 28;
-
-  // ── panel cards joined by connectors ──
-  const labelX = M + 64;
-  const textW = contentW - 64 - 44; // minus badge gutter and icon gutter
-  spec.panels.forEach((p, i) => {
-    const capLines = p.caption ? wrapText(p.caption, textW, 15) : [];
-    const cardH = Math.max(74, 50 + capLines.length * 21 + 14);
-    const cardY = y;
-
-    // card + left accent stripe
-    parts.push(
-      `<rect x="${M}" y="${cardY}" width="${contentW}" height="${cardH}" rx="14" fill="${COMIC.card}" stroke="${COMIC.border}" stroke-width="1.5"/>`,
-    );
-    parts.push(
-      `<rect x="${M}" y="${cardY}" width="6" height="${cardH}" rx="3" fill="${COMIC.primary}"/>`,
-    );
-    // number badge
-    const badgeCx = M + 34;
-    const badgeCy = cardY + 34;
-    parts.push(`<circle cx="${badgeCx}" cy="${badgeCy}" r="16" fill="${COMIC.primary}"/>`);
-    parts.push(
-      `<text x="${badgeCx}" y="${badgeCy + 5}" font-size="15" font-weight="700" fill="#FFFFFF" text-anchor="middle">${i + 1}</text>`,
-    );
-    // icon top-right
-    parts.push(comicIcon(p.icon, W - M - 28, cardY + 30));
-    // label
-    if (p.label) {
-      parts.push(
-        `<text x="${labelX}" y="${cardY + 30}" font-size="17" font-weight="700" fill="${COMIC.text}">${escapeXml(p.label)}</text>`,
-      );
-    }
-    // caption lines
-    let cy = cardY + (p.label ? 54 : 36);
-    for (const line of capLines) {
-      parts.push(
-        `<text x="${labelX}" y="${cy}" font-size="15" fill="${COMIC.muted}">${escapeXml(line)}</text>`,
-      );
-      cy += 21;
-    }
-
-    y = cardY + cardH;
-
-    // connector to the next card (chain arrow)
-    if (i < spec.panels.length - 1) {
-      const gap = 26;
-      const x = badgeCx;
-      parts.push(
-        `<line x1="${x}" y1="${y + 4}" x2="${x}" y2="${y + gap - 4}" stroke="${COMIC.primary}" stroke-width="2"/>`,
-      );
-      parts.push(
-        `<path d="M${x - 5} ${y + gap - 7} L${x} ${y + gap - 1} L${x + 5} ${y + gap - 7}" fill="none" stroke="${COMIC.primary}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
-      );
-      y += gap;
-    }
-  });
-
-  // ── footer ──
-  y += 30;
-  parts.push(`<line x1="${M}" y1="${y - 18}" x2="${W - M}" y2="${y - 18}" stroke="${COMIC.border}" stroke-width="1.5"/>`);
-  parts.push(
-    `<text x="${M}" y="${y}" font-size="12" font-weight="700" fill="${COMIC.primary}">WatchOMacho</text>`,
-  );
-  parts.push(
-    `<text x="${W - M}" y="${y}" font-size="12" fill="${COMIC.muted}" text-anchor="end">${escapeXml(meta.targetName)} · ${escapeXml(meta.dateUtc)}</text>`,
-  );
-  const H = y + 24;
-
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="'DM Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
-<rect width="${W}" height="${H}" fill="${COMIC.bg}"/>
-<rect x="6" y="6" width="${W - 12}" height="${H - 12}" rx="18" fill="none" stroke="${COMIC.border}" stroke-width="1.5"/>
-${parts.join("\n")}
-</svg>`;
-}
-
-/** Generate + persist the comic for a just-written briefing. Best-effort:
+/** Generate + persist the day-map for a just-written briefing. Best-effort:
  *  catches everything, records the failure to settings for the admin page,
- *  and never throws — the briefing is already saved before this runs.
- *  Stores the SVG in R2 (mirroring report markdown) and links it from the
- *  reports row via comic_r2_key + comic_slug. */
-export async function makeComic(
+ *  and never throws — the briefing is already saved before this runs. Stores
+ *  the interactive HTML in R2 (mirroring report markdown) and links it from
+ *  the reports row via day_map_r2_key + day_map_slug. */
+export async function makeDayMap(
   env: Env,
-  report: { id: string; created_at: number; title: string },
+  report: { id: string; created_at: number; title: string; snippet?: string | null },
   body: string,
-  target: Target,
   model: string,
   signal?: AbortSignal,
 ): Promise<void> {
   try {
-    const spec = await planComic(env, report.title, body, model, signal);
-    if (!spec) {
-      console.warn(`makeComic: no usable comic spec for report ${report.id}; skipping`);
+    const html = await planDayMap(
+      env,
+      report.title,
+      report.snippet ?? null,
+      body,
+      model,
+      signal,
+    );
+    if (!html) {
+      console.warn(`makeDayMap: no usable day-map for report ${report.id}; skipping`);
       return;
     }
-    const dateUtc = new Date(report.created_at).toISOString().slice(0, 10);
-    const svg = renderComicSvg(spec, { dateUtc, targetName: target.name });
-    const r2Key = `comics/${report.created_at}-${report.id}.svg`;
-    await env.REPORTS.put(r2Key, svg, {
-      httpMetadata: { contentType: "image/svg+xml; charset=utf-8" },
+    const r2Key = `day-maps/${report.created_at}-${report.id}.html`;
+    await env.REPORTS.put(r2Key, html, {
+      httpMetadata: { contentType: "text/html; charset=utf-8" },
     });
     await env.DB.prepare(
-      "UPDATE reports SET comic_r2_key = ?, comic_slug = ? WHERE id = ?",
+      "UPDATE reports SET day_map_r2_key = ?, day_map_slug = ? WHERE id = ?",
     )
-      .bind(r2Key, spec.slug || "comic", report.id)
+      .bind(r2Key, slugify(report.title) || "day-map", report.id)
       .run();
-    await setSetting(env, "comic_last_ok_at", String(Date.now())).catch(() => {});
-    await setSetting(env, "comic_last_error", "").catch(() => {});
+    await setSetting(env, "day_map_last_ok_at", String(Date.now())).catch(() => {});
+    await setSetting(env, "day_map_last_error", "").catch(() => {});
   } catch (e: any) {
     const msg = String(e?.message ?? e).slice(0, 500);
-    console.error("makeComic failed", report.id, msg);
+    console.error("makeDayMap failed", report.id, msg);
     await setSetting(
       env,
-      "comic_last_error",
+      "day_map_last_error",
       JSON.stringify({ message: msg, at: Date.now(), report_id: report.id }),
     ).catch(() => {});
   }
+}
+
+/** Regenerate ONLY the day-map for an existing report — no research, no
+ *  re-write of the briefing, just the day-map LLM call over the already-stored
+ *  body. Powers the admin "Remake map" button, so a story can get a fresh map
+ *  (e.g. after a generator change) for one cheap call instead of a whole run.
+ *  Best-effort via makeDayMap; returns false if the report/body/target can't
+ *  be loaded (caller logs it). */
+export async function regenerateDayMap(
+  env: Env,
+  reportId: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const report = await getReportById(env, reportId);
+  if (!report) return false;
+  const obj = await env.REPORTS.get(report.r2_key);
+  if (!obj) return false;
+  const body = await obj.text();
+  const model = await getChatModel(env);
+  await makeDayMap(
+    env,
+    { id: report.id, created_at: report.created_at, title: report.title, snippet: report.snippet },
+    body,
+    model,
+    signal,
+  );
+  return true;
 }
 
 /** Pipeline step labels used by runResearch's step-boundary breadcrumb.
@@ -2440,25 +2328,24 @@ export async function runResearch(
     attempt.outcome = "success";
     await markStep(env, attempt, "done");
 
-    // Paired comic (v13). Runs AFTER the briefing is fully persisted, gated
+    // Paired day-map (v14). Runs AFTER the briefing is fully persisted, gated
     // per-target. Lives here (not only in the DO alarm) so BOTH the cron and
-    // the manual "Run Now" path get a comic. makeComic is best-effort and
+    // the manual "Run Now" path get a day-map. makeDayMap is best-effort and
     // never throws, so it can't fail or roll back the briefing above. We do
     // it before the final getReportById so the returned Report carries the
-    // freshly-linked comic_r2_key / comic_slug.
+    // freshly-linked day_map_r2_key / day_map_slug.
     try {
-      if (await comicEnabledForTarget(env, target)) {
-        await makeComic(
+      if (await dayMapEnabledForTarget(env, target)) {
+        await makeDayMap(
           env,
-          { id: reportId, created_at: created, title },
+          { id: reportId, created_at: created, title, snippet },
           body,
-          target,
           chatModel,
           signal,
         );
       }
-    } catch (comicErr) {
-      console.error(`runResearch[${runId}] comic step failed (non-fatal):`, comicErr);
+    } catch (dayMapErr) {
+      console.error(`runResearch[${runId}] day-map step failed (non-fatal):`, dayMapErr);
     }
 
     return (await getReportById(env, reportId))!;
@@ -2615,6 +2502,7 @@ export class ResearchRunner extends DurableObject<Env> {
    *  alarm; returns immediately so the route can redirect the user. */
   async scheduleManualRun(targetSlug: string): Promise<void> {
     await this.ctx.storage.put("job", {
+      kind: "full" as const,
       targetSlug,
       triggeredBy: "manual" as const,
       scheduledAt: Date.now(),
@@ -2623,16 +2511,31 @@ export class ResearchRunner extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + 1000);
   }
 
+  /** Like scheduleManualRun, but regenerates ONLY the day-map for one existing
+   *  report (no research, no re-write). Runs inside the alarm's 15-min budget
+   *  so the long day-map call can't be cut off by the 30s ctx.waitUntil cap.
+   *  The caller keys this DO by report id (`day-map:<id>`), separate from the
+   *  target's full-run DO, so a regen never clobbers a "Run Now" job slot.
+   *  `targetSlug` is kept only for log context. */
+  async scheduleDayMapRun(targetSlug: string, reportId: string): Promise<void> {
+    await this.ctx.storage.put("job", {
+      kind: "day-map" as const,
+      targetSlug,
+      reportId,
+      scheduledAt: Date.now(),
+    });
+    await this.ctx.storage.setAlarm(Date.now() + 1000);
+  }
+
   /** Cloudflare invokes this when our setAlarm time arrives. Runs in the
    *  scheduled-handler context (15-min wall budget). We enforce a tighter
    *  `max_run_seconds` ceiling via an AbortController so a hung Tavily /
    *  Anthropic fetch can't burn the full 15 minutes (~115 GB-seconds). */
   async alarm(): Promise<void> {
-    const job = await this.ctx.storage.get<{
-      targetSlug: string;
-      triggeredBy: "manual";
-      scheduledAt: number;
-    }>("job");
+    const job = await this.ctx.storage.get<
+      | { kind?: "full"; targetSlug: string; triggeredBy: "manual"; scheduledAt: number }
+      | { kind: "day-map"; targetSlug: string; reportId: string; scheduledAt: number }
+    >("job");
     if (!job) {
       console.warn("ResearchRunner alarm: no pending job; nothing to do");
       return;
@@ -2659,22 +2562,30 @@ export class ResearchRunner extends DurableObject<Env> {
     }, maxRunSeconds * 1000);
 
     try {
-      const target = await getTargetBySlug(this.env, job.targetSlug);
-      if (!target) {
-        console.error(`ResearchRunner alarm: target not found: ${job.targetSlug}`);
-        return;
+      if (job.kind === "day-map") {
+        // Day-map-only regen: no research, just rebuild the map from the
+        // already-stored briefing body. Best-effort, like the post-run hook.
+        console.log(`ResearchRunner alarm: regenerating day-map for report ${job.reportId} (max ${maxRunSeconds}s)`);
+        const ok = await regenerateDayMap(this.env, job.reportId, controller.signal);
+        if (!ok) console.error(`ResearchRunner alarm: could not load report ${job.reportId} for day-map regen`);
+      } else {
+        const target = await getTargetBySlug(this.env, job.targetSlug);
+        if (!target) {
+          console.error(`ResearchRunner alarm: target not found: ${job.targetSlug}`);
+          return;
+        }
+        if (!target.primary_skill_id) {
+          console.error(`ResearchRunner alarm: target has no skill: ${job.targetSlug}`);
+          return;
+        }
+        const skill = await getSkillById(this.env, target.primary_skill_id);
+        if (!skill) {
+          console.error(`ResearchRunner alarm: skill not found for target: ${job.targetSlug}`);
+          return;
+        }
+        console.log(`ResearchRunner alarm: running ${job.targetSlug} (${job.triggeredBy}, max ${maxRunSeconds}s)`);
+        await runResearch(this.env, target, skill, job.triggeredBy, controller.signal);
       }
-      if (!target.primary_skill_id) {
-        console.error(`ResearchRunner alarm: target has no skill: ${job.targetSlug}`);
-        return;
-      }
-      const skill = await getSkillById(this.env, target.primary_skill_id);
-      if (!skill) {
-        console.error(`ResearchRunner alarm: skill not found for target: ${job.targetSlug}`);
-        return;
-      }
-      console.log(`ResearchRunner alarm: running ${job.targetSlug} (${job.triggeredBy}, max ${maxRunSeconds}s)`);
-      await runResearch(this.env, target, skill, job.triggeredBy, controller.signal);
     } catch (e) {
       console.error(`ResearchRunner alarm failed:`, e);
     } finally {
