@@ -300,6 +300,30 @@ export default {
         return html(await renderReportPage(env, id));
       }
 
+      // ─── Comic (public; v13) ───────────────────────────────────────────────
+      // Serves a briefing's paired comic SVG at its own URL so daylila (or
+      // anyone) can embed it or link to it. Keyed by report id — unique and
+      // simple; the descriptive comic_slug is exposed via the JSON API for
+      // building pretty URLs on top. Public, like /report/:id.
+      if (path.startsWith("/comic/") && (req.method === "GET" || req.method === "HEAD")) {
+        const id = path.slice("/comic/".length);
+        if (!/^[a-z0-9-]+$/.test(id)) {
+          return new Response("Bad id", withSecurityHeaders({ status: 400 }));
+        }
+        const report = await getReportById(env, id);
+        if (!report?.comic_r2_key) {
+          return new Response("Not found", withSecurityHeaders({ status: 404 }));
+        }
+        const obj = await env.REPORTS.get(report.comic_r2_key);
+        if (!obj) return new Response("Not found", withSecurityHeaders({ status: 404 }));
+        return new Response(req.method === "HEAD" ? null : obj.body, {
+          headers: {
+            "content-type": "image/svg+xml; charset=utf-8",
+            "cache-control": "public, max-age=86400",
+          },
+        });
+      }
+
       // ─── JSON API ────────────────────────────────────────────────────────
       // All /api/* endpoints are gated by the X-API-Key header. The secret
       // is WATCHOMACHO_API_KEY (set via `wrangler secret put`). Callers
@@ -342,6 +366,7 @@ export default {
           const rows = await env.DB.prepare(
             `SELECT reports.id, reports.title, reports.snippet, reports.word_count,
                     reports.sources_json, reports.created_at,
+                    reports.comic_r2_key, reports.comic_slug,
                     targets.slug AS target_slug, targets.name AS target_name
                FROM reports
                LEFT JOIN targets ON targets.id = reports.target_id
@@ -367,6 +392,12 @@ export default {
             source_count: r.sources_json
               ? (() => { try { return JSON.parse(r.sources_json).length; } catch { return 0; } })()
               : 0,
+            // Paired comic (v13). null when the run made no comic. The feed
+            // stays light — slug + URL only, no inline SVG (pull /api/reports/:id
+            // for the SVG itself).
+            comic: r.comic_r2_key
+              ? { slug: r.comic_slug, url: `${origin}/comic/${r.id}` }
+              : null,
           }));
           return json({ reports: items });
         }
@@ -385,6 +416,17 @@ export default {
           }
           const obj = await env.REPORTS.get(report.r2_key);
           const bodyMarkdown = obj ? await obj.text() : null;
+          // Paired comic (v13): inline the SVG (mirrors body_markdown) plus the
+          // slug + its own URL. null when the run made no comic.
+          let comic: { slug: string | null; url: string; svg: string | null } | null = null;
+          if (report.comic_r2_key) {
+            const comicObj = await env.REPORTS.get(report.comic_r2_key);
+            comic = {
+              slug: report.comic_slug,
+              url: `${new URL(req.url).origin}/comic/${report.id}`,
+              svg: comicObj ? await comicObj.text() : null,
+            };
+          }
           const target = await getTargetById(env, report.target_id);
           let sources: Array<{ title: string; url: string; kind: string }> = [];
           if (report.sources_json) {
@@ -413,6 +455,7 @@ export default {
             target: target ? { slug: target.slug, name: target.name } : null,
             body_markdown: bodyMarkdown,
             sources,
+            comic,
           });
         }
 
@@ -598,6 +641,11 @@ export default {
             if (Number.isFinite(n) && n >= 1 && n <= 200) patch.tavily_max_final_sources = n;
           }
         }
+        // Comic switch (v13). "" = inherit global default (NULL), on = 1, off = 0.
+        if (form.comic_enabled !== undefined) {
+          const raw = form.comic_enabled.trim();
+          patch.comic_enabled = raw === "" ? null : (raw === "on" ? 1 : 0);
+        }
         await updateTarget(env, target.id, patch);
         // Snap next_run_at to the new schedule immediately when cadence
         // or anchor changed — see rescheduleTarget() in src/agent.ts.
@@ -730,12 +778,13 @@ export default {
       // Settings
       if (path === "/admin/settings" && req.method === "GET") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const [reportLim, searchLim, perTick, lastCron, chatModel] = await Promise.all([
+        const [reportLim, searchLim, perTick, lastCron, chatModel, comicsEnabled] = await Promise.all([
           getSetting(env, "daily_report_limit", "20"),
           getSetting(env, "daily_search_limit", "500"),
           getSetting(env, "cron_max_per_tick", "2"),
           getSetting(env, "last_cron_run", "0"),
           getChatModel(env),
+          getSetting(env, "comics_enabled", "off"),
         ]);
         const usage = await getDailyUsage(env);
         return json({
@@ -744,6 +793,7 @@ export default {
           cron_max_per_tick: Number(perTick),
           last_cron_run: Number(lastCron),
           chat_model: chatModel,
+          comics_enabled: comicsEnabled === "on",
           allowed_chat_models: ALLOWED_CHAT_MODELS,
           usage,
           tavily_api_key_set: !!env.TAVILY_API_KEY,
@@ -784,6 +834,15 @@ export default {
           }
           await setSetting(env, "chat_model", form.chat_model);
           updated.chat_model = form.chat_model;
+        }
+        // Global comic default (v13): per-target comic_enabled=NULL inherits this.
+        // Sent as a <select> (always present, value "on"/"off") — keep it a
+        // select, not a checkbox: an unchecked checkbox is absent from FormData,
+        // so "off" could never be saved.
+        if (form.comics_enabled !== undefined) {
+          const on = form.comics_enabled === "on" || form.comics_enabled === "true" || form.comics_enabled === "1";
+          await setSetting(env, "comics_enabled", on ? "on" : "off");
+          updated.comics_enabled = on ? "on" : "off";
         }
         return json({ ok: true, updated });
       }

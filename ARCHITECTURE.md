@@ -62,6 +62,7 @@ For each `runResearch(target, skill, triggeredBy)` call:
 | 5 | **Recall** — Vectorize semantic + D1 same-target recents, layered & deduped | 1 embed + 1 vector query + 1 D1 query | ~3 neurons + free |
 | 6 | **Write** — LLM produces the markdown report from gathered sources + recalled context. Output is parsed for a leading YAML frontmatter block (`title:` + `summary:`) that becomes the LLM-authored headline and editorial abstract; the body is the rest. If parsing fails, falls back to templated title + first-240-char body lead (logs `writeReport: frontmatter parse failed`). Body capped by `writer_max_tokens` setting (default 2200, range 200–16000). | 1 chat call | ~$0.04–0.43 (Sonnet) / ~$0.013–0.036 (Haiku) — scales with sources kept |
 | 7 | **Persist** — R2 put + D1 inserts + embed + Vectorize upsert + update target.next_run_at + runs audit row + heartbeat setting | 1 R2 put + ~4 D1 writes + 1 embed + 1 Vectorize upsert | ~3 neurons + free |
+| 8 | **Comic** (optional, v13) — when enabled for the target (`comicEnabledForTarget()`), one LLM pass → `{ spine, slug, panels[] }`, rendered to an SVG **in code** (`renderComicSvg`, no image-gen model), stored in R2 (`comics/*.svg`) and linked from the report row (`comic_r2_key`/`comic_slug`). Best-effort, never fails the briefing. Runs in `runResearch` so cron + manual both get it. | 1 chat call + 1 R2 put + 1 D1 update | ~$0.005 (Haiku) / free (Workers AI) |
 
 **Total per run (Sonnet default):** ~2 chat calls + 1 embedding + N Tavily calls (default N=10) → roughly **$0.05/run with a tight min-score filter, up to $0.44/run with min-score=0 on a busy news skill** + N Tavily credits. At 1 run/day = **~$1.50–13/month + 300 Tavily credits/month** (free tier is 1000). Haiku 4.5 selectable as a ~5× cheaper fallback.
 
@@ -227,6 +228,7 @@ queries_per_run INTEGER            -- v11: per-target override; NULL = use globa
 tavily_min_score REAL              -- v11: per-target override; NULL = use global default (0.35). 0 = keep all hits.
 tavily_max_final_sources INTEGER   -- v11: per-target override; NULL = use global default (100). Range 1–200.
 anchor_hour_utc INTEGER            -- v12: fixed daily anchor (0-23, UTC). NULL = inherit DEFAULT_ANCHOR_HOUR_UTC=2 (02:00 UTC). Combined with cadence_hours: cadence=24 anchor=2 → daily 02:00; cadence=12 anchor=2 → 02:00 + 14:00; etc.
+comic_enabled INTEGER              -- v13: comic switch. 1 = on, 0 = off, NULL = inherit global `comics_enabled` setting (ships 'off').
 created_at, updated_at
 ```
 
@@ -260,6 +262,8 @@ word_count INTEGER
 sources_json TEXT                  -- JSON: [{title, url, kind: 'web'|'archive'}, ...]
 run_id TEXT
 chat_model TEXT                    -- which chat model wrote it (e.g. 'anthropic/claude-sonnet-4-6')
+comic_r2_key TEXT                  -- v13: R2 key of the paired comic SVG (`comics/*.svg`). NULL = no comic.
+comic_slug TEXT                    -- v13: short descriptive slug for the comic's own page. NULL = no comic.
 created_at
 ```
 
@@ -285,6 +289,7 @@ Key/value strings. Editable live from `/admin` (Budgets & settings + Run guardra
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `chat_model` | `anthropic/claude-sonnet-4-6` | Active chat model. Must be in `ALLOWED_CHAT_MODELS` in `agent.ts`. |
+| `comics_enabled` | `off` | v13. Global default for the paired-comic step. Per-target `targets.comic_enabled` overrides it. `comicEnabledForTarget()` resolves the effective value. |
 | `daily_report_limit` | `20` | Cap on reports written per UTC day |
 | `daily_search_limit` | `500` | Cap on Tavily credits consumed per UTC day |
 | `cron_max_per_tick` | `2` | Max targets advanced per hourly cron tick |
@@ -297,6 +302,7 @@ Key/value strings. Editable live from `/admin` (Budgets & settings + Run guardra
 | `last_cron_run` | `0` | Last successful cron timestamp (heartbeat) |
 | `last_run_attempt` | `{}` | JSON: live "in-flight" step breadcrumb for the most-recent run |
 | `embed_last_ok_at` / `embed_last_error` | — | Heartbeat for the Vectorize embedding step |
+| `comic_last_ok_at` / `comic_last_error` | — | v13. Heartbeat for the comic step (best-effort; failures recorded here, never abort the run) |
 
 ### `daily_usage`
 
@@ -338,10 +344,12 @@ Recall filters out same-target matches at query time (we surface same-target his
 ## R2 layout
 
 ```
-reports/<created_at>-<report_id>.md
+reports/<created_at>-<report_id>.md     -- full markdown of every report; text/markdown
+comics/<created_at>-<report_id>.svg      -- v13: paired comic SVG; image/svg+xml
+static/tailwind.v4.css                    -- bundled CSS
 ```
 
-The full markdown of every report. `text/markdown; charset=utf-8`. Never queried; only fetched by `r2_key`.
+The full markdown of every report (`text/markdown; charset=utf-8`) plus, when comics are enabled, the paired comic SVG (`image/svg+xml`; v13). Never queried; only fetched by `r2_key` / `comic_r2_key`. `findOrphanedR2()` treats both columns (and the `static/` keep-set) as referenced, so the GC sweep never deletes a live comic.
 
 ---
 
@@ -367,7 +375,8 @@ Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 | GET | `/` | Home — list of active targets |
 | GET | `/target/:slug` | Target page with all reports |
 | GET | `/skill/:slug` | Skill detail with writer instructions |
-| GET | `/report/:id` | Single report (date + word count only on header — no admin info) |
+| GET | `/report/:id` | Single report (date + word count only on header — no admin info). Embeds the paired comic via `/comic/:id` when present. |
+| GET | `/comic/:id` | The report's paired comic SVG (`image/svg+xml`, served from R2; v13). 404 when none. Public, like `/report/:id`. |
 
 ### JSON API (gated by `X-API-Key: <WATCHOMACHO_API_KEY>`)
 
@@ -377,8 +386,8 @@ Total: ~4400 lines of TypeScript. Tailwind CSS is built locally via `npm run bui
 | --- | --- | --- |
 | GET | `/api/targets` | Active targets |
 | GET | `/api/skills` | Skill list |
-| GET | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Slim — summary + source_count, no body. Includes `date` (ISO) and `briefing_date` (v12: `YYYY-MM-DD` UTC — the canonical date for any UI that needs to label which day this briefing belongs to). |
-| GET | `/api/reports/:id` | Full report — D1 metadata + R2 `body_markdown` + `sources[]` with `kind: "web" \| "archive"`. Same `briefing_date` field as `/recent`. |
+| GET | `/api/reports/recent?limit=N` | Latest reports across targets (1–50, default 10). Slim — summary + source_count, no body. Includes `date` (ISO), `briefing_date` (v12: `YYYY-MM-DD` UTC — the canonical date for any UI that needs to label which day this briefing belongs to), and `comic` (`{slug, url}` or `null`; v13 — slim, no inline SVG). |
+| GET | `/api/reports/:id` | Full report — D1 metadata + R2 `body_markdown` + `sources[]` with `kind: "web" \| "archive"` + `comic` (`{slug, url, svg}` inlined, or `null`; v13). Same `briefing_date` field as `/recent`. |
 
 ### Admin (cookie auth, set via `/admin/login`)
 

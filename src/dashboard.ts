@@ -952,6 +952,17 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
   const html = wrapSectionsInCards(renderMarkdown(bodyMd));
   const sourcesHtml = renderSourcesSection(report.sources_json);
 
+  // Paired comic (v13). Embed via the public /comic/:id route (the SVG is
+  // served from R2). Omitted entirely when the run produced no comic.
+  const comicHtml = report.comic_r2_key
+    ? `
+    <figure class="mt-8 mb-2">
+      <figcaption class="label mb-2">The day's thread</figcaption>
+      <img src="/comic/${escapeHtml(report.id)}" alt="Comic: the day's connecting thread"
+           class="w-full max-w-2xl rounded-xl border border-zee-border" loading="lazy">
+    </figure>`
+    : "";
+
   // Public report page meta is intentionally minimal — date + word count.
   // Skill, model, runtime, and the Tavily gather funnel are admin-only
   // diagnostics and live on /admin instead.
@@ -965,6 +976,7 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
       </div>
     </section>
     <article class="prose pt-6 pb-2">${html}</article>
+    ${comicHtml}
     ${sourcesHtml}
     <div class="pb-12"></div>
   `;
@@ -1294,7 +1306,7 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
 
 export async function renderAdminPanel(env: Env): Promise<string> {
   const cutoff24h = Date.now() - 24 * 3600 * 1000;
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr, comicsEnabledStr] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1329,7 +1341,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     getSetting(env, "max_chars_per_source", "4000"),
     getSetting(env, "max_run_seconds", "90"),
     getSetting(env, "writer_max_tokens", "2200"),
+    getSetting(env, "comics_enabled", "off"),
   ]);
+  const comicsEnabled = comicsEnabledStr === "on";
   const maxCharsPerSource = (() => {
     const n = parseInt(maxCharsPerSourceStr, 10);
     return Number.isFinite(n) && n >= 200 && n <= 8000 ? n : 4000;
@@ -1384,6 +1398,14 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <label>Chat model</label>
           <select name="chat_model">${modelOptions}</select>
           <div class="field-help">Used for planning and writing. Switch to a smaller model if you hit rate limits.</div>
+        </div>
+        <div class="field mb-4">
+          <label>Daily comic (default)</label>
+          <select name="comics_enabled">
+            <option value="off"${comicsEnabled ? "" : " selected"}>Off</option>
+            <option value="on"${comicsEnabled ? " selected" : ""}>On</option>
+          </select>
+          <div class="field-help">Global default. After each briefing, generate a small connection comic (SVG) with one extra LLM call. Per-target switches on the target page override this.</div>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4 mb-4">
           <div class="field mb-0">
@@ -2246,6 +2268,19 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
                    value="${target.tavily_max_final_sources ?? ""}"
                    placeholder="100 (default)">
             <div class="field-help mt-1.5">Hard cap on how many sources reach the writer after dedupe.</div>
+          </div>
+        </div>
+
+        <div class="label-muted mt-4 mb-2">Comic</div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-4">
+          <div class="field mb-0">
+            <label>Daily comic</label>
+            <select name="comic_enabled">
+              <option value=""${target.comic_enabled == null ? " selected" : ""}>Use default</option>
+              <option value="on"${target.comic_enabled === 1 ? " selected" : ""}>On</option>
+              <option value="off"${target.comic_enabled === 0 ? " selected" : ""}>Off</option>
+            </select>
+            <div class="field-help mt-1.5">After each briefing for this target, generate a small SVG connection comic (one extra LLM call). "Use default" follows the global setting on the admin console.</div>
           </div>
         </div>
       </form>
