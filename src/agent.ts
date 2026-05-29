@@ -1919,15 +1919,16 @@ OUTPUT
 - Runs inside a sandboxed iframe with NO other network access: no fetch(), no localStorage/cookies, no forms, no other external requests. Inline everything else.
 - Keep hand-written markup under ~45 KB.
 
-THE MAP — layout (this is the whole point, and it MUST stay readable on a phone)
-- Lay the map out as a CAUSE→EFFECT FLOW in tiers. Do NOT use a free-floating "web" of nodes and do NOT hand-place nodes at fixed pixel coordinates — both pile up into an unreadable mess on small screens. Instead assign EVERY node a tier:
+THE MAP — layout (ONE layout for every screen size — mobile-first, just centered on desktop)
+- Use a SINGLE VERTICAL COLUMN at EVERY width: a reading column of max-width ~680px, centered on the page. Do NOT switch to side-by-side columns on desktop and do NOT reflow between two layouts — one column everywhere is simpler and bug-free. Do NOT hand-place nodes at fixed pixel coordinates and do NOT build a free-floating "web".
+- Assign every node a tier and lay them out TOP→DOWN in this order:
   • Tier 1 = the root driver — the single thread, the one thing the day traces back to.
   • Tier 2 = the major forces it sets in motion.
   • Tier 3 = the downstream effects/consequences.
-  (If the day has no clean 3-level causal chain, use 2 tiers: the driver, then everything it connects to.)
-- Render the tiers with CSS fl/grid: side-by-side COLUMNS on wide screens (the flow reads left→right), and STACKED top→bottom on narrow screens (one column of full-width cards). Use a media query and/or flex-wrap so this reflow is AUTOMATIC. Cards MUST NEVER overlap and nothing may overflow the viewport, at any width down to 320px.
-- Each node is a BIG, tappable CARD: a short bold label + a one-line hint. Connect related cards across tiers with simple arrows/connectors, and put the cause→effect relationship as a short label on/beside the connector. On a phone the arrows read top-to-bottom.
-- Clicking/tapping any card (or connector) reveals that item's FULL detail. The detail MUST expand INLINE, in normal document flow, right under or inside the clicked card (accordion-style). Do NOT use a position:fixed / position:absolute / full-screen-overlay modal — this map is embedded in a tall auto-sized iframe, so a "fixed" popup lands off-screen instead of where the user clicked. Keep on-card text short and in WHOLE words — never cut a word mid-way with "…"; the long version lives in the inline expansion.
+  (If there's no clean 3-level chain, use 2 tiers: the driver, then everything it connects to.)
+- Within a tier, stack its cards vertically. Between tiers, put ONE DOWNWARD (↓) connector with a short label ("sets in motion", "downstream effects"). ALL connectors point DOWN — never sideways — because the flow is always vertical. Cards MUST NEVER overlap and nothing may overflow the viewport down to 320px.
+- Each node is a BIG, full-width, tappable CARD: a short bold label + a one-line hint, with a small tier badge (ROOT DRIVER / FORCE / EFFECT). Leave clear space before the +/− expand control so it never touches the title text.
+- Tapping any card expands its FULL detail INLINE, in normal document flow, directly under the card (accordion-style, with a +/− affordance). Do NOT use a position:fixed / position:absolute / full-screen-overlay modal — this map is embedded in a tall auto-sized iframe, so a "fixed" popup lands off-screen. Keep on-card text short and in WHOLE words — never cut a word mid-way with "…"; the long version lives in the inline expansion.
 
 BELOW THE MAP — the day in short
 - A skimmable rundown: each story's HEADING followed by a tight 1–3 sentence take with the real specifics. Do NOT label these "beats" and do NOT number them ("Beat 1", etc.) — just the heading and the short take, cleanly.
