@@ -1336,7 +1336,7 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
 
 export async function renderAdminPanel(env: Env): Promise<string> {
   const cutoff24h = Date.now() - 24 * 3600 * 1000;
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr, dayMapEnabledStr] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr, dayMapEnabledStr, dayMapLastOkStr, dayMapLastErrorRaw] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1372,6 +1372,8 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     getSetting(env, "max_run_seconds", "90"),
     getSetting(env, "writer_max_tokens", "2200"),
     getSetting(env, "day_map_enabled", "off"),
+    getSetting(env, "day_map_last_ok_at", "0"),
+    getSetting(env, "day_map_last_error", ""),
   ]);
   const dayMapEnabled = dayMapEnabledStr === "on";
   const maxCharsPerSource = (() => {
@@ -1389,6 +1391,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
   const embedLastOkAt = parseInt(embedLastOkStr, 10) || 0;
   const embedLastError: { message: string; at: number; report_id?: string } | null =
     embedLastErrorRaw ? (() => { try { return JSON.parse(embedLastErrorRaw); } catch { return null; } })() : null;
+  const dayMapLastOkAt = parseInt(dayMapLastOkStr, 10) || 0;
+  const dayMapLastError: { message: string; at: number; report_id?: string } | null =
+    dayMapLastErrorRaw ? (() => { try { return JSON.parse(dayMapLastErrorRaw); } catch { return null; } })() : null;
   const totalReports = totalReportsRow?.n ?? 0;
   const lastCronRun = parseInt(lastCronRunStr, 10) || 0;
   type GatherStats = { tavily_queries: number; tavily_raw: number; after_score_filter: number; after_url_dedupe: number; after_title_dedupe: number; final_kept: number; tavily_credits: number };
@@ -1547,6 +1552,19 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           <button id="backfill-memory-btn" type="button" class="btn btn-secondary"${totalReports === 0 ? " disabled" : ""}>Backfill memory</button>
           <div id="backfill-memory-result" class="field-help mt-1"></div>
         </div>
+      </div>
+
+      <div class="label-muted mt-5 mb-2">Day-map status</div>
+      <div class="text-sm">
+        ${dayMapLastError
+          ? `<span class="text-[rgb(180,60,60)]">Last error: ${escapeHtml(dayMapLastError.message.slice(0, 90))}${dayMapLastError.message.length > 90 ? "…" : ""}</span>
+             <span class="label-muted ml-2">${escapeHtml(timeAgo(dayMapLastError.at))}</span>${dayMapLastError.report_id ? `<span class="label-muted ml-2">(${escapeHtml(dayMapLastError.report_id)})</span>` : ""}`
+          : dayMapLastOkAt > 0
+            ? `<span class="text-zee-primary">Last successful day-map</span> <span class="label-muted">${escapeHtml(timeAgo(dayMapLastOkAt))}</span>`
+            : `<span class="text-zee-muted">No day-map generated yet on this version.</span>`}
+      </div>
+      <div class="field-help mt-1" style="max-width: 64ch;">
+        Best-effort: a failed day-map (e.g. a transient <code>Anthropic 5xx</code>) never blocks the briefing — it just leaves the previous map in place. Use "Remake map" on a report's Activity row to retry.
       </div>
 
     </details>
