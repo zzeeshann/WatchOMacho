@@ -981,7 +981,7 @@ export async function renderReportPage(env: Env, id: string): Promise<string> {
           if(e.source!==f.contentWindow)return;
           var d=e.data;
           if(d&&d.type==='day-map-height'){
-            var h=Math.max(300,Math.min(8000,parseInt(d.height,10)||0));
+            var h=Math.max(300,Math.min(15000,parseInt(d.height,10)||0));
             f.style.height=h+'px';
           }
         });

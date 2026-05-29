@@ -1933,11 +1933,13 @@ THE MAP — layout (ONE layout for every screen size — mobile-first, just cent
 BELOW THE MAP — the day in short
 - A skimmable rundown: each story's HEADING followed by a tight 1–3 sentence take with the real specifics. Do NOT label these "beats" and do NOT number them ("Beat 1", etc.) — just the heading and the short take, cleanly.
 
-AUTO-HEIGHT (required — so the embedding page can size the frame and there is NO inner scrollbar)
+AUTO-HEIGHT (required — so the embedding page can size the frame and there is NO inner scrollbar, even when a card is expanded)
 - Include this exact script verbatim:
   <script>
-  function postH(){parent.postMessage({type:'day-map-height',height:document.documentElement.scrollHeight},'*');}
-  addEventListener('load',postH);addEventListener('resize',postH);new ResizeObserver(postH).observe(document.documentElement);
+  function postH(){parent.postMessage({type:'day-map-height',height:Math.max(document.body.scrollHeight,document.documentElement.scrollHeight)},'*');}
+  addEventListener('load',postH);addEventListener('resize',postH);
+  new ResizeObserver(postH).observe(document.body);
+  addEventListener('click',function(){setTimeout(postH,60);setTimeout(postH,400);});
   </script>
 
 STYLE (brand — match daylila exactly)
