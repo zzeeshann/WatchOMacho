@@ -641,6 +641,11 @@ export default {
             if (Number.isFinite(n) && n >= 1 && n <= 200) patch.tavily_max_final_sources = n;
           }
         }
+        // Comic switch (v13). "" = inherit global default (NULL), on = 1, off = 0.
+        if (form.comic_enabled !== undefined) {
+          const raw = form.comic_enabled.trim();
+          patch.comic_enabled = raw === "" ? null : (raw === "on" ? 1 : 0);
+        }
         await updateTarget(env, target.id, patch);
         // Snap next_run_at to the new schedule immediately when cadence
         // or anchor changed — see rescheduleTarget() in src/agent.ts.
@@ -773,12 +778,13 @@ export default {
       // Settings
       if (path === "/admin/settings" && req.method === "GET") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const [reportLim, searchLim, perTick, lastCron, chatModel] = await Promise.all([
+        const [reportLim, searchLim, perTick, lastCron, chatModel, comicsEnabled] = await Promise.all([
           getSetting(env, "daily_report_limit", "20"),
           getSetting(env, "daily_search_limit", "500"),
           getSetting(env, "cron_max_per_tick", "2"),
           getSetting(env, "last_cron_run", "0"),
           getChatModel(env),
+          getSetting(env, "comics_enabled", "off"),
         ]);
         const usage = await getDailyUsage(env);
         return json({
@@ -787,6 +793,7 @@ export default {
           cron_max_per_tick: Number(perTick),
           last_cron_run: Number(lastCron),
           chat_model: chatModel,
+          comics_enabled: comicsEnabled === "on",
           allowed_chat_models: ALLOWED_CHAT_MODELS,
           usage,
           tavily_api_key_set: !!env.TAVILY_API_KEY,
@@ -827,6 +834,13 @@ export default {
           }
           await setSetting(env, "chat_model", form.chat_model);
           updated.chat_model = form.chat_model;
+        }
+        // Global comic default (v13): per-target comic_enabled=NULL inherits this.
+        // Checkbox semantics — present in the form means "on".
+        if (form.comics_enabled !== undefined) {
+          const on = form.comics_enabled === "on" || form.comics_enabled === "true" || form.comics_enabled === "1";
+          await setSetting(env, "comics_enabled", on ? "on" : "off");
+          updated.comics_enabled = on ? "on" : "off";
         }
         return json({ ok: true, updated });
       }
