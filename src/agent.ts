@@ -1928,6 +1928,7 @@ async function planDayMap(
   title: string,
   summary: string | null,
   body: string,
+  dateLabel: string,
   model: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
@@ -1939,6 +1940,9 @@ async function planDayMap(
   const system = `You turn a finished, fact-checked daily news briefing into a "map of the day": a single self-contained interactive HTML page. At the top is a clear MAP of how the day's stories connect — the one thread, the central driver, and the cause→effect links. Below it is a short, skimmable rundown of each story.
 
 This is NOT abstract. Use the REAL names, places, dates and numbers from the briefing — the specifics are the whole point. Invent no new facts; only reshape what the briefing already states.
+
+HEADER (top of the page)
+- Show the briefing TITLE, the single connecting-thread sentence, AND the date — this briefing is for **${dateLabel}**. The date MUST be visible in the header so the reader knows exactly which day this map covers (e.g. an eyebrow line like "Map of the day · ${dateLabel}").
 
 OUTPUT
 - Output ONLY a complete HTML document. No prose, no markdown, no code fences. Start with <!DOCTYPE html> and end with </html>.
@@ -2014,11 +2018,16 @@ export async function makeDayMap(
   signal?: AbortSignal,
 ): Promise<void> {
   try {
+    const d = new Date(report.created_at);
+    const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    const dateLabel = `${DAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
     const html = await planDayMap(
       env,
       report.title,
       report.snippet ?? null,
       body,
+      dateLabel,
       model,
       signal,
     );
