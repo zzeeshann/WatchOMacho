@@ -264,8 +264,10 @@ export default {
       // ─── Static assets (served from R2 watchomacho-reports/static/) ──────
       // Versioned filenames are immutable: bump the filename version to bust
       // the edge cache.
-      if (path === "/static/tailwind.v4.css" && (req.method === "GET" || req.method === "HEAD")) {
-        const obj = await env.REPORTS.get("static/tailwind.v4.css");
+      if (/^\/static\/tailwind\.v\d+\.css$/.test(path) && (req.method === "GET" || req.method === "HEAD")) {
+        // Serve any versioned tailwind file by its exact name, so HTML cached
+        // with an older ?v link keeps working while new HTML points at v5+.
+        const obj = await env.REPORTS.get(path.slice(1));
         if (!obj) return new Response("Not found", { status: 404 });
         const headers = {
           "content-type": "text/css; charset=utf-8",
@@ -642,7 +644,9 @@ export default {
         }
         const queued = url.searchParams.get("queued") === "1";
         const dayMapQueued = url.searchParams.get("daymap") === "1";
-        return html(await renderAdminTargetEdit(env, slug, queued, dayMapQueued));
+        const lessonQueued = url.searchParams.get("lesson") === "1";
+        const labQueued = url.searchParams.get("lab") === "1";
+        return html(await renderAdminTargetEdit(env, slug, queued, dayMapQueued, lessonQueued, labQueued));
       }
 
       // Targets: create / update / delete

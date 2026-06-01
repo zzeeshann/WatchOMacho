@@ -687,7 +687,7 @@ function shell(title: string, body: string, opts: { activeNav?: string; adminFoo
 <title>${escapeHtml(title)}</title>
 ${FONTS}
 <style>${BASE_CSS}</style>
-<link rel="stylesheet" href="/static/tailwind.v4.css">
+<link rel="stylesheet" href="/static/tailwind.v5.css">
 </head>
 <body>
 <header class="site-header">
@@ -2083,7 +2083,7 @@ export async function renderAdminTargetsList(env: Env): Promise<string> {
 // Admin: target edit page
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function renderAdminTargetEdit(env: Env, slug: string, queued = false, dayMapQueued = false): Promise<string> {
+export async function renderAdminTargetEdit(env: Env, slug: string, queued = false, dayMapQueued = false, lessonQueued = false, labQueued = false): Promise<string> {
   const target = await getTargetBySlug(env, slug);
   if (!target) {
     return shell("Not found", `<section class="py-20 text-center"><h1 class="headline">No such target.</h1></section>`, { activeNav: "targets", adminFooter: true });
@@ -2096,6 +2096,8 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             reports.chat_model    AS report_chat_model,
             reports.sources_json  AS report_sources_json,
             reports.day_map_r2_key AS report_day_map_r2_key,
+            (SELECT status FROM edition_pieces WHERE report_id = runs.report_id AND kind = 'lesson') AS lesson_status,
+            (SELECT status FROM edition_pieces WHERE report_id = runs.report_id AND kind = 'lab')    AS lab_status,
             skills.name           AS skill_name,
             skills.slug           AS skill_slug
        FROM runs
@@ -2146,6 +2148,22 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
   /** Middot separator between meta items on the same line. */
   const metaSep = `<span class="mx-2.5 text-zee-border" aria-hidden="true">·</span>`;
 
+  /** A small status pill for one edition piece (briefing / map / lesson / lab).
+   *  'ok' = teal ✓ (links out when href given), 'failed' = red ✕, 'absent' = grey –. */
+  const pieceChip = (label: string, state: "ok" | "failed" | "absent", href?: string): string => {
+    const cfg =
+      state === "ok"
+        ? { dot: "#1A6B62", cls: "text-zee-text border-zee-border", mark: "✓" }
+      : state === "failed"
+        ? { dot: "rgb(180,60,60)", cls: "text-[rgb(180,60,60)] border-[rgba(180,60,60,0.35)]", mark: "✕" }
+        :   { dot: "#d6cfc2", cls: "text-zee-muted border-zee-border", mark: "–" };
+    const inner = `<span class="inline-block w-1.5 h-1.5 rounded-full" style="background:${cfg.dot}"></span><span>${label}</span><span aria-hidden="true">${cfg.mark}</span>`;
+    const base = `inline-flex items-center gap-1.5 text-xs border rounded-full px-2.5 py-1 leading-none ${cfg.cls}`;
+    return href && state === "ok"
+      ? `<a href="${href}" target="_blank" rel="noopener" class="${base} no-underline hover:border-zee-primary transition-colors">${inner}</a>`
+      : `<span class="${base}">${inner}</span>`;
+  };
+
   const activityList = (activityRows.results ?? []).length === 0
     ? `<div class="empty">No activity yet.</div>`
     : `<ul class="list-none">${(activityRows.results ?? []).map((r: any) => {
@@ -2182,11 +2200,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
             }
           } catch { /* malformed JSON — skip */ }
         }
-        // Day-map link (v14) — only when this run produced one. whitespace-nowrap
-        // so "day-map ↗" wraps as one unit instead of breaking after the hyphen.
-        if (isSuccess && r.report_day_map_r2_key) {
-          lineReportParts.push(`<a href="/day-map/${escapeHtml(r.report_id)}" class="text-zee-primary whitespace-nowrap" target="_blank" rel="noopener">day-map ↗</a>`);
-        }
+        // (The day-map link now lives on the "Map" edition-piece chip below.)
 
         // ─── Line 3 — gather funnel (only when populated) ───
         const funnelHtml = renderGatherFunnel(r.gather_stats_json);
@@ -2200,22 +2214,48 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
         `;
 
         if (isSuccess) {
+          const id = escapeHtml(r.report_id);
+          const lessonState = r.lesson_status === "ok" ? "ok" : r.lesson_status === "failed" ? "failed" : "absent";
+          const labState = r.lab_status === "ok" ? "ok" : r.lab_status === "failed" ? "failed" : "absent";
+          // The whole edition at a glance: briefing (always, links to report) ·
+          // map · lesson · lab. Each piece is independently (re)generatable below.
+          const chips = [
+            pieceChip("Briefing", "ok", `/report/${id}`),
+            pieceChip("Map", r.report_day_map_r2_key ? "ok" : "absent", r.report_day_map_r2_key ? `/day-map/${id}` : undefined),
+            pieceChip("Lesson", lessonState),
+            pieceChip("Lab", labState),
+          ].join("");
+          // Per-piece regen — each is one AI call, no re-research, no touching
+          // the other pieces. Mirrors the modular makeLesson/makeLab/makeDayMap.
+          const actions = `
+            <div class="mt-4 flex flex-wrap items-center gap-2">
+              <form method="post" action="/admin/reports/${id}/day-map" class="inline" onsubmit="return confirm('Rebuild the map of the day for this story? One AI call (~1 min), no re-research.')">
+                <button class="btn btn-sm" type="submit">${r.report_day_map_r2_key ? "Remake map" : "Make map"}</button>
+              </form>
+              <form method="post" action="/admin/reports/${id}/lesson" class="inline" onsubmit="return confirm('Rebuild the lesson for this story? One AI call (~1 min), no re-research.')">
+                <button class="btn btn-sm" type="submit">${r.lesson_status ? "Remake lesson" : "Make lesson"}</button>
+              </form>
+              <form method="post" action="/admin/reports/${id}/lab" class="inline" onsubmit="return confirm('Rebuild the lab for this story? One AI call (~1–2 min). The lesson must exist first — the lab rehearses its pattern.')">
+                <button class="btn btn-sm" type="submit">${r.lab_status ? "Remake lab" : "Make lab"}</button>
+              </form>
+              <form method="post" action="/admin/reports/${id}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
+                <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+              </form>
+            </div>`;
           return `
-            <li class="py-5 px-1 flex items-start gap-3.5 border-b border-zee-border last:border-b-0">
-              <span class="activity-dot activity-dot--ok" aria-hidden="true">✓</span>
-              <div class="flex-1 min-w-0">
-                <a href="/report/${escapeHtml(r.report_id)}" class="text-sm font-medium text-zee-text block leading-snug">
-                  ${escapeHtml(r.report_title ?? "Untitled report")}
-                </a>
-                ${metaBlock}
-              </div>
-              <div class="shrink-0 flex flex-col items-end gap-2">
-                <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/day-map" class="inline" onsubmit="return confirm('Rebuild the map of the day for this story? One AI call (~1 min), no re-research.')">
-                  <button class="btn btn-sm" type="submit">${r.report_day_map_r2_key ? "Remake map" : "Make map"}</button>
-                </form>
-                <form method="post" action="/admin/reports/${escapeHtml(r.report_id)}/delete" class="inline" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
-                  <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-                </form>
+            <li class="py-6 px-1 border-b border-zee-border last:border-b-0">
+              <div class="flex items-start gap-3.5">
+                <span class="activity-dot activity-dot--ok mt-0.5" aria-hidden="true">✓</span>
+                <div class="flex-1 min-w-0">
+                  <a href="/report/${id}" class="text-base font-semibold text-zee-text block leading-snug no-underline hover:text-zee-primary transition-colors">
+                    ${escapeHtml(r.report_title ?? "Untitled report")}
+                  </a>
+                  <div class="mt-1.5 text-sm text-zee-muted">${lineRunParts.join(metaSep)}</div>
+                  <div class="mt-3 flex flex-wrap gap-2">${chips}</div>
+                  ${lineReportParts.length ? `<div class="mt-3 text-[13px] text-zee-muted leading-relaxed">${lineReportParts.join(metaSep)}</div>` : ""}
+                  ${funnelHtml ? `<div class="mt-1.5 text-[13px] text-zee-muted">${funnelHtml}</div>` : ""}
+                  ${actions}
+                </div>
               </div>
             </li>`;
         }
@@ -2231,8 +2271,8 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
           ? `Run failed at <code class="tt font-mono text-[rgb(180,60,60)]">${failedStep}</code>`
           : `Run failed`;
         return `
-          <li class="py-5 px-1 flex items-start gap-3.5 border-b border-zee-border last:border-b-0">
-            <span class="activity-dot activity-dot--err" aria-hidden="true">✕</span>
+          <li class="py-6 px-1 flex items-start gap-3.5 border-b border-zee-border last:border-b-0">
+            <span class="activity-dot activity-dot--err mt-0.5" aria-hidden="true">✕</span>
             <div class="flex-1 min-w-0">
               <div class="text-sm font-medium text-zee-text leading-snug">${titleLine}</div>
               ${metaBlock}
@@ -2269,6 +2309,22 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
     <div class="card" style="border-color:#C49A1A;background:rgba(196,154,26,0.08);">
       <p class="text-sm m-0" style="color:#8a6d12;">
         <strong>Map rebuilding.</strong> Regenerating the map of the day from the existing story — one AI call, no re-research, ~1 minute. Refresh this page shortly to see the new map.
+      </p>
+    </div>
+    ` : ""}
+
+    ${lessonQueued ? `
+    <div class="card" style="border-color:#C49A1A;background:rgba(196,154,26,0.08);">
+      <p class="text-sm m-0" style="color:#8a6d12;">
+        <strong>Lesson rebuilding.</strong> Regenerating the lesson from the existing briefing — one AI call, no re-research, ~1 minute. Refresh shortly; the <em>Lesson</em> chip on the report will turn green.
+      </p>
+    </div>
+    ` : ""}
+
+    ${labQueued ? `
+    <div class="card" style="border-color:#C49A1A;background:rgba(196,154,26,0.08);">
+      <p class="text-sm m-0" style="color:#8a6d12;">
+        <strong>Lab rebuilding.</strong> Regenerating the lab from the existing lesson — one AI call, ~1–2 minutes. Refresh shortly; the <em>Lab</em> chip on the report will turn green (or red if the model declined).
       </p>
     </div>
     ` : ""}
