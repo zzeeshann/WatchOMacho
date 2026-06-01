@@ -598,6 +598,17 @@ export async function findOrphanedR2(
     // sweep would delete every day-map on the next tick.
     if (r.day_map_r2_key) known.add(r.day_map_r2_key);
   }
+  // Edition pieces (lesson + lab, 2026-06-01) store their body/html in R2 as
+  // well, keyed in `edition_pieces.r2_key` — NOT in `reports`. They MUST be in
+  // the keep-set or the sweep deletes every lesson + lab blob as a false
+  // orphan (the day-map survives only because it sits in `reports`). This
+  // omission silently wiped all lesson/lab bodies → the lesson-404.
+  const pieceRows = await env.DB.prepare(
+    "SELECT r2_key FROM edition_pieces WHERE r2_key IS NOT NULL",
+  ).all<{ r2_key: string }>();
+  for (const p of pieceRows.results ?? []) {
+    if (p.r2_key) known.add(p.r2_key);
+  }
 
   let scanned = 0;
   const orphans: string[] = [];
