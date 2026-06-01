@@ -45,15 +45,6 @@ export interface Env {
   // Manual runs schedule themselves into this DO's alarm handler (15-min wall
   // budget) instead of the HTTP context's 30-second `waitUntil` cap.
   RESEARCH_RUNNER: DurableObjectNamespace<ResearchRunner>;
-
-  // ─── Daylila lesson webhook (2026-05-30) ───────────────────────────────────
-  // When a briefing publishes, fire a webhook to Daylila so it can turn the
-  // briefing into a Lesson + Lab — the briefing's other companion, the mirror
-  // of the day-map. Both set via `wrangler secret put`. Unset = webhook off
-  // (fireDaylilaWebhook no-ops). DAYLILA_WEBHOOK_SECRET must match Daylila's
-  // BRIEFING_WEBHOOK_SECRET. See the daylila repo: shared/webhook-spec.md.
-  DAYLILA_WEBHOOK_URL?: string;        // e.g. https://daylila.com/api/webhooks/briefing
-  DAYLILA_WEBHOOK_SECRET?: string;
 }
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -2549,32 +2540,6 @@ async function reapStalledRun(env: Env, now: number): Promise<void> {
  *  ResearchRunner DO alarm can enforce a max_run_seconds ceiling — when the
  *  signal fires, in-flight fetches throw `AbortError` and the catch block
  *  records the run as errored with the originating step tagged. */
-/**
- * Fire-and-forget webhook to Daylila when a briefing publishes. Daylila
- * turns each briefing into a Lesson + Lab (the mirror of how each briefing
- * gets a day-map). Best-effort: a webhook failure NEVER affects the
- * briefing. Daylila fetches the full briefing itself via /api/reports/:id,
- * so we send only the id + a little context. See the daylila repo:
- * shared/webhook-spec.md.
- */
-async function fireDaylilaWebhook(
-  env: Env,
-  payload: { briefing_id: string; target_slug: string; date: string; title: string },
-  signal?: AbortSignal,
-): Promise<void> {
-  if (!env.DAYLILA_WEBHOOK_URL || !env.DAYLILA_WEBHOOK_SECRET) return;
-  const res = await fetch(env.DAYLILA_WEBHOOK_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Webhook-Secret": env.DAYLILA_WEBHOOK_SECRET,
-    },
-    body: JSON.stringify(payload),
-    signal,
-  });
-  if (!res.ok) console.warn(`fireDaylilaWebhook: daylila returned ${res.status}`);
-}
-
 export async function runResearch(
   env: Env,
   target: Target,
@@ -2801,25 +2766,12 @@ export async function runResearch(
       console.error(`runResearch[${runId}] lab step failed (non-fatal):`, labErr);
     }
 
-    // Notify Daylila the edition is ready so it can purge any cached read.
-    // Daylila no longer generates anything — it pulls the whole edition
-    // (briefing + map + lesson + lab) from /api/reports/:id and renders.
-    // Best-effort, non-blocking; fires on BOTH cron and manual paths.
-    try {
-      await fireDaylilaWebhook(
-        env,
-        {
-          briefing_id: reportId,
-          target_slug: target.slug,
-          date: new Date(created).toISOString().slice(0, 10),
-          title,
-        },
-        signal,
-      );
-    } catch (whErr) {
-      console.error(`runResearch[${runId}] daylila webhook failed (non-fatal):`, whErr);
-    }
-
+    // Daylila reads the whole edition (briefing + map + lesson + lab) from
+    // /api/reports/:id on demand and renders it — there is nothing to notify.
+    // The old fireDaylilaWebhook ping was removed 2026-06-01: it kicked
+    // Daylila's legacy agents worker into RE-generating the lesson + lab, so
+    // leaving it fired caused a double-generation once WatchOMacho took over
+    // edition creation. WatchOMacho is now the sole creator.
     return (await getReportById(env, reportId))!;
   } catch (err: any) {
     // Tag the error with the step we failed at, so Activity can render
