@@ -128,3 +128,33 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_ts ON login_attempts(ip, ts);
+
+-- edition_pieces (v15, 2026-06-01) — generic per-piece store for everything
+-- WatchOMacho creates beyond the briefing + day-map: the LESSON (the "why")
+-- and the LAB (rehearse-the-decision HTML). One row per (report, kind); a new
+-- piece-type is a new `kind` value, never a schema change. Body lives in R2
+-- (lessons/*.md, labs/*.html — like reports.r2_key + day-maps); metadata +
+-- per-piece status/error live here so a single failed piece is visible and
+-- re-runnable (makeLesson/makeLab) without rebuilding the whole edition.
+-- Daylila reads these via /api/reports/:id and renders — it generates nothing.
+CREATE TABLE IF NOT EXISTS edition_pieces (
+  id          TEXT PRIMARY KEY,
+  report_id   TEXT NOT NULL,              -- reports.id this edition is built on
+  target_id   TEXT,                       -- denormalised for target-scoped queries
+  kind        TEXT NOT NULL,              -- 'lesson' | 'lab' | <future>
+  title       TEXT,                       -- lesson headline / lab title
+  summary     TEXT,                       -- lesson lede / lab concept
+  slug        TEXT,                       -- url slug
+  r2_key      TEXT,                       -- body in R2 (lessons/...md, labs/...html)
+  word_count  INTEGER,                    -- lessons
+  meta_json   TEXT,                       -- per-kind forward-proof extras
+  status      TEXT NOT NULL DEFAULT 'ok', -- 'ok' | 'failed'
+  error       TEXT,                       -- last failure reason
+  chat_model  TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE(report_id, kind)                 -- regen UPSERTs the same (report, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edition_pieces_report ON edition_pieces(report_id);
+CREATE INDEX IF NOT EXISTS idx_edition_pieces_target_kind ON edition_pieces(target_id, kind, created_at);

@@ -16,6 +16,7 @@ import {
   gcOrphanedR2,
   getChatModel,
   getDailyUsage,
+  getEditionPieces,
   getReportById,
   getReportByDateSlug,
   reportUrlParts,
@@ -418,8 +419,28 @@ export default {
               ORDER BY reports.created_at DESC
               LIMIT ?`,
           ).bind(limit).all<any>();
+          // Edition pieces per report (2026-06-01) so the archive + the
+          // homepage spine render the whole edition (lesson headline + lede,
+          // lab title + concept) from this ONE call — no per-/:id fetch for
+          // the list view. Cheap: edition_pieces already has title/summary/slug.
+          const reportIds = (rows.results ?? []).map((r) => r.id);
+          const piecesByReport = new Map<string, Map<string, { title: string | null; summary: string | null; slug: string | null }>>();
+          if (reportIds.length) {
+            const ph = reportIds.map(() => "?").join(",");
+            const ep = await env.DB.prepare(
+              `SELECT report_id, kind, title, summary, slug FROM edition_pieces
+                 WHERE status = 'ok' AND r2_key IS NOT NULL AND report_id IN (${ph})`,
+            ).bind(...reportIds).all<{ report_id: string; kind: string; title: string | null; summary: string | null; slug: string | null }>();
+            for (const row of ep.results ?? []) {
+              if (!piecesByReport.has(row.report_id)) piecesByReport.set(row.report_id, new Map());
+              piecesByReport.get(row.report_id)!.set(row.kind, { title: row.title, summary: row.summary, slug: row.slug });
+            }
+          }
           const items = (rows.results ?? []).map((r) => {
             const parts = reportUrlParts({ id: r.id, created_at: r.created_at, title: r.title });
+            const pieces = piecesByReport.get(r.id);
+            const lessonPiece = pieces?.get("lesson") ?? null;
+            const labPiece = pieces?.get("lab") ?? null;
             return {
             id: r.id,
             title: r.title,
@@ -444,6 +465,17 @@ export default {
             // for the HTML itself).
             day_map: r.day_map_r2_key
               ? { slug: r.day_map_slug, url: `${origin}/day-map/${parts.date}/${parts.slug}` }
+              : null,
+            // Edition-piece presence + light metadata (2026-06-01). Daylila's
+            // archive + homepage spine render lesson headline/lede + lab
+            // title/concept from here; full body/html via /:id.
+            has_lesson: !!lessonPiece,
+            has_lab: !!labPiece,
+            lesson: lessonPiece
+              ? { headline: lessonPiece.title, lede: lessonPiece.summary, slug: lessonPiece.slug }
+              : null,
+            lab: labPiece
+              ? { title: labPiece.title, concept: labPiece.summary, slug: labPiece.slug }
               : null,
           };
           });
@@ -495,6 +527,40 @@ export default {
               }
             } catch { /* corrupted JSON — return [] */ }
           }
+          // The rest of the edition (2026-06-01): lesson + lab, both created
+          // here now. Daylila reads + renders, generates nothing. Lesson body
+          // is markdown (Daylila renders it); lab is a self-contained HTML doc
+          // (Daylila drops `html` into a sandboxed srcdoc iframe, same wall as
+          // the day-map). Each is null when absent or failed-without-a-body.
+          const pieces = await getEditionPieces(env, report.id);
+          const lessonRow = pieces.find((p) => p.kind === "lesson" && p.status === "ok" && p.r2_key);
+          const labRow = pieces.find((p) => p.kind === "lab" && p.status === "ok" && p.r2_key);
+          let lesson:
+            | { headline: string; lede: string | null; body_markdown: string | null; word_count: number | null; slug: string | null }
+            | null = null;
+          if (lessonRow) {
+            const lObj = await env.REPORTS.get(lessonRow.r2_key!);
+            lesson = {
+              headline: lessonRow.title ?? report.title,
+              lede: lessonRow.summary,
+              body_markdown: lObj ? await lObj.text() : null,
+              word_count: lessonRow.word_count,
+              slug: lessonRow.slug,
+            };
+          }
+          let lab:
+            | { type: "html"; title: string | null; concept: string | null; slug: string | null; html: string | null }
+            | null = null;
+          if (labRow) {
+            const labObj = await env.REPORTS.get(labRow.r2_key!);
+            lab = {
+              type: "html",
+              title: labRow.title,
+              concept: labRow.summary,
+              slug: labRow.slug,
+              html: labObj ? await labObj.text() : null,
+            };
+          }
           const origin = new URL(req.url).origin;
           return json({
             id: report.id,
@@ -510,6 +576,8 @@ export default {
             body_markdown: bodyMarkdown,
             sources,
             day_map,
+            lesson,
+            lab,
           });
         }
 
@@ -773,6 +841,29 @@ export default {
         const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(`day-map:${id}`));
         await stub.scheduleDayMapRun(target.slug, id);
         return redirect(`/admin/targets/${target.slug}?daymap=1`);
+      }
+
+      // Reports: regenerate ONE edition piece — lesson or lab — for a report,
+      // independently (2026-06-01). Modular: a failed/poor lesson or lab gets
+      // remade with one AI call, no re-research, no touching the other pieces.
+      // Same DO-budget posture as the day-map regen; keyed `lesson:<id>` /
+      // `lab:<id>` so a piece regen never collides with a "Run Now" job slot.
+      // (The lab regen needs the lesson to already exist — it rehearses the
+      // lesson's pattern; makeLab records a failure cleanly if it's missing.)
+      {
+        const pieceMatch = path.match(/^\/admin\/reports\/([a-z0-9-]+)\/(lesson|lab)$/);
+        if (pieceMatch && req.method === "POST") {
+          if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
+          const id = pieceMatch[1];
+          const piece = pieceMatch[2] as "lesson" | "lab";
+          const report = await getReportById(env, id);
+          if (!report) return redirect(req.headers.get("referer") || "/admin");
+          const target = await getTargetById(env, report.target_id);
+          if (!target) return redirect("/admin");
+          const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(`${piece}:${id}`));
+          await stub.schedulePieceRun(piece, id);
+          return redirect(`/admin/targets/${target.slug}?${piece}=1`);
+        }
       }
 
       // Skills: create / update / delete

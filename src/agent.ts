@@ -16,6 +16,8 @@ import {
   TOOLS,
   type TavilySearchOptions,
 } from "./apis";
+import { VOICE_CONTRACT, LESSON_CONTRACT, LAB_CONTRACT } from "./contracts";
+import { validateLab } from "./lab-validator";
 
 export interface Env {
   AI: Ai;
@@ -43,6 +45,15 @@ export interface Env {
   // Manual runs schedule themselves into this DO's alarm handler (15-min wall
   // budget) instead of the HTTP context's 30-second `waitUntil` cap.
   RESEARCH_RUNNER: DurableObjectNamespace<ResearchRunner>;
+
+  // ─── Daylila lesson webhook (2026-05-30) ───────────────────────────────────
+  // When a briefing publishes, fire a webhook to Daylila so it can turn the
+  // briefing into a Lesson + Lab — the briefing's other companion, the mirror
+  // of the day-map. Both set via `wrangler secret put`. Unset = webhook off
+  // (fireDaylilaWebhook no-ops). DAYLILA_WEBHOOK_SECRET must match Daylila's
+  // BRIEFING_WEBHOOK_SECRET. See the daylila repo: shared/webhook-spec.md.
+  DAYLILA_WEBHOOK_URL?: string;        // e.g. https://daylila.com/api/webhooks/briefing
+  DAYLILA_WEBHOOK_SECRET?: string;
 }
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -2084,6 +2095,358 @@ export async function regenerateDayMap(
   return true;
 }
 
+// ─── Edition pieces: lesson + lab (the briefing's companions) ──────────────
+//
+// WatchOMacho creates the WHOLE edition now (2026-06-01): briefing + day-map
+// (above) + lesson + lab. Lesson + lab live in the generic `edition_pieces`
+// table keyed by (report_id, kind) — a new piece-type is a new `kind`, never a
+// migration. Body in R2 (like reports.r2_key + day-maps), metadata + status
+// here. Each generator is best-effort + independently re-runnable (mirrors
+// makeDayMap / regenerateDayMap) so one failed piece never blocks the rest.
+
+export interface EditionPiece {
+  id: string;
+  report_id: string;
+  target_id: string | null;
+  kind: string;
+  title: string | null;
+  summary: string | null;
+  slug: string | null;
+  r2_key: string | null;
+  word_count: number | null;
+  meta_json: string | null;
+  status: string;
+  error: string | null;
+  chat_model: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/** All edition pieces for a report (lesson, lab, future kinds). */
+export async function getEditionPieces(env: Env, reportId: string): Promise<EditionPiece[]> {
+  const rows = await env.DB.prepare(
+    "SELECT * FROM edition_pieces WHERE report_id = ?",
+  )
+    .bind(reportId)
+    .all<EditionPiece>();
+  return rows.results ?? [];
+}
+
+/** One edition piece by (report, kind), or null. */
+export async function getEditionPiece(
+  env: Env,
+  reportId: string,
+  kind: string,
+): Promise<EditionPiece | null> {
+  return env.DB.prepare(
+    "SELECT * FROM edition_pieces WHERE report_id = ? AND kind = ?",
+  )
+    .bind(reportId, kind)
+    .first<EditionPiece>();
+}
+
+/** Write a successful piece. UPSERT on (report_id, kind) — regeneration
+ *  overwrites the same row, clearing any prior failure. */
+async function upsertEditionPiece(
+  env: Env,
+  p: {
+    reportId: string;
+    targetId: string | null;
+    kind: string;
+    title: string;
+    summary: string | null;
+    slug: string;
+    r2Key: string;
+    wordCount?: number | null;
+    metaJson?: string | null;
+    chatModel: string;
+  },
+): Promise<void> {
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO edition_pieces
+       (id, report_id, target_id, kind, title, summary, slug, r2_key, word_count, meta_json, status, error, chat_model, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?, ?, ?)
+     ON CONFLICT(report_id, kind) DO UPDATE SET
+       title = excluded.title, summary = excluded.summary, slug = excluded.slug,
+       r2_key = excluded.r2_key, word_count = excluded.word_count, meta_json = excluded.meta_json,
+       status = 'ok', error = NULL, chat_model = excluded.chat_model, updated_at = excluded.updated_at`,
+  )
+    .bind(
+      uid(), p.reportId, p.targetId, p.kind, p.title, p.summary, p.slug,
+      p.r2Key, p.wordCount ?? null, p.metaJson ?? null, p.chatModel, now, now,
+    )
+    .run();
+}
+
+/** Mark a piece failed. If a good row (with r2_key) already exists, keep its
+ *  body + 'ok' status but record the latest error — a regen that fails leaves
+ *  the previously-working piece serving. Only a piece that never produced a
+ *  body shows status='failed'. */
+async function recordEditionPieceFailure(
+  env: Env,
+  reportId: string,
+  targetId: string | null,
+  kind: string,
+  msg: string,
+): Promise<void> {
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO edition_pieces (id, report_id, target_id, kind, status, error, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)
+     ON CONFLICT(report_id, kind) DO UPDATE SET
+       error = excluded.error,
+       updated_at = excluded.updated_at,
+       status = CASE WHEN edition_pieces.r2_key IS NULL THEN 'failed' ELSE edition_pieces.status END`,
+  )
+    .bind(uid(), reportId, targetId, kind, msg.slice(0, 500), now, now)
+    .run();
+}
+
+// ── Lesson ─────────────────────────────────────────────────────────────────
+
+/** Split the lesson's own `# headline` + `> lede` off the model output; the
+ *  rest is the markdown body (starting at the first `## ` beat). Mirrors
+ *  Daylila's splitHeadlineAndSummary — single-`#` headline only (so `## `
+ *  beats aren't matched), optional `> ` lede line right after. Either part
+ *  may be absent (→ null), in which case the caller falls back to the
+ *  briefing title / summary. */
+function splitLessonHeadlineLede(text: string): {
+  headline: string | null;
+  lede: string | null;
+  body: string;
+} {
+  const lines = text.trim().split("\n");
+  let i = 0;
+  while (i < lines.length && lines[i].trim().length === 0) i++;
+  const first = (lines[i] ?? "").trim();
+  const hm = first.match(/^#\s+(.+)$/);
+  if (!hm) return { headline: null, lede: null, body: text.trim() };
+  const headline = hm[1].trim();
+  let j = i + 1;
+  while (j < lines.length && lines[j].trim().length === 0) j++;
+  const lm = (lines[j] ?? "").trim().match(/^>\s+(.+)$/);
+  if (lm) {
+    return { headline, lede: lm[1].trim(), body: lines.slice(j + 1).join("\n").trim() };
+  }
+  return { headline, lede: null, body: lines.slice(i + 1).join("\n").trim() };
+}
+
+function buildLessonUserPrompt(title: string, briefingBody: string): string {
+  return `Today's world-news briefing. Re-explain it as a Daylila lesson — the human / system / psychological "why" behind these events, the pattern the reader can carry forward. Ground everything in the briefing below; invent nothing.
+
+BRIEFING TITLE: ${title}
+
+--- BRIEFING BODY ---
+${briefingBody}
+--- END BRIEFING BODY ---`;
+}
+
+/** Generate + persist the lesson for a just-written briefing. Best-effort:
+ *  never throws — the briefing is already saved. Stores the lesson markdown
+ *  in R2 and the metadata in edition_pieces (kind='lesson'). */
+export async function makeLesson(
+  env: Env,
+  report: { id: string; target_id: string | null; created_at: number; title: string },
+  briefingBody: string,
+  model: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    const res = await runChat(
+      env,
+      model,
+      {
+        messages: [
+          { role: "system", content: `${LESSON_CONTRACT}\n\n---\n\n# Voice (non-negotiable, applies to every word)\n\n${VOICE_CONTRACT}` },
+          { role: "user", content: buildLessonUserPrompt(report.title, briefingBody) },
+        ],
+        max_tokens: 8000,
+      },
+      signal,
+    );
+    const { headline, lede, body } = splitLessonHeadlineLede(res.response);
+    if (body.trim().length < 200) {
+      throw new Error("lesson output empty or too short");
+    }
+    const finalHeadline = headline ?? report.title;
+    const r2Key = `lessons/${report.created_at}-${report.id}.md`;
+    await env.REPORTS.put(r2Key, body, {
+      httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+    });
+    const wordCount = body.split(/\s+/).filter(Boolean).length;
+    await upsertEditionPiece(env, {
+      reportId: report.id,
+      targetId: report.target_id,
+      kind: "lesson",
+      title: finalHeadline,
+      summary: lede,
+      slug: slugify(finalHeadline) || "lesson",
+      r2Key,
+      wordCount,
+      chatModel: model,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    console.error("makeLesson failed", report.id, msg);
+    await recordEditionPieceFailure(env, report.id, report.target_id, "lesson", msg).catch(() => {});
+  }
+}
+
+/** Regenerate ONLY the lesson for an existing report — no research, no
+ *  re-write of the briefing. Re-reads the stored briefing body from R2 and
+ *  reruns the lesson LLM call. Powers the admin "Remake lesson" button +
+ *  modular regen. Returns false if the report/body can't be loaded. */
+export async function regenerateLesson(
+  env: Env,
+  reportId: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const report = await getReportById(env, reportId);
+  if (!report) return false;
+  const obj = await env.REPORTS.get(report.r2_key);
+  if (!obj) return false;
+  // The stored .md is `# {title}\n\n{body}` — strip the leading H1 so the
+  // lesson prompt gets the briefing prose, the same shape runResearch passes.
+  const raw = await obj.text();
+  const briefingBody = raw.replace(/^#\s+.*\n+/, "").trim();
+  const model = await getChatModel(env);
+  await makeLesson(
+    env,
+    { id: report.id, target_id: report.target_id, created_at: report.created_at, title: report.title },
+    briefingBody,
+    model,
+    signal,
+  );
+  return true;
+}
+
+// ── Lab ──────────────────────────────────────────────────────────────────
+
+/** Parse the trailing `<!-- LAB ... -->` comment the lab contract requires.
+ *  Returns 'decline' for `<!-- LAB DECLINE -->`, {title, concept} for a
+ *  populated comment, or null when absent (caller falls back to <title>). */
+function parseLabMeta(raw: string): "decline" | { title: string; concept: string } | null {
+  if (/<!--\s*LAB\s+DECLINE\s*-->/i.test(raw)) return "decline";
+  const m = raw.match(/<!--\s*LAB\s+title=([^|]+?)\s*\|\s*concept=([\s\S]+?)\s*-->/i);
+  if (!m) return null;
+  const title = m[1].trim();
+  const concept = m[2].trim();
+  if (!title || !concept) return null;
+  return { title, concept };
+}
+
+/** Fallback title from a <title> tag when the LAB comment is missing. */
+function titleFromHtml(html: string): string {
+  const m = html.match(/<title>([\s\S]*?)<\/title>/i);
+  return m ? m[1].replace(/\s+/g, " ").trim() : "Today's lab";
+}
+
+function buildLabUserPrompt(lessonHeadline: string, lessonBody: string): string {
+  return `## Today's lesson — build the lab's rehearsal from the pattern it teaches
+Lesson headline: "${lessonHeadline}"
+
+### Lesson body
+${lessonBody}
+
+Build the lab now: a single self-contained HTML document where the reader rehearses the decision this lesson's pattern is about. Output ONLY the HTML document, then the trailing <!-- LAB title=... | concept=... --> line.`;
+}
+
+/** Generate + persist the lab for a report whose lesson already exists. Reads
+ *  the stored lesson from edition_pieces → R2, runs one LLM call for a
+ *  self-contained HTML doc (raw HTML, like the day-map — NOT a JSON envelope,
+ *  so no missing-quote parse-fail class), validates sandbox-safety, and
+ *  stores it. Best-effort: never throws. A clean decline (no decision to
+ *  rehearse) records status='failed' with a 'declined' note — no lab that day. */
+export async function makeLab(
+  env: Env,
+  report: { id: string; target_id: string | null; created_at: number },
+  model: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    const lesson = await getEditionPiece(env, report.id, "lesson");
+    if (!lesson || !lesson.r2_key) {
+      throw new Error("no lesson body to build the lab from");
+    }
+    const lessonObj = await env.REPORTS.get(lesson.r2_key);
+    if (!lessonObj) throw new Error("lesson R2 object missing");
+    const lessonBody = await lessonObj.text();
+
+    const res = await runChat(
+      env,
+      model,
+      {
+        messages: [
+          { role: "system", content: `${LAB_CONTRACT}\n\n---\n\n# Voice (non-negotiable, every text surface inside the iframe)\n\n${VOICE_CONTRACT}` },
+          { role: "user", content: buildLabUserPrompt(lesson.title ?? "Today's lesson", lessonBody) },
+        ],
+        max_tokens: 16000,
+      },
+      signal,
+    );
+
+    const meta = parseLabMeta(res.response);
+    if (meta === "decline") {
+      await recordEditionPieceFailure(env, report.id, report.target_id, "lab", "declined: no decision to rehearse");
+      return;
+    }
+
+    const doc = extractHtmlDoc(res.response);
+    if (!doc || !looksLikeHtmlDoc(doc)) {
+      throw new Error("lab output not a usable HTML document");
+    }
+    const validation = validateLab(doc);
+    if (!validation.passed) {
+      throw new Error(
+        "lab validator failed: " +
+          validation.violations.map((v) => `[${v.rule}] ${v.message}`).join(" | "),
+      );
+    }
+
+    const title = meta?.title ?? titleFromHtml(doc);
+    const concept = meta?.concept ?? null;
+    const r2Key = `labs/${report.created_at}-${report.id}.html`;
+    await env.REPORTS.put(r2Key, doc, {
+      httpMetadata: { contentType: "text/html; charset=utf-8" },
+    });
+    await upsertEditionPiece(env, {
+      reportId: report.id,
+      targetId: report.target_id,
+      kind: "lab",
+      title,
+      summary: concept,
+      slug: slugify(title) || "lab",
+      r2Key,
+      chatModel: model,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    console.error("makeLab failed", report.id, msg);
+    await recordEditionPieceFailure(env, report.id, report.target_id, "lab", msg).catch(() => {});
+  }
+}
+
+/** Regenerate ONLY the lab for an existing report (its lesson must already
+ *  exist). Powers the admin "Remake lab" button + modular regen. Returns
+ *  false if the report can't be loaded. */
+export async function regenerateLab(
+  env: Env,
+  reportId: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const report = await getReportById(env, reportId);
+  if (!report) return false;
+  const model = await getChatModel(env);
+  await makeLab(
+    env,
+    { id: report.id, target_id: report.target_id, created_at: report.created_at },
+    model,
+    signal,
+  );
+  return true;
+}
+
 /** Pipeline step labels used by runResearch's step-boundary breadcrumb.
  *  These flow into both the live `last_run_attempt` setting (so admin can
  *  see "in-flight at step X") and the `runs.error` text (so completed
@@ -2186,6 +2549,32 @@ async function reapStalledRun(env: Env, now: number): Promise<void> {
  *  ResearchRunner DO alarm can enforce a max_run_seconds ceiling — when the
  *  signal fires, in-flight fetches throw `AbortError` and the catch block
  *  records the run as errored with the originating step tagged. */
+/**
+ * Fire-and-forget webhook to Daylila when a briefing publishes. Daylila
+ * turns each briefing into a Lesson + Lab (the mirror of how each briefing
+ * gets a day-map). Best-effort: a webhook failure NEVER affects the
+ * briefing. Daylila fetches the full briefing itself via /api/reports/:id,
+ * so we send only the id + a little context. See the daylila repo:
+ * shared/webhook-spec.md.
+ */
+async function fireDaylilaWebhook(
+  env: Env,
+  payload: { briefing_id: string; target_slug: string; date: string; title: string },
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!env.DAYLILA_WEBHOOK_URL || !env.DAYLILA_WEBHOOK_SECRET) return;
+  const res = await fetch(env.DAYLILA_WEBHOOK_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": env.DAYLILA_WEBHOOK_SECRET,
+    },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) console.warn(`fireDaylilaWebhook: daylila returned ${res.status}`);
+}
+
 export async function runResearch(
   env: Env,
   target: Target,
@@ -2384,6 +2773,53 @@ export async function runResearch(
       console.error(`runResearch[${runId}] day-map step failed (non-fatal):`, dayMapErr);
     }
 
+    // The rest of the edition: lesson (the "why") + lab (rehearse the decision).
+    // WatchOMacho creates the WHOLE edition now (2026-06-01) — Daylila reads +
+    // renders, generates nothing. Both best-effort + never throw, so they can't
+    // roll back the briefing. The lab depends on the lesson (it rehearses the
+    // lesson's pattern), so lesson runs first. Each is independently
+    // re-runnable from admin if it fails (regenerateLesson / regenerateLab).
+    try {
+      await makeLesson(
+        env,
+        { id: reportId, target_id: target.id, created_at: created, title },
+        body,
+        chatModel,
+        signal,
+      );
+    } catch (lessonErr) {
+      console.error(`runResearch[${runId}] lesson step failed (non-fatal):`, lessonErr);
+    }
+    try {
+      await makeLab(
+        env,
+        { id: reportId, target_id: target.id, created_at: created },
+        chatModel,
+        signal,
+      );
+    } catch (labErr) {
+      console.error(`runResearch[${runId}] lab step failed (non-fatal):`, labErr);
+    }
+
+    // Notify Daylila the edition is ready so it can purge any cached read.
+    // Daylila no longer generates anything — it pulls the whole edition
+    // (briefing + map + lesson + lab) from /api/reports/:id and renders.
+    // Best-effort, non-blocking; fires on BOTH cron and manual paths.
+    try {
+      await fireDaylilaWebhook(
+        env,
+        {
+          briefing_id: reportId,
+          target_slug: target.slug,
+          date: new Date(created).toISOString().slice(0, 10),
+          title,
+        },
+        signal,
+      );
+    } catch (whErr) {
+      console.error(`runResearch[${runId}] daylila webhook failed (non-fatal):`, whErr);
+    }
+
     return (await getReportById(env, reportId))!;
   } catch (err: any) {
     // Tag the error with the step we failed at, so Activity can render
@@ -2463,26 +2899,27 @@ export async function cronTick(env: Env): Promise<{ processed: number; skipped: 
 
   let processed = 0, skipped = 0, errors = 0;
 
+  // Route each due target through its ResearchRunner DO (keyed by slug)
+  // rather than running runResearch inline here. The edition is now FOUR
+  // serial LLM calls (writer + day-map + lesson + lab), ~3–4 min — well past
+  // the 30s scheduled() waitUntil cap. The DO alarm gives a 15-min budget AND
+  // wraps the run in the max_run_seconds AbortController, so a hung call
+  // auto-aborts instead of burning the whole budget. Enqueue + return; the
+  // alarm advances the target's next_run_at on success (same as "Run Now").
+  // Per-target budget is still checked inside each runResearch (throws
+  // BudgetExceeded → recorded on the run row), so we don't pre-check here.
   for (const target of due.results ?? []) {
     if (!target.primary_skill_id) {
       skipped++;
       continue;
     }
-    const skill = await getSkillById(env, target.primary_skill_id);
-    if (!skill) {
-      skipped++;
-      continue;
-    }
     try {
-      await runResearch(env, target, skill, "cron");
+      const stub = env.RESEARCH_RUNNER.get(env.RESEARCH_RUNNER.idFromName(target.slug));
+      await stub.scheduleManualRun(target.slug, "cron");
       processed++;
     } catch (e: any) {
-      if (e instanceof BudgetExceeded) {
-        console.warn("cronTick: daily budget exhausted, stopping");
-        break;
-      }
       errors++;
-      console.error("cron run failed", target.slug, e);
+      console.error("cron enqueue failed", target.slug, e);
     }
   }
 
@@ -2534,16 +2971,34 @@ export async function cronTick(env: Env): Promise<{ processed: number; skipped: 
 // wrangler.toml via `new_sqlite_classes`). Storage is tiny (one row per
 // pending job, deleted on completion).
 export class ResearchRunner extends DurableObject<Env> {
-  /** Called from the HTTP route. Records the pending job and sets a 1s
-   *  alarm; returns immediately so the route can redirect the user. */
-  async scheduleManualRun(targetSlug: string): Promise<void> {
+  /** Called from the HTTP route (manual "Run Now") AND from cronTick. Records
+   *  the pending job and sets a 1s alarm; returns immediately. `triggeredBy`
+   *  defaults to "manual" so the existing call sites are unchanged; cronTick
+   *  passes "cron" so the whole edition (briefing + map + lesson + lab) runs
+   *  inside the DO's 15-min budget + max_run_seconds AbortController ceiling
+   *  rather than inline under the 30s scheduled() waitUntil cap. */
+  async scheduleManualRun(targetSlug: string, triggeredBy: "manual" | "cron" = "manual"): Promise<void> {
     await this.ctx.storage.put("job", {
       kind: "full" as const,
       targetSlug,
-      triggeredBy: "manual" as const,
+      triggeredBy,
       scheduledAt: Date.now(),
     });
     // Fire effectively now. The 1s offset lets the DO settle before alarm.
+    await this.ctx.storage.setAlarm(Date.now() + 1000);
+  }
+
+  /** Regenerate ONE edition piece (lesson or lab) for an existing report —
+   *  no research, no briefing re-write. Mirrors scheduleDayMapRun; runs inside
+   *  the 15-min budget so the long generation can't be cut by the 30s cap.
+   *  Keyed by the caller as `lesson:<id>` / `lab:<id>` so a piece regen never
+   *  clobbers a target's full-run job slot. */
+  async schedulePieceRun(piece: "lesson" | "lab", reportId: string): Promise<void> {
+    await this.ctx.storage.put("job", {
+      kind: piece,
+      reportId,
+      scheduledAt: Date.now(),
+    });
     await this.ctx.storage.setAlarm(Date.now() + 1000);
   }
 
@@ -2568,14 +3023,19 @@ export class ResearchRunner extends DurableObject<Env> {
    *  `max_run_seconds` ceiling via an AbortController so a hung Tavily /
    *  Anthropic fetch can't burn the full 15 minutes (~115 GB-seconds). */
   async alarm(): Promise<void> {
-    const job = await this.ctx.storage.get<
-      | { kind?: "full"; targetSlug: string; triggeredBy: "manual"; scheduledAt: number }
+    type Job =
+      | { kind: "full"; targetSlug: string; triggeredBy: "manual" | "cron"; scheduledAt: number }
       | { kind: "day-map"; targetSlug: string; reportId: string; scheduledAt: number }
-    >("job");
-    if (!job) {
+      | { kind: "lesson" | "lab"; reportId: string; scheduledAt: number };
+    const rawJob = await this.ctx.storage.get<Record<string, unknown>>("job");
+    if (!rawJob) {
       console.warn("ResearchRunner alarm: no pending job; nothing to do");
       return;
     }
+    // Legacy jobs (pre-2026-06-01) were written without `kind`; treat a missing
+    // discriminant as a full run so an in-flight upgrade can't strand one.
+    if (!rawJob.kind) rawJob.kind = "full";
+    const job = rawJob as unknown as Job;
 
     // Read the configurable per-run ceiling (Run guardrails admin card).
     // 30–600s window: anything outside falls back to DEFAULT_MAX_RUN_SECONDS.
@@ -2591,9 +3051,10 @@ export class ResearchRunner extends DurableObject<Env> {
     // Anthropic). When the timer fires, in-flight fetches throw
     // `AbortError`; runResearch's catch records "<step>: AbortError" into
     // the runs table and surfaces it on the Activity card.
+    const jobLabel = job.kind === "full" ? job.targetSlug : `${job.kind}:${job.reportId}`;
     const controller = new AbortController();
     const timer = setTimeout(() => {
-      console.warn(`ResearchRunner alarm: max_run_seconds (${maxRunSeconds}s) exceeded for ${job.targetSlug}, aborting`);
+      console.warn(`ResearchRunner alarm: max_run_seconds (${maxRunSeconds}s) exceeded for ${jobLabel}, aborting`);
       controller.abort(new Error(`max_run_seconds (${maxRunSeconds}s) exceeded`));
     }, maxRunSeconds * 1000);
 
@@ -2604,7 +3065,18 @@ export class ResearchRunner extends DurableObject<Env> {
         console.log(`ResearchRunner alarm: regenerating day-map for report ${job.reportId} (max ${maxRunSeconds}s)`);
         const ok = await regenerateDayMap(this.env, job.reportId, controller.signal);
         if (!ok) console.error(`ResearchRunner alarm: could not load report ${job.reportId} for day-map regen`);
-      } else {
+      } else if (job.kind === "lesson") {
+        // Lesson-only regen — modular: re-runs ONE piece, not the edition.
+        console.log(`ResearchRunner alarm: regenerating lesson for report ${job.reportId} (max ${maxRunSeconds}s)`);
+        const ok = await regenerateLesson(this.env, job.reportId, controller.signal);
+        if (!ok) console.error(`ResearchRunner alarm: could not load report ${job.reportId} for lesson regen`);
+      } else if (job.kind === "lab") {
+        // Lab-only regen — modular: re-runs ONE piece. Needs the lesson to
+        // already exist (it rehearses the lesson's pattern).
+        console.log(`ResearchRunner alarm: regenerating lab for report ${job.reportId} (max ${maxRunSeconds}s)`);
+        const ok = await regenerateLab(this.env, job.reportId, controller.signal);
+        if (!ok) console.error(`ResearchRunner alarm: could not load report ${job.reportId} for lab regen`);
+      } else if (job.kind === "full") {
         const target = await getTargetBySlug(this.env, job.targetSlug);
         if (!target) {
           console.error(`ResearchRunner alarm: target not found: ${job.targetSlug}`);
