@@ -1336,7 +1336,7 @@ function renderHeartbeatCard({ lastCronRun, lastRunAttempt, last24hStats, recent
 
 export async function renderAdminPanel(env: Env): Promise<string> {
   const cutoff24h = Date.now() - 24 * 3600 * 1000;
-  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, embedLastOkStr, embedLastErrorRaw, totalReportsRow, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr, dayMapEnabledStr, dayMapLastOkStr, dayMapLastErrorRaw] = await Promise.all([
+  const [targets, skills, usage, reportLim, searchLim, perTick, currentChatModel, r2Stats, lastCronRunStr, lastRunAttemptRaw, last24hStats, recentRuns, maxCharsPerSourceStr, maxRunSecondsStr, writerMaxTokensStr, dayMapEnabledStr, dayMapLastOkStr, dayMapLastErrorRaw] = await Promise.all([
     listTargets(env),
     listSkills(env),
     getDailyUsage(env),
@@ -1348,9 +1348,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
       console.error("renderAdminPanel: findOrphanedR2 failed", e);
       return null;
     }),
-    getSetting(env, "embed_last_ok_at", "0"),
-    getSetting(env, "embed_last_error", ""),
-    env.DB.prepare("SELECT COUNT(*) AS n FROM reports").first<{ n: number }>(),
     getSetting(env, "last_cron_run", "0"),
     getSetting(env, "last_run_attempt", ""),
     env.DB.prepare(
@@ -1388,13 +1385,9 @@ export async function renderAdminPanel(env: Env): Promise<string> {
     const n = parseInt(writerMaxTokensStr, 10);
     return Number.isFinite(n) && n >= 200 && n <= 16000 ? n : 2200;
   })();
-  const embedLastOkAt = parseInt(embedLastOkStr, 10) || 0;
-  const embedLastError: { message: string; at: number; report_id?: string } | null =
-    embedLastErrorRaw ? (() => { try { return JSON.parse(embedLastErrorRaw); } catch { return null; } })() : null;
   const dayMapLastOkAt = parseInt(dayMapLastOkStr, 10) || 0;
   const dayMapLastError: { message: string; at: number; report_id?: string } | null =
     dayMapLastErrorRaw ? (() => { try { return JSON.parse(dayMapLastErrorRaw); } catch { return null; } })() : null;
-  const totalReports = totalReportsRow?.n ?? 0;
   const lastCronRun = parseInt(lastCronRunStr, 10) || 0;
   type GatherStats = { tavily_queries: number; tavily_raw: number; after_score_filter: number; after_url_dedupe: number; after_title_dedupe: number; final_kept: number; tavily_credits: number };
   type LastRunAttempt = { run_id: string; target_slug: string; triggered_by: "cron" | "manual"; started_at: number; last_step: string; completed_at: number | null; outcome: "in_flight" | "success" | "error"; error?: string; gather_stats?: GatherStats };
@@ -1523,37 +1516,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
 
       <div style="margin: 28px 0; border-top: 1px solid #D6CFC4;"></div>
 
-      <div class="label-muted mb-2">Recall memory (Vectorize)</div>
-      <div class="field-help" style="max-width: 64ch;">
-        Each report is turned into a 768-number "fingerprint" by an embedding model and stored in a Vectorize index. When the agent writes a new report it asks Vectorize <em>"what past reports are most similar?"</em> and uses the answer as "you've already covered…" context, so future reports build on past ones instead of repeating them. Embedding is best-effort — a failure here never blocks a report from being written, it just means that report won't be recall-able. The recalled reports also become inline [N] citations in the new report's body, marked with 📚 in the Sources footer.
-      </div>
-      <div class="field-help mt-2" style="max-width: 64ch;">
-        <span class="label-muted">Guardrails:</span>
-        layer last 2 same-target reports for continuity · query top 10 semantic hits ·
-        keep only similarity ≥ 0.65 · same-target first, cross-target as fallback ·
-        cap at 5 recalled per run.
-      </div>
-      <div class="label-muted mt-5 mb-2">Embedding status</div>
-      <div class="row items-baseline">
-        <div class="flex-1">
-          <div class="text-sm">
-            ${embedLastError
-              ? `<span class="text-[rgb(180,60,60)]">Last error: ${escapeHtml(embedLastError.message.slice(0, 90))}${embedLastError.message.length > 90 ? "…" : ""}</span>
-                 <span class="label-muted ml-2">${escapeHtml(timeAgo(embedLastError.at))}</span>`
-              : embedLastOkAt > 0
-                ? `<span class="text-zee-primary">Last successful embed</span> <span class="label-muted">${escapeHtml(timeAgo(embedLastOkAt))}</span>`
-                : `<span class="text-zee-muted">No embed attempted yet on this version.</span>`}
-          </div>
-          <div class="field-help mt-1">
-            ${totalReports} report${totalReports === 1 ? "" : "s"} in D1. Backfill re-embeds every report (idempotent) — safe to click anytime.
-          </div>
-        </div>
-        <div>
-          <button id="backfill-memory-btn" type="button" class="btn btn-secondary"${totalReports === 0 ? " disabled" : ""}>Backfill memory</button>
-          <div id="backfill-memory-result" class="field-help mt-1"></div>
-        </div>
-      </div>
-
       <div class="label-muted mt-5 mb-2">Day-map status</div>
       <div class="text-sm">
         ${dayMapLastError
@@ -1620,28 +1582,6 @@ export async function renderAdminPanel(env: Env): Promise<string> {
           }
           result.textContent = 'Processed ' + d.processed + ' · skipped ' + d.skipped + ' · errors ' + d.errors;
           setTimeout(() => location.reload(), 1200);
-        } catch (err) {
-          result.textContent = 'Failed: ' + (err && err.message || err);
-        } finally {
-          btn.disabled = false;
-        }
-      });
-
-      $('backfill-memory-btn')?.addEventListener('click', async () => {
-        const btn = $('backfill-memory-btn');
-        const result = $('backfill-memory-result');
-        btn.disabled = true;
-        result.textContent = 'Embedding…';
-        try {
-          const res = await fetch('/admin/memory/backfill', { method: 'POST' });
-          const d = await res.json();
-          if (!res.ok) {
-            result.textContent = d.error || ('HTTP ' + res.status);
-            return;
-          }
-          const failTail = d.failed ? ' · ' + d.failed + ' failed' : '';
-          result.textContent = 'Scanned ' + d.scanned + ' · embedded ' + d.embedded + failTail;
-          setTimeout(() => location.reload(), 1500);
         } catch (err) {
           result.textContent = 'Failed: ' + (err && err.message || err);
         } finally {
@@ -2238,7 +2178,7 @@ export async function renderAdminTargetEdit(env: Env, slug: string, queued = fal
               <form method="post" action="/admin/reports/${id}/lab" class="inline" onsubmit="return confirm('Rebuild the lab for this story? One AI call (~1–2 min). The lesson must exist first — the lab rehearses its pattern.')">
                 <button class="btn btn-sm" type="submit">${r.lab_status ? "Remake lab" : "Make lab"}</button>
               </form>
-              <form method="post" action="/admin/reports/${id}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this report? R2 file, recall vector, and this activity entry all go too.')">
+              <form method="post" action="/admin/reports/${id}/delete" class="inline ml-auto" onsubmit="return confirm('Delete this report? Its R2 files, edition pieces, and this activity entry all go too.')">
                 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
               </form>
             </div>`;

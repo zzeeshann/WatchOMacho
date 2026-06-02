@@ -8,7 +8,6 @@ import {
   cronTick,
   createSkillFromMarkdown,
   createTarget,
-  backfillMemory,
   countSkillUsage,
   deleteReport,
   deleteSkill,
@@ -809,7 +808,7 @@ export default {
         return redirect("/admin");
       }
 
-      // Reports: delete a single report (R2 + Vectorize + D1 row; run stays).
+      // Reports: delete a single report (R2 blobs + edition pieces + D1 rows).
       if (path.startsWith("/admin/reports/") && path.endsWith("/delete") && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
         const id = path.slice("/admin/reports/".length, path.length - "/delete".length);
@@ -1032,13 +1031,6 @@ export default {
       if (path === "/admin/storage/gc" && req.method === "POST") {
         if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
         const res = await gcOrphanedR2(env);
-        return json({ ok: true, ...res });
-      }
-
-      // Re-embed every report in D1 and upsert into Vectorize. Idempotent.
-      if (path === "/admin/memory/backfill" && req.method === "POST") {
-        if (!isAdmin(req, env)) return json({ error: "unauthorized" }, { status: 401 });
-        const res = await backfillMemory(env);
         return json({ ok: true, ...res });
       }
 

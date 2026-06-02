@@ -23,7 +23,6 @@ export interface Env {
   AI: Ai;
   DB: D1Database;
   REPORTS: R2Bucket;
-  MEMORY: VectorizeIndex;
   ADMIN_SECRET: string;
   /** Read-only API key for /api/reports/* endpoints. Set via:
    *    wrangler secret put WATCHOMACHO_API_KEY
@@ -46,8 +45,6 @@ export interface Env {
   // budget) instead of the HTTP context's 30-second `waitUntil` cap.
   RESEARCH_RUNNER: DurableObjectNamespace<ResearchRunner>;
 }
-
-const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
 
 // ─── chat model registry ──────────────────────────────────────────────────
 //
@@ -119,8 +116,7 @@ export async function dayMapEnabledForTarget(env: Env, target: Target): Promise<
 //   "anthropic/..."   → Anthropic Messages API via Cloudflare AI Gateway
 //
 // Returns a uniform { response: string } so call sites stay identical
-// regardless of provider. Embedding calls (EMBED_MODEL) keep using
-// env.AI.run directly — they're not chat.
+// regardless of provider.
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -648,126 +644,8 @@ export async function gcOrphanedR2(
   return { scanned, orphans: orphans.length, deleted, failures };
 }
 
-// ─── recall memory (Vectorize) ─────────────────────────────────────────────
-
-/** Shape required by `embedReport`. Keeps the helper agnostic to whether
- *  the report was just written (runResearch) or backfilled (from D1+R2). */
-export interface ReportForEmbed {
-  id: string;
-  target_id: string;
-  target_name: string;
-  target_slug: string;
-  skill_id: string | null;
-  skill_slug: string;
-  skill_name: string;
-  title: string;
-  snippet: string;
-  body: string;
-  created_at: number;
-}
-
-/** Embed a report and upsert it into Vectorize. Outcome is recorded to the
- *  settings table (`embed_last_ok_at` / `embed_last_error`) so the admin
- *  page can surface failures without anyone reading wrangler logs. Never
- *  throws — by design embedding is best-effort, so the caller can ignore
- *  the return value if it wants to. */
-export async function embedReport(
-  env: Env,
-  r: ReportForEmbed,
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  try {
-    const text = `${r.target_name}. ${r.skill_name}. ${r.body}`.slice(0, 2000);
-    const emb: any = await env.AI.run(EMBED_MODEL, { text: [text] });
-    const vec = emb?.data?.[0];
-    if (!vec || !Array.isArray(vec)) {
-      throw new Error("embedding model returned no vector");
-    }
-    await env.MEMORY.upsert([
-      {
-        id: r.id,
-        values: vec,
-        metadata: {
-          target_id: r.target_id,
-          target_name: r.target_name,
-          target_slug: r.target_slug,
-          skill_slug: r.skill_slug,
-          title: r.title,
-          snippet: r.snippet,
-          created_at: r.created_at,
-        },
-      },
-    ]);
-    await setSetting(env, "embed_last_ok_at", String(Date.now()));
-    await setSetting(env, "embed_last_error", "");
-    return { ok: true };
-  } catch (e: any) {
-    const msg = String(e?.message ?? e).slice(0, 500);
-    console.error("embedReport failed", r.id, msg);
-    await setSetting(
-      env,
-      "embed_last_error",
-      JSON.stringify({ message: msg, at: Date.now(), report_id: r.id }),
-    ).catch(() => {});
-    return { ok: false, error: msg };
-  }
-}
-
-/** Walk every report in D1, fetch the markdown from R2, and re-embed via
- *  `embedReport`. Idempotent — Vectorize upsert overwrites by id, so
- *  running this twice is harmless. Reports whose R2 blob is missing are
- *  counted as failures (the body is the embed input, so without it we
- *  can't produce a meaningful vector). */
-export async function backfillMemory(
-  env: Env,
-): Promise<{ scanned: number; embedded: number; failed: number; errors: string[] }> {
-  const rows = await env.DB.prepare(
-    `SELECT r.id, r.target_id, r.skill_id, r.title, r.snippet, r.r2_key, r.created_at,
-            t.name AS target_name, t.slug AS target_slug,
-            s.slug AS skill_slug, s.name AS skill_name
-       FROM reports r
-       LEFT JOIN targets t ON r.target_id = t.id
-       LEFT JOIN skills  s ON r.skill_id  = s.id
-       ORDER BY r.created_at DESC`,
-  ).all<any>();
-
-  let embedded = 0;
-  let failed = 0;
-  const errors: string[] = [];
-  const scanned = rows.results?.length ?? 0;
-
-  for (const r of rows.results ?? []) {
-    const obj = await env.REPORTS.get(r.r2_key);
-    if (!obj) {
-      failed++;
-      errors.push(`${r.id}: R2 blob missing`);
-      continue;
-    }
-    const body = await obj.text();
-    const res = await embedReport(env, {
-      id: r.id,
-      target_id: r.target_id,
-      target_name: r.target_name ?? "",
-      target_slug: r.target_slug ?? "",
-      skill_id: r.skill_id,
-      skill_slug: r.skill_slug ?? "",
-      skill_name: r.skill_name ?? "",
-      title: r.title,
-      snippet: r.snippet,
-      body,
-      created_at: r.created_at,
-    });
-    if (res.ok) embedded++;
-    else {
-      failed++;
-      errors.push(`${r.id}: ${res.error.slice(0, 120)}`);
-    }
-  }
-
-  return { scanned, embedded, failed, errors };
-}
-
-/** Delete a single report and everything attached to it: R2 blob, Vectorize
- *  entry, the reports row, and the matching runs row. The run row goes too
+/** Delete a single report and everything attached to it: R2 blobs, the
+ *  reports row, its edition pieces, and the matching runs row. The run row goes too
  *  because once the report is gone the run is just an unmoored "something
  *  ran" record with no payload to link to. */
 export async function deleteReport(env: Env, id: string): Promise<void> {
@@ -787,11 +665,6 @@ export async function deleteReport(env: Env, id: string): Promise<void> {
     } catch (e) {
       console.error("deleteReport: day-map R2 delete failed", row.day_map_r2_key, e);
     }
-  }
-  try {
-    await env.MEMORY.deleteByIds([id]);
-  } catch (e) {
-    console.error("deleteReport: Vectorize deleteByIds failed", e);
   }
   // Edition pieces (lesson + lab): R2 bodies AND D1 rows. Without this they leak
   // permanently — gcOrphanedR2 keeps any edition_pieces.r2_key in its keep-set,
@@ -832,11 +705,6 @@ export async function deleteTarget(env: Env, id: string): Promise<void> {
     }
   }
   if (ids.length > 0) {
-    try {
-      await env.MEMORY.deleteByIds(ids);
-    } catch (e) {
-      console.error("deleteTarget: Vectorize deleteByIds failed", e);
-    }
     // Edition pieces (lesson + lab) for every report of this target: R2 bodies
     // AND D1 rows. Same leak as deleteReport — orphaned edition_pieces rows pin
     // their R2 blobs in gcOrphanedR2's keep-set forever. Sweep by the report ids
@@ -1616,103 +1484,12 @@ async function gatherTavily(
   };
 }
 
-/** A past report surfaced by the recall layer. Both chronological "what
- *  did we last write on this target" hits and semantic "what topically
- *  related thing have we written anywhere" hits flow through this shape,
- *  so downstream code can treat them uniformly. */
-export interface RecalledReport {
-  id: string;
-  title: string;
-  snippet: string;
-  target_id: string;
-  target_name: string;
-  target_slug: string;
-  same_target: boolean;
-  age_days: number;
-  score: number; // similarity 0..1, or 1 for guaranteed-continuity recents
-}
-
-const RECALL_TOP_K = 10;
-const RECALL_SCORE_THRESHOLD = 0.65;
-const RECALL_MAX_KEPT = 5;
-const RECALL_MAX_SAME_TARGET_RECENT = 2;
-
-/** Step 4: build the recall context. Three sources, layered:
- *   1. Last 1-2 reports on THIS target via D1 (guaranteed continuity even
- *      if today's draft is semantically different from yesterday's).
- *   2. Vectorize top-K semantic hits filtered by similarity threshold,
- *      preferring same-target then cross-target, deduped against step 1.
- *   3. Hard cap at RECALL_MAX_KEPT total to control prompt size.
- *  Caller treats every hit identically — same source list, same citation
- *  numbering. Failures are best-effort; an empty result is fine. */
-async function recallMemory(
-  env: Env,
-  target: Target,
-  skill: Skill,
-): Promise<RecalledReport[]> {
-  const now = Date.now();
-  const ageDays = (ts: number) => Math.max(0, Math.floor((now - ts) / 86_400_000));
-
-  // 1. Chronological recents on this target (guaranteed continuity).
-  const recents = (await listReportsForTarget(env, target.id, RECALL_MAX_SAME_TARGET_RECENT))
-    .map<RecalledReport>((r) => ({
-      id: r.id,
-      title: r.title,
-      snippet: r.snippet,
-      target_id: target.id,
-      target_name: target.name,
-      target_slug: target.slug,
-      same_target: true,
-      age_days: ageDays(r.created_at),
-      score: 1,
-    }));
-  const seen = new Set<string>(recents.map((r) => r.id));
-
-  // 2. Semantic hits via Vectorize. Cast wide, filter by threshold, sort
-  //    same-target-first, dedupe against recents, cap.
-  let semantic: RecalledReport[] = [];
-  try {
-    const emb: any = await env.AI.run(EMBED_MODEL, {
-      text: [`${target.name}. ${skill.name}. ${target.description ?? ""}`.slice(0, 1000)],
-    });
-    const vec = emb?.data?.[0];
-    if (vec) {
-      const hits = await env.MEMORY.query(vec, { topK: RECALL_TOP_K, returnMetadata: "all" });
-      semantic = (hits.matches ?? [])
-        .filter((m: any) => m.score >= RECALL_SCORE_THRESHOLD)
-        .filter((m: any) => !seen.has(m.id))
-        .map<RecalledReport>((m: any) => ({
-          id: m.id,
-          title: String(m.metadata?.title ?? "Untitled"),
-          snippet: String(m.metadata?.snippet ?? ""),
-          target_id: String(m.metadata?.target_id ?? ""),
-          target_name: String(m.metadata?.target_name ?? "?"),
-          target_slug: String(m.metadata?.target_slug ?? ""),
-          same_target: m.metadata?.target_id === target.id,
-          age_days: m.metadata?.created_at ? ageDays(Number(m.metadata.created_at)) : 0,
-          score: Number(m.score),
-        }))
-        .sort((a, b) => {
-          // Same-target first; within each bucket, higher score first.
-          if (a.same_target !== b.same_target) return a.same_target ? -1 : 1;
-          return b.score - a.score;
-        });
-    }
-  } catch (e) {
-    console.error("recallMemory: semantic query failed", e);
-  }
-
-  return [...recents, ...semantic].slice(0, RECALL_MAX_KEPT);
-}
-
-/** Unified citation row passed to the writer. Web hits and recalled past
- *  reports share the same shape so the LLM cites both with one [N]
- *  numbering scheme — and the rendered report's Sources footer can render
- *  them side by side. `score` and `published_date` are optional metadata
- *  the writer uses to weight recency and confidence; they don't affect
- *  the rendered footer. */
+/** A web source passed to the writer for citation. The LLM cites each with
+ *  an [N] number that the rendered report's Sources footer mirrors. `score`
+ *  and `published_date` are optional metadata the writer uses to weight
+ *  recency and confidence; they don't affect the rendered footer. */
 interface CitableSource {
-  kind: "web" | "archive";
+  kind: "web";
   title: string;
   url: string;
   content: string; // what the writer actually reads
@@ -1782,28 +1559,18 @@ async function writeReport(
   skill: Skill,
   target: Target,
   webSources: GatheredSource[],
-  recalled: RecalledReport[],
   model: string,
   signal?: AbortSignal,
 ): Promise<{ title: string; summary: string; body: string; citations: CitableSource[] }> {
-  // Web sources first (fresh material the writer must rely on), archive
-  // sources after (background/continuity). One unified numbering scheme.
-  const citations: CitableSource[] = [
-    ...webSources.map<CitableSource>((s) => ({
-      kind: "web",
-      title: s.title,
-      url: s.url,
-      content: s.content,
-      score: s.score,
-      published_date: s.published_date,
-    })),
-    ...recalled.map<CitableSource>((r) => ({
-      kind: "archive",
-      title: `${r.title} (${r.age_days === 0 ? "today" : r.age_days === 1 ? "yesterday" : `${r.age_days} days ago`}${r.same_target ? "" : ` · from "${r.target_name}"`})`,
-      url: `/report/${r.id}`,
-      content: r.snippet,
-    })),
-  ];
+  // The writer's sources are the fresh web material — nothing else.
+  const citations: CitableSource[] = webSources.map<CitableSource>((s) => ({
+    kind: "web",
+    title: s.title,
+    url: s.url,
+    content: s.content,
+    score: s.score,
+    published_date: s.published_date,
+  }));
 
   // Format a published_date string from Tavily into a short human label
   // for the writer. Tavily returns either ISO ("2026-05-18T...") or
@@ -1818,10 +1585,7 @@ async function writeReport(
   const sourceBlock = citations.length
     ? citations
         .map((c, i) => {
-          if (c.kind === "archive") {
-            return `[${i + 1}] (PRIOR REPORT) ${c.title}\n${c.url}\n${c.content}`;
-          }
-          // Web source: surface score + published date as a metadata line
+          // Surface score + published date as a metadata line
           // so the writer can weight recency and trust per cite.
           const metaBits: string[] = [];
           const dateLabel = fmtDate(c.published_date);
@@ -2504,7 +2268,7 @@ export async function regenerateLab(
  *  see "in-flight at step X") and the `runs.error` text (so completed
  *  failures are tagged "gather: Tavily timeout" rather than just "Tavily
  *  timeout"). Order matters — it's the actual pipeline sequence. */
-export type RunStep = "init" | "plan" | "gather" | "recall" | "write" | "persist" | "done";
+export type RunStep = "init" | "plan" | "gather" | "write" | "persist" | "done";
 
 /** Live "what's happening right now" breadcrumb. Overwritten by each new
  *  runResearch invocation (we only care about the most-recent attempt for
@@ -2596,7 +2360,7 @@ async function reapStalledRun(env: Env, now: number): Promise<void> {
   );
 }
 
-/** The full research loop. Plan → gather → recall → write → persist.
+/** The full research loop. Plan → gather → write → persist.
  *  `signal` (optional) is forwarded to Tavily/Anthropic fetches so the
  *  ResearchRunner DO alarm can enforce a max_run_seconds ceiling — when the
  *  signal fires, in-flight fetches throw `AbortError` and the catch block
@@ -2670,16 +2434,12 @@ export async function runResearch(
     const { sources, stats: gatherStats } = await gatherSources(env, queries, target, skill, calls, signal);
     attempt.gather_stats = gatherStats;
 
-    await markStep(env, attempt, "recall");
-    const recalled = await recallMemory(env, target, skill);
-
     await markStep(env, attempt, "write");
     const { title, summary, body, citations } = await writeReport(
       env,
       skill,
       target,
       sources,
-      recalled,
       chatModel,
       signal,
     );
@@ -2725,23 +2485,6 @@ export async function runResearch(
     )
       .bind(reportId, target.id, skill.id, title, snippet, r2Key, wordCount, sourcesJson, runId, chatModel, created)
       .run();
-
-    // Embed for cross-target recall. Best-effort: failures are surfaced
-    // to the admin Maintenance card via settings; they never abort the
-    // report write.
-    await embedReport(env, {
-      id: reportId,
-      target_id: target.id,
-      target_name: target.name,
-      target_slug: target.slug,
-      skill_id: skill.id,
-      skill_slug: skill.slug,
-      skill_name: skill.name,
-      title,
-      snippet,
-      body,
-      created_at: created,
-    });
 
     await env.DB.prepare("UPDATE skills SET used_count = used_count + 1, updated_at = ? WHERE id = ?")
       .bind(Date.now(), skill.id)
@@ -2969,8 +2712,8 @@ export async function cronTick(env: Env): Promise<{ processed: number; skipped: 
 //   Route calls `stub.scheduleManualRun(targetSlug)` → DO stores the slug in
 //   its own SQLite + sets an alarm for now+1s → returns immediately. The
 //   alarm fires inside the scheduled-handler context, which has the
-//   15-minute budget. Same `runResearch()` runs, persistence into D1/R2/
-//   Vectorize is unchanged.
+//   15-minute budget. Same `runResearch()` runs, persistence into D1/R2
+//   is unchanged.
 //
 // Cost: per-run compute is ~70s × 0.128 GB = ~9 GB-seconds. The Workers
 // Free DO quota is 13,000 GB-seconds/day, so we can do ~1,400 manual runs

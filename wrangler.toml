@@ -46,12 +46,11 @@ database_id = "35a02280-dab6-4d64-be0c-0d5a3b5b484a"
 binding = "REPORTS"
 bucket_name = "watchomacho-reports"
 
-# Vectorize — semantic memory so the agent doesn't repeat itself.
-# Create with:
-#   wrangler vectorize create watchomacho-memory --dimensions=768 --metric=cosine
-[[vectorize]]
-binding = "MEMORY"
-index_name = "watchomacho-memory"
+# Recall memory (Vectorize) removed 2026-06-02 — it wasn't earning its place
+# (one target, days of data, a skill that wants each brief to stand alone) and
+# was the source of dangling self-citation links. The `watchomacho-memory`
+# index can be re-created + backfilled if a real cross-target archive search is
+# ever wanted.
 
 # Durable Object: ResearchRunner — wraps `runResearch` in an alarm handler
 # so manual "Run Now" gets a 15-minute wall-clock budget instead of the
