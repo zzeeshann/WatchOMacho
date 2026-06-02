@@ -793,6 +793,23 @@ export async function deleteReport(env: Env, id: string): Promise<void> {
   } catch (e) {
     console.error("deleteReport: Vectorize deleteByIds failed", e);
   }
+  // Edition pieces (lesson + lab): R2 bodies AND D1 rows. Without this they leak
+  // permanently — gcOrphanedR2 keeps any edition_pieces.r2_key in its keep-set,
+  // so an orphaned row pins its orphaned blob forever (the GC can never reclaim
+  // it). Delete the blobs first, then the rows.
+  const pieces = await env.DB.prepare(
+    "SELECT r2_key FROM edition_pieces WHERE report_id = ? AND r2_key IS NOT NULL",
+  )
+    .bind(id)
+    .all<{ r2_key: string }>();
+  for (const p of pieces.results ?? []) {
+    try {
+      await env.REPORTS.delete(p.r2_key);
+    } catch (e) {
+      console.error("deleteReport: edition_piece R2 delete failed", p.r2_key, e);
+    }
+  }
+  await env.DB.prepare("DELETE FROM edition_pieces WHERE report_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM reports WHERE id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM runs WHERE report_id = ?").bind(id).run();
 }
@@ -820,6 +837,26 @@ export async function deleteTarget(env: Env, id: string): Promise<void> {
     } catch (e) {
       console.error("deleteTarget: Vectorize deleteByIds failed", e);
     }
+    // Edition pieces (lesson + lab) for every report of this target: R2 bodies
+    // AND D1 rows. Same leak as deleteReport — orphaned edition_pieces rows pin
+    // their R2 blobs in gcOrphanedR2's keep-set forever. Sweep by the report ids
+    // collected above.
+    const placeholders = ids.map(() => "?").join(",");
+    const pieces = await env.DB.prepare(
+      `SELECT r2_key FROM edition_pieces WHERE r2_key IS NOT NULL AND report_id IN (${placeholders})`,
+    )
+      .bind(...ids)
+      .all<{ r2_key: string }>();
+    for (const p of pieces.results ?? []) {
+      try {
+        await env.REPORTS.delete(p.r2_key);
+      } catch (e) {
+        console.error("deleteTarget: edition_piece R2 delete failed", p.r2_key, e);
+      }
+    }
+    await env.DB.prepare(`DELETE FROM edition_pieces WHERE report_id IN (${placeholders})`)
+      .bind(...ids)
+      .run();
   }
   await env.DB.prepare("DELETE FROM reports WHERE target_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM runs WHERE target_id = ?").bind(id).run();
@@ -2235,8 +2272,11 @@ function splitLessonHeadlineLede(text: string): {
   return { headline, lede: null, body: lines.slice(i + 1).join("\n").trim() };
 }
 
-function buildLessonUserPrompt(title: string, briefingBody: string): string {
-  return `Today's world-news briefing. Re-explain it as a Daylila lesson — the human / system / psychological "why" behind these events, the pattern the reader can carry forward. Ground everything in the briefing below; invent nothing.
+function buildLessonUserPrompt(targetName: string, title: string, briefingBody: string): string {
+  // Name the actual target ("World News", "Finance", …) so the lesson is framed
+  // for the right beat — not hardcoded to world-news. Empty name → generic.
+  const label = targetName.trim() ? `${targetName.trim()} ` : "";
+  return `Today's ${label}briefing. Re-explain it as a Daylila lesson — the human / system / psychological "why" behind these events, the pattern the reader can carry forward. Ground everything in the briefing below; invent nothing.
 
 BRIEFING TITLE: ${title}
 
@@ -2256,13 +2296,22 @@ export async function makeLesson(
   signal?: AbortSignal,
 ): Promise<void> {
   try {
+    // Resolve the target's display name so the prompt frames the lesson for the
+    // right target (World News / Finance / …). target_id can be null on old rows.
+    let targetName = "";
+    if (report.target_id) {
+      const t = await env.DB.prepare("SELECT name FROM targets WHERE id = ?")
+        .bind(report.target_id)
+        .first<{ name: string }>();
+      targetName = t?.name ?? "";
+    }
     const res = await runChat(
       env,
       model,
       {
         messages: [
           { role: "system", content: `${LESSON_CONTRACT}\n\n---\n\n# Voice (non-negotiable, applies to every word)\n\n${VOICE_CONTRACT}` },
-          { role: "user", content: buildLessonUserPrompt(report.title, briefingBody) },
+          { role: "user", content: buildLessonUserPrompt(targetName, report.title, briefingBody) },
         ],
         max_tokens: 8000,
       },
